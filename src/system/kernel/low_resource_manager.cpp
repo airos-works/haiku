@@ -151,7 +151,7 @@ call_handlers(uint32 lowResources)
 static void
 compute_state(void)
 {
-	sLastMeasurement = system_time();
+	atomic_set64(&sLastMeasurement, system_time());
 
 	sLowResources = B_ALL_KERNEL_RESOURCES;
 
@@ -397,16 +397,18 @@ low_resource(uint32 resource, uint64 requirements, uint32 flags, uint32 timeout)
 int32
 low_resource_state(uint32 resources)
 {
-	recursive_lock_lock(&sLowResourceLock);
+	// Page faults ask this (whether they may map or read more than their
+	// own page), with many threads at once: no lock for reading the states.
+	// Each is one word that compute_state() and low_resource() store in one
+	// piece. Only who finds the measurement too old takes the lock, to
+	// renew it.
+	if (system_time() - atomic_get64(&sLastMeasurement) > 500000) {
+		RecursiveLocker locker(&sLowResourceLock);
+		if (system_time() - sLastMeasurement > 500000)
+			compute_state();
+	}
 
-	if (system_time() - sLastMeasurement > 500000)
-		compute_state();
-
-	int32 state = low_resource_state_no_update(resources);
-
-	recursive_lock_unlock(&sLowResourceLock);
-
-	return state;
+	return low_resource_state_no_update(resources);
 }
 
 

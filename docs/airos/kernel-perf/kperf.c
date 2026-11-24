@@ -10,6 +10,8 @@
  *   kperf malloc <threads>            parallel malloc/free mix
  *   kperf anon <MiB> [threads]        touch fresh anonymous memory
  *   kperf filemap <path> [rounds]     map a cached file and read each page
+ *   kperf filefaultthr <threads> [dir] [MiB]   threads map and read their
+ *   kperf filefaultteam <teams> [dir] [MiB]    own cached files, 8 times
  *   kperf exec <count>                fork + exec /bin/true
  *   kperf daemon <MiB> <seconds>      keep touching memory; page daemon time
  *   kperf mkfile <path> <MiB>         write a file of that size
@@ -461,6 +463,142 @@ test_mkfile(const char* path, int mib)
 }
 
 
+// #pragma mark - filefault: several workers fault in their own cached files
+
+
+static const char* sFileFaultDirectory;
+static size_t sFileFaultSize;
+static int sFileFaultCycles;
+
+
+static void
+file_fault_path(int index, char* path, size_t size)
+{
+	snprintf(path, size, "%s/kperf-filefault.%d", sFileFaultDirectory, index);
+}
+
+
+/*!	Maps the worker's file, reads every page and unmaps it, some times. The
+	file is in the cache, so each fault maps a page and its neighbours.
+*/
+static void
+file_fault_cycles(int index)
+{
+	char path[256];
+	file_fault_path(index, path, sizeof(path));
+	int fd = open(path, O_RDONLY);
+	if (fd < 0)
+		die(path);
+	volatile unsigned sum = 0;
+	for (int cycle = 0; cycle < sFileFaultCycles; cycle++) {
+		char* p = mmap(NULL, sFileFaultSize, PROT_READ, MAP_PRIVATE, fd, 0);
+		if (p == MAP_FAILED)
+			die("mmap file");
+		for (size_t offset = 0; offset < sFileFaultSize; offset += B_PAGE_SIZE)
+			sum += p[offset];
+		munmap(p, sFileFaultSize);
+	}
+	close(fd);
+}
+
+
+static void*
+file_fault_thread(void* arg)
+{
+	pthread_barrier_wait(&sBarrier);
+	file_fault_cycles((int)(addr_t)arg);
+	pthread_barrier_wait(&sBarrier);
+	return NULL;
+}
+
+
+static void
+test_filefault(bool teams, int workers, const char* directory, int mib)
+{
+	sFileFaultDirectory = directory;
+	sFileFaultSize = (size_t)mib << 20;
+	sFileFaultCycles = 8;
+
+	// one file per worker, so that they share no cache; all in memory
+	char* buffer = malloc(1 << 20);
+	for (int i = 0; i < workers; i++) {
+		char path[256];
+		file_fault_path(i, path, sizeof(path));
+		test_mkfile(path, mib);
+		int fd = open(path, O_RDONLY);
+		if (fd < 0)
+			die(path);
+		while (read(fd, buffer, 1 << 20) > 0)
+			;
+		close(fd);
+	}
+	free(buffer);
+
+	bigtime_t times[9];
+	for (int round = 0; round < 9; round++) {
+		if (teams) {
+			int go[2], done[2];
+			if (pipe(go) != 0 || pipe(done) != 0)
+				die("pipe");
+			pid_t child[workers];
+			for (int i = 0; i < workers; i++) {
+				child[i] = fork();
+				if (child[i] == 0) {
+					char c;
+					close(go[1]);
+					read(go[0], &c, 1);
+					file_fault_cycles(i);
+					write(done[1], "d", 1);
+					_exit(0);
+				}
+			}
+			close(go[0]);
+			snooze(20000);
+			bigtime_t start = system_time();
+			close(go[1]);
+			for (int i = 0; i < workers; i++) {
+				char c;
+				read(done[0], &c, 1);
+			}
+			times[round] = system_time() - start;
+			for (int i = 0; i < workers; i++)
+				waitpid(child[i], NULL, 0);
+			close(done[0]);
+			close(done[1]);
+		} else {
+			pthread_barrier_init(&sBarrier, NULL, workers + 1);
+			pthread_t thread[workers];
+			for (int i = 0; i < workers; i++) {
+				pthread_create(&thread[i], NULL, file_fault_thread,
+					(void*)(addr_t)i);
+			}
+			pthread_barrier_wait(&sBarrier);
+			bigtime_t start = system_time();
+			pthread_barrier_wait(&sBarrier);
+			times[round] = system_time() - start;
+			for (int i = 0; i < workers; i++)
+				pthread_join(thread[i], NULL);
+			pthread_barrier_destroy(&sBarrier);
+		}
+	}
+
+	for (int i = 0; i < workers; i++) {
+		char path[256];
+		file_fault_path(i, path, sizeof(path));
+		unlink(path);
+	}
+
+	char args[64];
+	snprintf(args, sizeof(args), "n=%d mib=%d cycles=%d", workers, mib,
+		sFileFaultCycles);
+	qsort(times, 9, sizeof(bigtime_t), compare_bigtime);
+	report(teams ? "filefaultteam" : "filefaultthr", args, times[4] / 1000.0,
+		"ms");
+	report(teams ? "filefaultteam_min" : "filefaultthr_min", args,
+		times[0] / 1000.0, "ms");
+}
+
+
 // #pragma mark - correctness
 
 
@@ -831,6 +969,11 @@ main(int argc, char** argv)
 		test_large(a);
 	else if (strcmp(test, "mkfile") == 0)
 		test_mkfile(argv[2], atoi(argv[3]));
+	else if (strcmp(test, "filefaultthr") == 0
+		|| strcmp(test, "filefaultteam") == 0) {
+		test_filefault(strcmp(test, "filefaultteam") == 0, a,
+			argc > 3 ? argv[3] : "/tmp", argc > 4 ? atoi(argv[4]) : 32);
+	}
 	else {
 		fprintf(stderr, "unknown test %s\n", test);
 		return 1;

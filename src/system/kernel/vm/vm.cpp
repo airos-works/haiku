@@ -255,9 +255,10 @@ static const size_t kMinAnonymousFaultAroundAreaSize = 1024 * 1024;
 static inline bool
 fault_around_allowed()
 {
-	return low_resource_state(B_KERNEL_RESOURCE_PAGES) == B_NO_LOW_RESOURCE
-		&& vm_page_num_free_pages() >= vm_page_num_pages() / 16
-		&& !vm_page_cache_thrashing();
+	// the counters first: they are read without a lock
+	return vm_page_num_free_pages() >= vm_page_num_pages() / 16
+		&& !vm_page_cache_thrashing()
+		&& low_resource_state(B_KERNEL_RESOURCE_PAGES) == B_NO_LOW_RESOURCE;
 }
 
 
@@ -4288,9 +4289,9 @@ fault_allocate_anonymous_pages(PageFaultContext& context)
 		|| cache->CanOvercommit() || cache->GuardSize() != 0
 		|| (cache->type != CACHE_TYPE_RAM)
 		|| area->page_protections != NULL
+		|| vm_page_num_free_pages() < vm_page_num_pages() / 16
 		|| low_resource_state(B_KERNEL_RESOURCE_PAGES | B_KERNEL_RESOURCE_MEMORY)
-			!= B_NO_LOW_RESOURCE
-		|| vm_page_num_free_pages() < vm_page_num_pages() / 16) {
+			!= B_NO_LOW_RESOURCE) {
 		return;
 	}
 
@@ -4354,7 +4355,10 @@ fault_around(PageFaultContext& context, VMArea* area, addr_t faultAddress)
 		area->Base() + (area->Size() - B_PAGE_SIZE));
 		// the last page's address: the window ends with the area
 
+	// one lock of the translation map for the window (map_page() locks it
+	// again, which is cheap for the holder)
 	VMTranslationMap* map = context.map;
+	map->Lock();
 	for (addr_t address = start; ; address += B_PAGE_SIZE) {
 		if (address != faultAddress) {
 			off_t offset = address - area->Base() + area->cache_offset;
@@ -4374,7 +4378,6 @@ fault_around(PageFaultContext& context, VMArea* area, addr_t faultAddress)
 				& ~(B_WRITE_AREA | B_KERNEL_WRITE_AREA);
 			if (page != NULL && !page->busy
 				&& (protection & (B_READ_AREA | B_EXECUTE_AREA)) != 0) {
-				map->Lock();
 				phys_addr_t physicalAddress;
 				uint32 flags;
 				if (map->Query(address, &physicalAddress, &flags) != B_OK
@@ -4383,18 +4386,16 @@ fault_around(PageFaultContext& context, VMArea* area, addr_t faultAddress)
 					status_t status = map_page(area, page, address, protection,
 						&context.reservation);
 					DEBUG_PAGE_ACCESS_END(page);
-					if (status != B_OK) {
-						map->Unlock();
-						return;
-					}
+					if (status != B_OK)
+						break;
 				}
-				map->Unlock();
 			}
 		}
 
 		if (address >= last)
 			break;
 	}
+	map->Unlock();
 }
 
 
@@ -4403,12 +4404,12 @@ static void
 fault_map_anonymous_pages(PageFaultContext& context, VMArea* area)
 {
 	VMTranslationMap* map = context.map;
+	map->Lock();
 	for (uint32 i = 0; i < context.extraCount; i++) {
 		vm_page* page = context.extraPages[i];
 		addr_t address = area->Base()
 			+ (addr_t)(context.extraOffsets[i] - area->cache_offset);
 
-		map->Lock();
 		phys_addr_t physicalAddress;
 		uint32 flags;
 		status_t status = B_OK;
@@ -4419,10 +4420,10 @@ fault_map_anonymous_pages(PageFaultContext& context, VMArea* area)
 				get_area_page_protection(area, address), &context.reservation);
 			DEBUG_PAGE_ACCESS_END(page);
 		}
-		map->Unlock();
 		if (status != B_OK)
 			break;
 	}
+	map->Unlock();
 	context.extraCount = 0;
 }
 
@@ -4457,9 +4458,9 @@ fault_map_large_page(PageFaultContext& context, VMArea* area, addr_t address)
 		return B_NOT_SUPPORTED;
 	}
 
-	if (low_resource_state(B_KERNEL_RESOURCE_PAGES | B_KERNEL_RESOURCE_MEMORY)
-			!= B_NO_LOW_RESOURCE
-		|| vm_page_num_free_pages() < vm_page_num_pages() / 8) {
+	if (vm_page_num_free_pages() < vm_page_num_pages() / 8
+		|| low_resource_state(B_KERNEL_RESOURCE_PAGES | B_KERNEL_RESOURCE_MEMORY)
+			!= B_NO_LOW_RESOURCE) {
 		return B_NO_MEMORY;
 	}
 
