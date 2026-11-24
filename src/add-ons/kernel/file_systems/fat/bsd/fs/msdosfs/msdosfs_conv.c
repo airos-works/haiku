@@ -76,6 +76,15 @@ static uint16_t unix2doschr(const u_char **, size_t *, struct msdosfsmount *);
 static u_char * win2unixchr(u_char *, uint16_t, struct msdosfsmount *);
 static uint16_t unix2winchr(const u_char **, size_t *, int, struct msdosfsmount *);
 
+// Haiku port: file names are UTF-8 on Haiku's side. Where libiconv does the conversions (the
+// userlandfs module), FreeBSD's code is used as it is. Where there is no libiconv (the kernel
+// add-on and the FS shell), long names are converted between UTF-16 and UTF-8 by the functions
+// below, and short names between code page 850 and UTF-8 through the Latin-1 tables.
+static size_t utf8_decode(const u_char *, size_t, uint32_t *);
+static u_char *utf8_encode(u_char *, uint32_t);
+static uint16_t utf8_next_unit(const u_char **, size_t *);
+static uint16_t unit_tolower(uint16_t);
+
 /*
  * 0 - character disallowed in long file name.
  * 1 - character should be replaced by '_' in DOS file name,
@@ -324,18 +333,25 @@ unix2dosfn(const u_char *un, u_char dn[12], size_t unlen, u_int gen,
 #ifndef USER
 	// We don't have access to libiconv, so the driver will default to code page 850.
 	// Check for Japanese characters in un and use SJIS encoding instead if found.
-	status = B_TO_POSIX_ERROR(utf8_to_unicode((const char*) un, unicodeString, unicodeSize));
-	if (status < 0)
-		return 0;
-	else
-		resultLength = status;
-	for (i = 0; i < resultLength; i += 2) {
-		uint16 unicodeChar;
-		memcpy(&unicodeChar, unicodeString + i, 2);
-		if (is_unicode_japanese(B_LENDIAN_TO_HOST_INT16(unicodeChar))) {
+	// A name that is not UTF-8 is refused.
+	for (cp = un, i = unlen; i > 0;) {
+		uint32_t character;
+		size_t length = utf8_decode(cp, i, &character);
+		if (length == 0)
+			return 0;
+		if (character < 0x10000 && is_unicode_japanese(character))
 			sjis = 1;
-			break;
-		}
+		cp += length;
+		i -= length;
+	}
+	if (sjis == 1) {
+		// utf8_to_unicode() does not take characters outside the BMP: such a name gets its
+		// short name from code page 850 like any other.
+		status = B_TO_POSIX_ERROR(utf8_to_unicode((const char*) un, unicodeString, unicodeSize));
+		if (status < 0)
+			sjis = 0;
+		else
+			resultLength = status;
 	}
 #endif // !USER
 
@@ -798,9 +814,14 @@ winSlotCnt(const u_char *un, size_t unlen, struct msdosfsmount *pmp)
 		return howmany(WIN_MAXLEN - wlen/2, WIN_CHARS);
 	}
 
-	if (unlen > WIN_MAXLEN)
-		return 0;
-	return howmany(unlen, WIN_CHARS);
+	// Haiku port: the slots hold UTF-16 units
+	wlen = 0;
+	while (unlen > 0) {
+		utf8_next_unit(&un, &unlen);
+		if (++wlen > WIN_MAXLEN)
+			return 0;
+	}
+	return howmany(wlen, WIN_CHARS);
 }
 
 /*
@@ -829,6 +850,17 @@ mbsadjpos(const char **instr, size_t inlen, size_t outlen, int weight, int flag,
 		outp = outstr;
 		outlen *= weight;
 		msdosfs_iconv->conv(handle, instr, &inlen, &outp, &outlen);
+		return (inlen);
+	}
+
+	// Haiku port: a long name is cut by UTF-16 units, not by bytes
+	if (weight == 2) {
+		const u_char *in = (const u_char *)*instr;
+		while (outlen > 0 && inlen > 0) {
+			utf8_next_unit(&in, &inlen);
+			outlen--;
+		}
+		*instr = (const char *)in;
 		return (inlen);
 	}
 
@@ -871,8 +903,8 @@ dos2unixchr(u_char *outbuf, const u_char **instr, size_t *ilen, int lower, struc
 		c = dos2unix[c];
 		if (lower & (LCASE_BASE | LCASE_EXT))
 			c = u2l[c];
-		*outp++ = c;
-		outbuf[1] = '\0';
+		// Haiku port: the tables are Latin-1, the name is UTF-8
+		outp = utf8_encode(outp, c);
 	}
 
 	*outp = '\0';
@@ -950,10 +982,25 @@ unix2doschr(const u_char **instr, size_t *ilen, struct msdosfsmount *pmp)
 		return (wc);
 	}
 
-	(*ilen)--;
-	c = *(*instr)++;
-	c = l2u[c];
-	c = unix2dos[c];
+	// Haiku port: one UTF-8 character. What is not valid UTF-8 is not allowed in a name; what
+	// code page 850 does not have is replaced.
+	{
+		uint32_t character;
+		len = utf8_decode(*instr, *ilen, &character);
+		if (len == 0) {
+			(*ilen)--;
+			(*instr)++;
+			return (0);
+		}
+		(*ilen) -= len;
+		(*instr) += len;
+		if (character > 0xff)
+			return (1);
+		c = l2u[character];
+		c = unix2dos[c];
+		if (c == 0 && character >= 0x80)
+			return (1);
+	}
 	return ((uint16_t)c);
 }
 
@@ -985,7 +1032,9 @@ win2unixchr(u_char *outbuf, uint16_t wc, struct msdosfsmount *pmp)
 		if (len == 0)
 			*outp++ = '?';
 	} else {
-		*outp++ = (wc & 0xff00) ? '?' : (u_char)(wc & 0xff);
+		// Haiku port: UTF-8. Half of a surrogate pair is written like any other unit, three
+		// bytes; mbnambuf_flush() makes one character of the two halves.
+		outp = utf8_encode(outp, wc);
 	}
 
 	*outp = '\0';
@@ -1028,12 +1077,165 @@ unix2winchr(const u_char **instr, size_t *ilen, int lower, struct msdosfsmount *
 		return (wc);
 	}
 
-	(*ilen)--;
-	wc = (*instr)[0];
+	// Haiku port: the name is UTF-8
+	wc = utf8_next_unit(instr, ilen);
 	if (lower & (LCASE_BASE | LCASE_EXT))
-		wc = u2l[wc];
-	(*instr)++;
+		wc = unit_tolower(wc);
 	return (wc);
+}
+
+/*
+ * Haiku port: UTF-8 and UTF-16 for the long names.
+ */
+
+/*
+ * Decode the UTF-8 character at the start of the len bytes at s. Returns its length in bytes,
+ * 0 if this is not a well-formed character.
+ */
+static size_t
+utf8_decode(const u_char *s, size_t len, uint32_t *_character)
+{
+	uint32_t c;
+
+	if (len == 0)
+		return (0);
+	if (s[0] < 0x80) {
+		*_character = s[0];
+		return (1);
+	}
+	if (s[0] >= 0xc2 && s[0] <= 0xdf) {
+		if (len < 2 || (s[1] & 0xc0) != 0x80)
+			return (0);
+		*_character = (s[0] & 0x1f) << 6 | (s[1] & 0x3f);
+		return (2);
+	}
+	if (s[0] >= 0xe0 && s[0] <= 0xef) {
+		if (len < 3 || (s[1] & 0xc0) != 0x80 || (s[2] & 0xc0) != 0x80)
+			return (0);
+		c = (s[0] & 0x0f) << 12 | (s[1] & 0x3f) << 6 | (s[2] & 0x3f);
+		if (c < 0x800 || (c >= 0xd800 && c <= 0xdfff))
+			return (0);
+		*_character = c;
+		return (3);
+	}
+	if (s[0] >= 0xf0 && s[0] <= 0xf4) {
+		if (len < 4 || (s[1] & 0xc0) != 0x80 || (s[2] & 0xc0) != 0x80
+		    || (s[3] & 0xc0) != 0x80)
+			return (0);
+		c = (s[0] & 0x07) << 18 | (s[1] & 0x3f) << 12 | (s[2] & 0x3f) << 6
+		    | (s[3] & 0x3f);
+		if (c < 0x10000 || c > 0x10ffff)
+			return (0);
+		*_character = c;
+		return (4);
+	}
+	return (0);
+}
+
+/*
+ * Write c (below 0x10000) as UTF-8, at most three bytes. Returns the end of what was written.
+ */
+static u_char *
+utf8_encode(u_char *out, uint32_t c)
+{
+	if (c < 0x80) {
+		*out++ = c;
+	} else if (c < 0x800) {
+		*out++ = 0xc0 | (c >> 6);
+		*out++ = 0x80 | (c & 0x3f);
+	} else {
+		*out++ = 0xe0 | (c >> 12);
+		*out++ = 0x80 | ((c >> 6) & 0x3f);
+		*out++ = 0x80 | (c & 0x3f);
+	}
+	return (out);
+}
+
+/*
+ * Take the next UTF-16 unit from a UTF-8 name.
+ *
+ * A character outside the BMP is two units, and the callers ask for one at a time with nothing
+ * but the position in the name to remember where they are. So the first unit takes the first
+ * two of the character's four bytes, and the second unit is made from the two that are left
+ * (they hold its ten bits). Well-formed UTF-8 never has two continuation bytes at the start
+ * of a character, so that state cannot be mistaken for anything else.
+ *
+ * A byte that is not UTF-8 gives U+FFFD; names with such bytes are not created
+ * (unix2dosfn() refuses them), a lookup just does not find anything.
+ */
+static uint16_t
+utf8_next_unit(const u_char **instr, size_t *ilen)
+{
+	uint32_t c;
+	size_t len;
+
+	if (*ilen == 0)
+		return (0);
+
+	len = utf8_decode(*instr, *ilen, &c);
+	if (len == 0) {
+		if (*ilen >= 2 && ((*instr)[0] & 0xc0) == 0x80
+		    && ((*instr)[1] & 0xc0) == 0x80) {
+			c = 0xdc00 | ((*instr)[0] & 0x0f) << 6 | ((*instr)[1] & 0x3f);
+			(*instr) += 2;
+			(*ilen) -= 2;
+			return (c);
+		}
+		(*instr)++;
+		(*ilen)--;
+		return (0xfffd);
+	}
+
+	if (c >= 0x10000) {
+		(*instr) += 2;
+		(*ilen) -= 2;
+		return (0xd800 | ((c - 0x10000) >> 10));
+	}
+
+	(*instr) += len;
+	(*ilen) -= len;
+	return (c);
+}
+
+/*
+ * Lower case for comparing names: FAT names differ in more than case. Latin, Greek, Cyrillic
+ * and Armenian letters that have a single lower case form.
+ */
+static uint16_t
+unit_tolower(uint16_t c)
+{
+	if (c < 0x80)
+		return (c >= 'A' && c <= 'Z' ? c + 0x20 : c);
+	if (c < 0x100)
+		return (c >= 0xc0 && c <= 0xde && c != 0xd7 ? c + 0x20 : c);
+	if (c < 0x180) {
+		if (c == 0x130 || c == 0x131 || c == 0x138 || c == 0x149 || c == 0x17f)
+			return (c);
+		if (c == 0x178)
+			return (0xff);
+		if ((c >= 0x139 && c <= 0x148) || c >= 0x179)
+			return ((c & 1) != 0 ? c + 1 : c);
+		return ((c & 1) == 0 ? c + 1 : c);
+	}
+	if (c == 0x386)
+		return (0x3ac);
+	if (c >= 0x388 && c <= 0x38a)
+		return (c + 0x25);
+	if (c == 0x38c)
+		return (0x3cc);
+	if (c == 0x38e || c == 0x38f)
+		return (c + 0x3f);
+	if (c >= 0x391 && c <= 0x3ab && c != 0x3a2)
+		return (c + 0x20);
+	if (c >= 0x400 && c <= 0x40f)
+		return (c + 0x50);
+	if (c >= 0x410 && c <= 0x42f)
+		return (c + 0x20);
+	if (c >= 0x531 && c <= 0x556)
+		return (c + 0x30);
+	if (c >= 0xff21 && c <= 0xff3a)
+		return (c + 0x20);
+	return (c);
 }
 
 /*
@@ -1081,6 +1283,10 @@ mbnambuf_write(struct mbnambuf *nbp, char *name, int id)
 #endif
 		return (ENAMETOOLONG);
 	}
+	// Haiku port: a substring of multibyte characters can be up to three times its slot. The
+	// substrings before it take at least their slots, so a name this long does not fit anyway.
+	if (id < 0 || id * WIN_CHARS + count > sizeof(nbp->nb_buf) - 1)
+		return (ENAMETOOLONG);
 
 	/* Shift suffix upwards by the amount length exceeds WIN_CHARS. */
 	if (count > WIN_CHARS && nbp->nb_len != 0) {
@@ -1111,10 +1317,42 @@ mbnambuf_flush(struct mbnambuf *nbp, struct dirent *dp)
 {
 
 	// Haiku port: modified to work with Haiku's struct dirent.
+	u_char *in, *out, *end;
+
 	if (nbp->nb_len > NAME_MAX - 1) {
 		mbnambuf_init(nbp);
 		return (NULL);
 	}
+
+	// Haiku port: the halves of surrogate pairs were written as three bytes each (ED A0..AF xx,
+	// ED B0..BF xx; see win2unixchr()), since a pair can be split between two slots. Now that
+	// the name is whole, a pair becomes its character, and a half without its other half
+	// becomes U+FFFD.
+	in = out = (u_char *)&nbp->nb_buf[0];
+	end = in + nbp->nb_len;
+	while (in < end) {
+		if (in[0] != 0xed || end - in < 3 || (in[1] & 0xe0) != 0xa0) {
+			*out++ = *in++;
+			continue;
+		}
+		if ((in[1] & 0xf0) == 0xa0 && end - in >= 6 && in[3] == 0xed
+		    && (in[4] & 0xf0) == 0xb0) {
+			uint32_t c = 0x10000 + (((in[1] & 0x0f) << 16) | ((in[2] & 0x3f) << 10)
+			    | ((in[4] & 0x0f) << 6) | (in[5] & 0x3f));
+			*out++ = 0xf0 | (c >> 18);
+			*out++ = 0x80 | ((c >> 12) & 0x3f);
+			*out++ = 0x80 | ((c >> 6) & 0x3f);
+			*out++ = 0x80 | (c & 0x3f);
+			in += 6;
+		} else {
+			*out++ = 0xef;
+			*out++ = 0xbf;
+			*out++ = 0xbd;
+			in += 3;
+		}
+	}
+	nbp->nb_len = out - (u_char *)&nbp->nb_buf[0];
+
 	memcpy(dp->d_name, &nbp->nb_buf[0], nbp->nb_len);
 	dp->d_name[nbp->nb_len] = '\0';
 	dp->d_reclen = GENERIC_DIRSIZ(dp);
