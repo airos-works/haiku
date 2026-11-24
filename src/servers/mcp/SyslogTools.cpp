@@ -2,6 +2,7 @@
  * airos_mcp - syslog queries by boot, pattern and mark.
  * Copyright 2026 air/OS contributors. MIT license.
  */
+#include <pthread.h>
 #include <regex>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +12,87 @@
 #include "Mcp.h"
 #include "Tools.h"
 #include "Util.h"
+
+
+// libstdc++'s std::regex matches by recursion, one level or more per
+// character of the subject, so a long log line (a stack dump, a hex dump)
+// overflowed the stack of the thread serving the request and mcp_server
+// crashed (seen on the X399 during a shutdown, 2026-11-25). The search runs
+// on a thread of its own with a large stack, and only the first
+// kMaxSearchedLineLength bytes of a line are searched.
+static const size_t kMaxSearchedLineLength = 16 * 1024;
+static const size_t kSearchStackSize = 64 * 1024 * 1024;
+
+struct LineSearch {
+	const std::vector<std::string>*	lines;
+	const std::string*				pattern;
+	bool							ignoreCase;
+	bool							invert;
+	std::vector<size_t>*			matches;
+	std::string						error;
+	bool							ok;
+};
+
+
+static void*
+search_lines_thread(void* data)
+{
+	LineSearch& search = *(LineSearch*)data;
+	try {
+		std::regex::flag_type flags = std::regex::ECMAScript
+			| std::regex::optimize;
+		if (search.ignoreCase)
+			flags |= std::regex::icase;
+		std::regex re(*search.pattern, flags);
+		const std::vector<std::string>& lines = *search.lines;
+		for (size_t i = 0; i < lines.size(); i++) {
+			const std::string& line = lines[i];
+			bool hit;
+			if (line.size() > kMaxSearchedLineLength) {
+				hit = std::regex_search(line.begin(),
+					line.begin() + kMaxSearchedLineLength, re);
+			} else
+				hit = std::regex_search(line, re);
+			if (hit != search.invert)
+				search.matches->push_back(i);
+		}
+		search.ok = true;
+	} catch (std::regex_error& e) {
+		search.error = e.what();
+	} catch (std::exception& e) {
+		search.error = e.what();
+	}
+	return NULL;
+}
+
+
+static bool
+SearchLines(const std::vector<std::string>& lines, const std::string& pattern,
+	bool ignoreCase, bool invert, std::vector<size_t>& matches,
+	std::string& error)
+{
+	LineSearch search = { &lines, &pattern, ignoreCase, invert, &matches,
+		std::string(), false };
+
+	pthread_attr_t attributes;
+	pthread_attr_init(&attributes);
+	pthread_attr_setstacksize(&attributes, kSearchStackSize);
+	pthread_t thread;
+	int result = pthread_create(&thread, &attributes, search_lines_thread,
+		&search);
+	pthread_attr_destroy(&attributes);
+	if (result != 0) {
+		// no thread with a large stack: search here, with the short lines
+		// that cannot overflow the stack
+		search_lines_thread(&search);
+	} else
+		pthread_join(thread, NULL);
+
+	if (!search.ok)
+		error = search.error;
+	return search.ok;
+}
+
 
 
 static const char* kSyslogPath = "/var/log/syslog";
@@ -182,20 +264,12 @@ SyslogQuery(const JsonValue& args)
 	}
 
 	std::vector<size_t> matches;
-	std::string regexError;
 	if (!pattern.empty()) {
-		try {
-			std::regex::flag_type flags = std::regex::ECMAScript | std::regex::optimize;
-			if (ignoreCase)
-				flags |= std::regex::icase;
-			std::regex re(pattern, flags);
-			for (size_t i = 0; i < selected.size(); i++) {
-				bool hit = std::regex_search(selected[i], re);
-				if (hit != invert)
-					matches.push_back(i);
-			}
-		} catch (std::regex_error& e) {
-			return ToolResult::Error(Format("bad pattern: %s", e.what()));
+		std::string regexError;
+		if (!SearchLines(selected, pattern, ignoreCase, invert, matches,
+				regexError)) {
+			return ToolResult::Error(Format("bad pattern: %s",
+				regexError.c_str()));
 		}
 	} else {
 		for (size_t i = 0; i < selected.size(); i++)
