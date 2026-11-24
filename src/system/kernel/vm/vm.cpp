@@ -689,6 +689,16 @@ compute_area_page_commitment(VMArea* area)
 }
 
 
+// The bits of VMArea::protection that say what an area is, not who may
+// access it. Changing the access rights leaves them alone.
+static const uint32 kPersistentAreaFlags = B_OVERCOMMITTING_AREA
+	| B_SHARED_AREA | B_KERNEL_AREA | B_LARGE_PAGES_AREA;
+// The access rights mprotect() sets, with the kernel's that follow from them.
+static const uint32 kMemoryProtectionFlags = B_READ_AREA | B_WRITE_AREA
+	| B_EXECUTE_AREA | B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA
+	| B_KERNEL_EXECUTE_AREA;
+
+
 static bool
 is_area_only_cache_user(VMArea* area)
 {
@@ -696,6 +706,23 @@ is_area_only_cache_user(VMArea* area)
 		&& area->cache->areas.First() == area
 		&& area->cache->areas.GetNext(area) == NULL
 		&& area->cache->consumers.IsEmpty();
+}
+
+
+/*!	Whether \a area has to move onto a cache of its own before it becomes
+	writable: its cache has consumers, which must not see what is written.
+	That is so for private anonymous memory only (the parent's side of a
+	fork() that found the area read-only). What is written to shared memory
+	or to a shared file mapping is meant for the cache, even when someone
+	has a private copy on top of it, and a device's cache has no pages to
+	copy.
+*/
+static bool
+area_needs_copy_on_write(VMArea* area, VMCache* cache)
+{
+	return !cache->consumers.IsEmpty()
+		&& (area->protection & B_SHARED_AREA) == 0
+		&& cache->type == CACHE_TYPE_RAM;
 }
 
 
@@ -2627,6 +2654,14 @@ vm_clone_area(team_id team, const char* name, void** address,
 		if (!kernel && (sourceArea->protection & B_KERNEL_AREA) != 0)
 			return B_NOT_ALLOWED;
 
+		// A clone another team may not make must not leave the area shared
+		// either: the next fork() would no longer copy it (the flag stays
+		// through set_area_protection() and mprotect()).
+		if (!kernel && sourceArea->address_space->ID() != team
+			&& (sourceArea->protection & B_CLONEABLE_AREA) == 0) {
+			return B_NOT_ALLOWED;
+		}
+
 		sourceArea->protection |= B_SHARED_AREA;
 		protection |= B_SHARED_AREA;
 	}
@@ -3307,6 +3342,11 @@ vm_set_area_protection(area_id areaID, uint32 newProtection,
 			return B_NOT_ALLOWED;
 		}
 
+		// What the area is stays: only its access rights (and whether it
+		// may be cloned) are set here. Without B_SHARED_AREA the next
+		// fork() would give the child a copy of shared memory.
+		newProtection |= area->protection & kPersistentAreaFlags;
+
 		if (area->protection == newProtection)
 			return B_OK;
 
@@ -3316,7 +3356,8 @@ vm_set_area_protection(area_id areaID, uint32 newProtection,
 		// Make sure the area (respectively, if we're going to call
 		// vm_copy_on_write_area(), all areas of the cache) doesn't have any
 		// wired ranges.
-		if (!isWritable && becomesWritable && !cache->consumers.IsEmpty()) {
+		if (!isWritable && becomesWritable
+			&& area_needs_copy_on_write(area, cache)) {
 			for (VMArea* otherArea = cache->areas.First(); otherArea != NULL;
 					otherArea = cache->areas.GetNext(otherArea)) {
 				if (wait_if_area_is_wired(otherArea, &locker, &cacheLocker)) {
@@ -3374,13 +3415,14 @@ vm_set_area_protection(area_id areaID, uint32 newProtection,
 	} else if (!isWritable && becomesWritable) {
 		// !writable -> writable
 
-		if (!cache->consumers.IsEmpty()) {
+		if (area_needs_copy_on_write(area, cache)) {
 			// There are consumers -- we have to insert a new cache. Fortunately
 			// vm_copy_on_write_area() does everything that's needed.
 			changePageProtection = false;
 			status = vm_copy_on_write_area(cache, NULL);
 		} else {
-			// No consumers, so we don't need to insert a new one.
+			// No consumers (or none that what is written has to be kept
+			// from), so we don't need to insert a new one.
 			if (cache->temporary) {
 				// the cache's commitment must contain all possible pages
 				status = cache->Commit(cache->virtual_end - cache->virtual_base,
@@ -6232,7 +6274,15 @@ transfer_area(area_id id, void** _address, uint32 addressSpec, team_id target,
 	// Now we can reset the protection to whatever it was before.
 	vm_set_area_protection(clonedArea, info.protection, kernel);
 
-	// TODO: The clonedArea is B_SHARED_AREA, which is not really desired.
+	// vm_clone_area() made the clone B_SHARED_AREA, which
+	// vm_set_area_protection() keeps. The clone is the only user of the
+	// memory now, and no more shared than the area was: fork() copies it.
+	if ((info.protection & B_SHARED_AREA) == 0) {
+		AddressSpaceWriteLocker locker;
+		VMArea* area;
+		if (locker.SetFromArea(clonedArea, area) == B_OK)
+			area->protection &= ~B_SHARED_AREA;
+	}
 
 	return clonedArea;
 }
@@ -6684,7 +6734,7 @@ _user_set_memory_protection(void* _address, size_t size, uint32 protection)
 			AreaCacheLocker cacheLocker(area);
 			VMCache* cache = cacheLocker.Get();
 
-			if (!cache->consumers.IsEmpty()) {
+			if (area_needs_copy_on_write(area, cache)) {
 				// We need to make the area copy-on-write.
 				// Unlock, then reacquire locks using MultiLocker.
 				area_id areaId = area->id;
@@ -6752,7 +6802,7 @@ _user_set_memory_protection(void* _address, size_t size, uint32 protection)
 		sizeLeft -= rangeSize;
 
 		if (area->page_protections == NULL) {
-			if (area->protection == protection)
+			if ((area->protection & kMemoryProtectionFlags) == protection)
 				continue;
 
 			if (offset == 0 && rangeSize == area->Size()) {
@@ -6813,8 +6863,12 @@ _user_set_memory_protection(void* _address, size_t size, uint32 protection)
 			}
 		}
 
-		if (area->page_protections == NULL)
-			area->protection = protection;
+		if (area->page_protections == NULL) {
+			// Only the access rights change: the area stays shared, a stack,
+			// overcommitting or cloneable.
+			area->protection = (area->protection & ~kMemoryProtectionFlags)
+				| protection;
+		}
 
 		map->Lock();
 		for (addr_t pageAddress = area->Base() + offset;
