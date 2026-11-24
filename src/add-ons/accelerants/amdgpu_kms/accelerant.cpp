@@ -473,10 +473,38 @@ amdgpu_get_accelerant_device_info(accelerant_device_info* info)
 // #pragma mark - retrace
 
 
+/*!	Whether blanks are worth following for \a semaphore: each costs a
+	wake-up and a DRM call, and keeps the blank interrupt asked for, 60 to
+	240 times a second per output, whether anybody waits or not (#182). A
+	semaphore with a negative count has threads waiting on it. Whoever
+	waited is likely to wait again soon (app_server's flush does, in every
+	frame it has something to copy), so blanks are followed for a second
+	after the last waiter was seen; after that, a look every 10 ms. The
+	first wait after a quiet spell may then end a blank late. As the
+	nvidia_rm accelerant does.
+*/
+static bool
+retrace_wanted(sem_id semaphore, bigtime_t& lastWaiter)
+{
+	int32 count;
+	if (get_sem_count(semaphore, &count) == B_OK && count < 0) {
+		lastWaiter = system_time();
+		return true;
+	}
+	if (system_time() - lastWaiter <= 1000000)
+		return true;
+	snooze(10000);
+	return false;
+}
+
+
 static status_t
 retrace_thread(void*)
 {
+	bigtime_t lastWaiter = system_time();
 	while (!gInfo->quitRetrace) {
+		if (!retrace_wanted(gInfo->retraceSemaphore, lastWaiter))
+			continue;
 		Output* primary = primary_output();
 		if (primary == NULL || gInfo->dpmsMode != B_DPMS_ON
 			|| Kms::WaitVBlank(card_of(*primary).fd, primary->crtcIndex)
@@ -522,7 +550,12 @@ output_retrace_thread(void* data)
 {
 	uint32 index = (uint32)(addr_t)data;
 	uint32 id = gInfo->outputRetraceConnectors[index];
+	bigtime_t lastWaiter = system_time();
 	while (!gInfo->quitRetrace) {
+		if (!retrace_wanted(gInfo->outputRetraceSemaphores[index],
+				lastWaiter)) {
+			continue;
+		}
 		Output* output = NULL;
 		for (uint32 i = 0; i < gInfo->outputCount; i++) {
 			if (gInfo->outputs[i].id == id) {

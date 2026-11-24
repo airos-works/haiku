@@ -50,7 +50,10 @@ static int32
 sdhci_generic_interrupt(void* data)
 {
 	SdhciBus* bus = (SdhciBus*)data;
-	return bus->HandleInterrupt();
+	int32 result = bus->HandleInterrupt();
+	if (result != B_UNHANDLED_INTERRUPT)
+		bus->InterruptArrived();
+	return result;
 }
 
 
@@ -65,6 +68,7 @@ SdhciBus::SdhciBus(struct registers* registers, uint32_t irq, bool poll,
 	fReadingDataBlock(false),
 	fStatus(B_OK),
 	fWorkerThread(-1),
+	fInterruptArrived(0),
 	fCardType(CARD_TYPE_UNKNOWN),
 	fPlatform(platform != NULL ? *platform : sdhci_platform_info{}),
 	fDMAArea(-1),
@@ -207,7 +211,8 @@ SdhciBus::SdhciBus(struct registers* registers, uint32_t irq, bool poll,
 		| (SDHCI_INT_NORMAL_MASK & ~SDHCI_INT_CARD_INT);
 
 	if (poll) {
-		// Spawn a polling thread, as the interrupts won't currently work on ACPI.
+		// Spawn a polling thread, as the interrupts may not arrive on ACPI
+		// machines. It slows down once one has (_WorkerThread()).
 		fWorkerThread = spawn_kernel_thread(_WorkerThread, "SD bus poller",
 			B_NORMAL_PRIORITY, this);
 		if (fWorkerThread < B_OK)
@@ -1170,7 +1175,11 @@ SdhciBus::_WorkerThread(void* cookie)
 	SdhciBus* bus = (SdhciBus*)cookie;
 	while (bus->fStatus != B_SHUTTING_DOWN) {
 		bus->HandleInterrupt();
-		snooze(100);
+		// A look every 100 us is 10,000 wake-ups a second for each slot,
+		// card or no card, and keeps a processor out of its deep idle
+		// states (#182). Once the interrupt has been seen to arrive, it
+		// does the work, and this is only a safety net.
+		snooze(atomic_get(&bus->fInterruptArrived) != 0 ? 100000 : 100);
 	}
 	return B_OK;
 }

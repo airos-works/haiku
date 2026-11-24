@@ -67,6 +67,8 @@ class SdhciBus {
 			status_t			ExecuteCommand(uint8_t command, uint32_t argument,
 									uint32_t* response);
 			int32				HandleInterrupt();
+			void				InterruptArrived()
+									{ atomic_set(&fInterruptArrived, 1); }
 			status_t			InitCheck();
 			void				Reset();
 			void				SetClock(int kilohertz, bool allowAuto);
@@ -109,6 +111,9 @@ class SdhciBus {
 				// a command 6 now is SD_SWITCH_FUNCTION, not ACMD6
 			status_t			fStatus;
 			thread_id			fWorkerThread;
+			int32				fInterruptArrived;
+				// the installed handler has had work: the polling thread
+				// can rest
 			card_type			fCardType;
 			sdhci_platform_info	fPlatform;
 			area_id				fDMAArea;
