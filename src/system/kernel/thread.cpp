@@ -2351,8 +2351,26 @@ thread_exit(void)
 					threadDeathEntry->thread = thread->id;
 					threadDeathEntry->status = thread->exit.status;
 
-					// add entry to dead thread list
-					team->dead_threads.Add(threadDeathEntry);
+					// add entry to dead thread list; the oldest one goes
+					// when there are too many (see MAX_DEAD_THREADS)
+					thread_death_entry* superfluous = NULL;
+					if (team->dead_threads_tree.Insert(threadDeathEntry)
+							!= B_OK) {
+						// An entry with this ID: only after the IDs have
+						// wrapped. The newer status counts.
+						team->dead_threads_tree.Find(thread->id)->status
+							= thread->exit.status;
+						superfluous = threadDeathEntry;
+					} else {
+						team->dead_threads.Add(threadDeathEntry);
+						if (++team->dead_threads_count > MAX_DEAD_THREADS) {
+							superfluous = team->dead_threads.RemoveHead();
+							team->dead_threads_tree.Remove(superfluous);
+							team->dead_threads_count--;
+						}
+					}
+					if (superfluous != NULL)
+						deferred_free(superfluous);
 				} else {
 					deferred_free(threadDeathEntry);
 					threadDeathEntry = NULL;
@@ -2711,19 +2729,16 @@ wait_for_thread_etc(thread_id id, uint32 flags, bigtime_t timeout,
 				delete freeDeath;
 		} else {
 			// check the thread death entries of the team (non-main threads)
-			thread_death_entry* threadDeathEntry = NULL;
-			for (threadDeathEntry = team->dead_threads.First(); threadDeathEntry != NULL;
-					threadDeathEntry = team->dead_threads.GetNext(threadDeathEntry)) {
-				if (threadDeathEntry->thread == id) {
-					team->dead_threads.Remove(threadDeathEntry);
-					death.status = threadDeathEntry->status;
-					free(threadDeathEntry);
-					break;
-				}
-			}
-
+			thread_death_entry* threadDeathEntry
+				= team->dead_threads_tree.Find(id);
 			if (threadDeathEntry == NULL)
 				return B_BAD_THREAD_ID;
+
+			team->dead_threads_tree.Remove(threadDeathEntry);
+			team->dead_threads.Remove(threadDeathEntry);
+			team->dead_threads_count--;
+			death.status = threadDeathEntry->status;
+			free(threadDeathEntry);
 		}
 
 		// we found the thread's death entry in our team

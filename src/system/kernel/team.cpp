@@ -476,6 +476,7 @@ Team::Team(team_id id, bool kernel)
 
 	clear_team_debug_info(&debug_info, true);
 
+	dead_threads_count = 0;
 	dead_threads_kernel_time = 0;
 	dead_threads_user_time = 0;
 	cpu_clock_offset = 0;
@@ -527,6 +528,7 @@ Team::~Team()
 	if (fQueuedSignalsCounter != NULL)
 		fQueuedSignalsCounter->ReleaseReference();
 
+	dead_threads_tree.Clear();
 	while (thread_death_entry* threadDeathEntry = dead_threads.RemoveHead())
 		free(threadDeathEntry);
 

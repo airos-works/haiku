@@ -22,6 +22,7 @@
 #include <timer.h>
 #include <UserTimer.h>
 #include <user_debugger.h>
+#include <util/AVLTree.h>
 #include <util/DoublyLinkedList.h>
 #include <util/KernelReferenceable.h>
 #include <util/list.h>
@@ -82,12 +83,51 @@ namespace BKernel {
 }
 
 
-struct thread_death_entry : DoublyLinkedListLinkImpl<thread_death_entry> {
+struct thread_death_entry : DoublyLinkedListLinkImpl<thread_death_entry>,
+		AVLTreeNode {
 	thread_id			thread;
 	status_t			status;
 };
 
 typedef DoublyLinkedList<thread_death_entry> ThreadDeathEntryList;
+
+// a team's thread death entries by thread ID
+struct ThreadDeathEntryTreeDefinition {
+	typedef thread_id			Key;
+	typedef thread_death_entry	Value;
+
+	AVLTreeNode* GetAVLTreeNode(Value* value) const
+	{
+		return value;
+	}
+
+	Value* GetValue(AVLTreeNode* node) const
+	{
+		return static_cast<Value*>(node);
+	}
+
+	int Compare(Key a, const Value* b) const
+	{
+		return a < b->thread ? -1 : (a > b->thread ? 1 : 0);
+	}
+
+	int Compare(const Value* a, const Value* b) const
+	{
+		return Compare(a->thread, b);
+	}
+};
+
+typedef AVLTree<ThreadDeathEntryTreeDefinition> ThreadDeathEntryTree;
+
+#define MAX_DEAD_THREADS	32768
+	// The limit for the number of thread death entries in a team; the oldest
+	// goes when it is reached. Such an entry is all that is left of a thread
+	// that ended with nobody waiting for it, for a wait_for_thread() that
+	// comes later, and the kernel cannot tell the threads nobody will ever
+	// wait for: detached ones, windows and loopers that quit by themselves.
+	// Without a limit a program that runs for long keeps one for every such
+	// thread it ever had. (The limit was 32 once, which programs that start
+	// many threads and join them later ran into.)
 
 struct team_loading_info {
 	ConditionVariable	condition;
@@ -465,6 +505,10 @@ struct Team : TeamThreadIteratorEntry<team_id>, KernelReferenceable,
 	struct xsi_sem_context *xsi_sem_context;
 	struct team_death_entry *death_entry;	// protected by fLock
 	ThreadDeathEntryList	dead_threads;
+		// oldest first; at most MAX_DEAD_THREADS
+	ThreadDeathEntryTree	dead_threads_tree;
+		// the same entries, for the lookup
+	int32			dead_threads_count;
 
 	// protected by the team's fLock
 	team_dead_children dead_children;

@@ -68,6 +68,10 @@ SimpleTest scheduler_pinned_power_saving_test
 	: scheduler_pinned_power_saving_test.cpp ;
 SimpleTest port_delete_race_test : port_delete_race_test.cpp ;
 
+# a team's entries for its exited threads: joining later, and the cost of a
+# join after many detached threads (airos-works/haiku#190)
+SimpleTest dead_threads_test : dead_threads_test.cpp ;
+
 SimpleTest hello_avx : hello_avx.c ;
 local avxSource = [ FGristFiles hello_avx.c ] ;
 local avxObject = $(avxSource:S=$(SUFOBJ)) ;
