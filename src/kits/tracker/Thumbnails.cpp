@@ -17,6 +17,7 @@
 #include <Application.h>
 #include <Autolock.h>
 #include <BitmapStream.h>
+#include <Entry.h>
 #include <Messenger.h>
 #include <Mime.h>
 #include <Node.h>
@@ -400,26 +401,6 @@ GenerateThumbnailJob::Execute()
 
 	// we have translated the image file into a BBitmap
 
-	// now, scale and directly insert into the icon cache
-	BBitmap tmp(NULL, false);
-	ScaleBitmap(image, tmp, fRequestedSize, fColorSpace);
-
-	BBitmap* cacheThumb = new BBitmap(tmp.Bounds(), 0, tmp.ColorSpace());
-	cacheThumb->ImportBits(&tmp);
-
-	NodeIconCache* nodeIconCache = &IconCache::sIconCache->fNodeCache;
-	AutoLocker<NodeIconCache> cacheLocker(nodeIconCache);
-	NodeCacheEntry* entry = nodeIconCache->FindItem(&fNodeRef);
-	if (entry == NULL)
-		entry = nodeIconCache->AddItem(&fNodeRef);
-	if (entry == NULL) {
-		delete cacheThumb;
-		return B_NO_MEMORY;
-	}
-
-	entry->SetIcon(cacheThumb, kNormalIcon, fRequestedSize);
-	cacheLocker.Unlock();
-
 	// write values to attributes
 	bool thumbnailWritten = false;
 	bool canWrite = true;
@@ -447,28 +428,57 @@ GenerateThumbnailJob::Execute()
 		if (BTranslatorRoster::Default()->Translate(&thumbStream,
 					NULL, NULL, &stream, B_WEBP_FORMAT) == B_OK
 				&& thumbStream.DetachBitmap(&thumbPointer) == B_OK) {
-			// write WebP image data into an attribute
-			status = file.WriteAttr(kAttrThumbnail, B_RAW_TYPE, 0,
-				stream.Buffer(), stream.BufferLength());
-			thumbnailWritten = (status == B_OK);
-
-			// write thumbnail creation time into an attribute
+			// write thumbnail creation time into an attribute; first: a
+			// window redraws the icon when it is told that the thumbnail
+			// was written, and the thumbnail counts only with its time
 			int64_t created = real_time_clock();
 			file.WriteAttr(kAttrThumbnailCreationTime, B_TIME_TYPE,
 				0, &created, sizeof(int64_t));
+
+			// write WebP image data into an attribute (WriteAttr() returns
+			// the bytes written, not B_OK)
+			ssize_t written = file.WriteAttr(kAttrThumbnail, B_RAW_TYPE, 0,
+				stream.Buffer(), stream.BufferLength());
+			thumbnailWritten = written == (ssize_t)stream.BufferLength();
 		}
 	}
 
-	delete image;
-
-	// Manually trigger an icon refresh, if necessary.
-	// (If the attribute was written, node monitoring will handle this automatically.)
+	// If the attribute was written, node monitoring updates the icon, which
+	// is then read from it. Otherwise (a read-only volume) the icon cache
+	// keeps the thumbnail, and Tracker is told to update the icon.
+	// The cache's entries are by node, and only a pose's model removes its
+	// entry, when it goes away. So nothing is put there when the attribute
+	// was written (the window may have been closed meanwhile), nor for a
+	// file that was deleted or moved meanwhile: a new file that got the
+	// same node was drawn with this picture and never got its own.
 	if (!thumbnailWritten) {
-		// send Tracker a message to tell it to update the thumbnail
+		BEntry current(&fRef);
+		node_ref currentNode;
+		if (current.GetNodeRef(&currentNode) == B_OK
+			&& currentNode == fNodeRef) {
+			BBitmap tmp(NULL, false);
+			ScaleBitmap(image, tmp, fRequestedSize, fColorSpace);
+
+			BBitmap* cacheThumb = new BBitmap(tmp.Bounds(), 0,
+				tmp.ColorSpace());
+			cacheThumb->ImportBits(&tmp);
+
+			NodeIconCache* nodeIconCache = &IconCache::sIconCache->fNodeCache;
+			AutoLocker<NodeIconCache> cacheLocker(nodeIconCache);
+			NodeCacheEntry* entry = nodeIconCache->FindItem(&fNodeRef);
+			if (entry == NULL)
+				entry = nodeIconCache->AddItem(&fNodeRef);
+			if (entry != NULL)
+				entry->SetIcon(cacheThumb, kNormalIcon, fRequestedSize);
+			else
+				delete cacheThumb;
+		}
+
 		BMessage message(kUpdateThumbnail);
 		if (message.AddNodeRef("noderef", &fNodeRef) == B_OK)
 			be_app->PostMessage(&message);
 	}
+	delete image;
 
 	return B_OK;
 }
