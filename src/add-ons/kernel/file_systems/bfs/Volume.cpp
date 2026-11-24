@@ -61,14 +61,17 @@ disk_super_block::IsValid() const
 	// The log is read (replayed) at mount, from where its run says, and its
 	// length divides the positions in it: a run outside the volume or without
 	// blocks is not something to find out about in the block cache.
+	// (log_start and log_end are not bounded by the log's length: the journal
+	// takes them modulo the length, Initialize() sets both to the log's
+	// absolute block number, and a transaction that ends at the end of the
+	// log leaves log_end at the length itself.)
 	off_t logBlock = ((off_t)log_blocks.AllocationGroup()
 		<< AllocationGroupShift()) + log_blocks.Start();
 	if (log_blocks.AllocationGroup() < 0
 		|| log_blocks.AllocationGroup() >= AllocationGroups()
 		|| log_blocks.Length() == 0
 		|| logBlock + log_blocks.Length() > NumBlocks()
-		|| LogStart() < 0 || LogStart() >= log_blocks.Length()
-		|| LogEnd() < 0 || LogEnd() >= log_blocks.Length())
+		|| LogStart() < 0 || LogEnd() < 0)
 		return false;
 
 	// so is the root directory's inode
