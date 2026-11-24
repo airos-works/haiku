@@ -149,7 +149,10 @@ every distinct one out, with the method lists from the push buffer.
            -c:v hevc_nvenc -preset p4 -rc constqp -qp 26 -bf 0 -g 300 -f null -
 
    the same with `-bf 2` (`hevc-b`; Pascal has no H.265 B pictures, the
-   driver will say so), and with `-c:v h264_nvenc -bf 2` (`h264-b`).
+   driver will say so), and with `-c:v h264_nvenc -bf 2` (`h264-b`). The
+   same with `-re` in front of `-f lavfi` sends the pictures at their real
+   rate, so each picture's setup stays in place for 33 ms and is caught
+   whole; at full speed some pictures go by between two looks.
 4. On air/OS, the add-on's own buffers for the same size:
    `NVENC_DUMP=<directory> nvenctest <add-on> hevc 1280 736 4 out.265 26`
    (H.265 here wants a last block row more than half full, so not 720).
@@ -157,10 +160,21 @@ every distinct one out, with the method lists from the push buffer.
 In `hevc-p`, a `setup-*.bin` whose `pic_control.pic_type` is 0 is a P
 picture: compare it field by field with `ours-0001.bin` (both are an
 `nvenc_h265_drv_pic_setup_s` followed by the controls at the offsets the
-picture control names), and the `methods-*.bin` of a P picture with the
-methods `nvencHevcEncode()` sends. The shim only reads; it was tried against
-a stand-in program, not yet against the driver, so if it finds nothing check
-that the buffers are in a `/dev/nvidia*` mapping (`/proc/<pid>/maps`).
+picture control names; the shim writes 16 KB from the magic on, so the
+controls are in it wherever NVIDIA's driver puts them), and the
+`methods-*.bin` of a P picture with the methods `nvencHevcEncode()` sends.
+A buffer is written again whenever it changes, so a picture can have a copy
+taken while the driver was still filling it in: the last copy from the same
+address before the next picture is the one to use. `index.txt` names each
+file's time, address and mapping, `maps-*.txt` are the program's mappings
+and `summary.txt` the counts. Without `NVSETUP_CLASS` any NVENC class's
+magic is taken. The shim only reads; it was tried against a stand-in
+program (`/dev/nvidia*` mappings that change, vanish and fault, a handler of
+the program's own), not yet against the driver, so if it finds nothing
+check that the buffers are in a `/dev/nvidia*` mapping (`maps-*.txt`), try
+`NVSETUP_UVM=1` (the `/dev/nvidia-uvm` mappings too) and look through the
+raw copies `NVSETUP_RAW=2500,3500` makes of the driver's mappings at those
+times (ms after start).
 
 `NVENC_DEBUG=1` makes the add-on print the error notifier and the status
 words of each picture, `NVENC_RC_DEBUG=1` each picture's kind, QP, size and
