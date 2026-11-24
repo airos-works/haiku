@@ -29,12 +29,15 @@ public:
 private:
 	static	status_t			_WriterThreadEntry(void* _this);
 			status_t			_PageWriter();
+			void				_SetUnwritablePages(page_num_t count);
 
 private:
 			thread_id			fWriterThread;
 			BinarySemaphore		fPageWriterCondition;
 
 			bigtime_t			fLastAveragePageWriteDuration;
+			page_num_t			fUnwritablePages = 0;
+				// pages the page writer saw it cannot write, see IsOverQuota()
 
 private:
 	static	ConditionVariable	sUnderQuotaCondition;

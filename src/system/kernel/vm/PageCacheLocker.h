@@ -14,26 +14,29 @@ struct vm_page;
 class PageCacheLocker {
 public:
 	inline						PageCacheLocker(vm_page* page,
-									bool dontWait = true);
+									bool dontWait = true,
+									bool ignoreWired = true);
 	inline						~PageCacheLocker();
 
 			bool				IsLocked() { return fPage != NULL; }
 
-			bool				Lock(vm_page* page, bool dontWait = true);
+			bool				Lock(vm_page* page, bool dontWait = true,
+									bool ignoreWired = true);
 			void				Unlock();
 
 private:
-			bool				_IgnorePage(vm_page* page);
+			bool				_IgnorePage(vm_page* page, bool ignoreWired);
 
 			vm_page*			fPage;
 };
 
 
-PageCacheLocker::PageCacheLocker(vm_page* page, bool dontWait)
+PageCacheLocker::PageCacheLocker(vm_page* page, bool dontWait,
+	bool ignoreWired)
 	:
 	fPage(NULL)
 {
-	Lock(page, dontWait);
+	Lock(page, dontWait, ignoreWired);
 }
 
 

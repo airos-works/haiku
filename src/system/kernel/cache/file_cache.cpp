@@ -42,6 +42,10 @@
 
 #define BYPASS_IO_SIZE		65536
 
+static const bigtime_t kModifiedQuotaTimeout = 10 * 1000 * 1000;
+	// how long a write waits for the page writer to get its device's
+	// modified pages under the quota before it adds its own regardless
+
 // cached pages a read copies with one round trip of the cache's lock
 #define COPY_RUN_PAGES		16
 #define LAST_ACCESSES		3
@@ -889,9 +893,16 @@ do_cache_io(void* _cacheRef, off_t offset, addr_t buffer,
 						toModified++;
 				}
 
+				// Not for ever, though: our caller usually holds locks of
+				// its file system (BFS its journal, for a write that grows
+				// the file), and the pages over the quota may need one of
+				// those to go away. After a while this write goes ahead.
 				locker.Unlock();
-				status = modifiedQueue->WaitIfOverQuota(toModified, 0, B_CAN_INTERRUPT);
+				status = modifiedQueue->WaitIfOverQuota(toModified,
+					kModifiedQuotaTimeout, B_CAN_INTERRUPT | B_RELATIVE_TIMEOUT);
 				locker.Lock();
+				if (status == B_TIMED_OUT)
+					status = B_OK;
 				if (status != B_OK)
 					return partial(status);
 			}

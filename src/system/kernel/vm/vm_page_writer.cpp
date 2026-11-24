@@ -50,6 +50,10 @@
 #define PAGES_FLUSH_DURATION_GLOBAL_QUOTA		(5 * 1000 * 1000)
 	// target maximum time needed to write out all modified pages, in one & all queues
 
+#define PAGE_WRITER_IDLE_PASS_BREAK				250000
+	// how long the page writer rests after it went through its whole queue
+	// and found nothing it can write
+
 ConditionVariable ModifiedPageQueue::sUnderQuotaCondition;
 int64 ModifiedPageQueue::sGlobalModifiedCount = 0;
 bigtime_t ModifiedPageQueue::sGlobalEstimatedWriteDuration = -1;
@@ -112,6 +116,7 @@ public:
 
 	void Start(uint32 flags);
 	uint32 Finish();
+	void ReleaseReferences();
 
 	void PageWritten(PageWriteTransfer* transfer, status_t status,
 		bool partialTransfer, size_t bytesTransferred);
@@ -508,7 +513,8 @@ PageWriterRun::Start(uint32 flags)
 
 
 /*!	Waits for the writes Start() scheduled, and marks the pages depending on
-	the outcome.
+	the outcome. A run that holds references has to release them afterwards
+	(ReleaseReferences()).
 	\return The number of pages that could not be written or otherwise handled.
 */
 uint32
@@ -546,6 +552,17 @@ PageWriterRun::Finish()
 
 	ASSERT(wrapperIndex == fWrapperCount);
 
+	return failedPages;
+}
+
+
+/*!	Releases the cache and store references of a finished run's pages.
+	This can be the last reference to a vnode, and then to its cache: file
+	system locks may be waited for here.
+*/
+void
+PageWriterRun::ReleaseReferences()
+{
 	for (uint32 i = 0; fHoldsReferences && i < fTransferCount; i++) {
 		PageWriteTransfer& transfer = fTransfers[i];
 		struct VMCache* cache = transfer.Cache();
@@ -558,8 +575,6 @@ PageWriterRun::Finish()
 			cache->ReleaseRef();
 		}
 	}
-
-	return failedPages;
 }
 
 
@@ -638,8 +653,9 @@ ModifiedPageQueue::_PageWriter()
 		if (pendingRun == NULL)
 			return;
 
-		uint32 failedPages = pendingRun->Finish();
+		PageWriterRun* run = pendingRun;
 		pendingRun = NULL;
+		uint32 failedPages = run->Finish();
 
 		if (failedPages == pendingPages)
 			pagesSinceLastSuccessfulWrite += pendingPagesSeen;
@@ -655,8 +671,13 @@ ModifiedPageQueue::_PageWriter()
 		}
 		lastFinished = now;
 
+		// Those who wait for the quota hear of the written pages before the
+		// references are released: the last reference to a vnode can make
+		// us wait for a file system lock, which one of them may hold.
 		if (!IsOverQuota())
 			sUnderQuotaCondition.NotifyAll();
+
+		run->ReleaseReferences();
 	};
 
 	while (fWriterThread >= 0) {
@@ -682,6 +703,7 @@ ModifiedPageQueue::_PageWriter()
 
 		page_num_t modifiedPages = queue.Count();
 		if (modifiedPages == 0) {
+			_SetUnwritablePages(0);
 			finishPendingRun();
 			continue;
 		}
@@ -722,12 +744,17 @@ ModifiedPageQueue::_PageWriter()
 
 		page_num_t maxPagesToSee = modifiedPages;
 
+		// pages we cannot write as long as their vnode is on its way out
+		page_num_t unwritablePages = 0;
+		VMCache* unwritableCache = NULL;
+
 		while (numPages < kNumPages && maxPagesToSee > 0) {
 			vm_page *page = next_modified_page(queue, maxPagesToSee);
 			if (page == NULL)
 				break;
 
-			PageCacheLocker cacheLocker(page, false);
+			// (wired pages included: they are taken out of the queue below)
+			PageCacheLocker cacheLocker(page, false, false);
 			if (!cacheLocker.IsLocked())
 				continue;
 
@@ -767,11 +794,15 @@ ModifiedPageQueue::_PageWriter()
 			}
 
 			// We need our own reference to the store, as it might currently be
-			// destroyed.
-			if (cache->AcquireUnreferencedStoreRef() != B_OK) {
+			// destroyed. Then the page stays where it is: whoever frees the
+			// vnode writes the page or drops it. That can take as long as a
+			// file system lock is waited for, so such pages are counted (and
+			// their vnode is asked for once only in a row of them).
+			if (cache == unwritableCache
+				|| cache->AcquireUnreferencedStoreRef() != B_OK) {
 				DEBUG_PAGE_ACCESS_END(page);
-				cacheLocker.Unlock();
-				thread_yield();
+				unwritableCache = cache;
+				unwritablePages++;
 				continue;
 			}
 
@@ -810,8 +841,27 @@ ModifiedPageQueue::_PageWriter()
 #ifdef TRACE_VM_PAGE_WRITER
 		pageCollectionTime += system_time();
 #endif
+		// What cannot be written does not count against the quota. (A run
+		// that got full did not see the whole queue: then this is the least
+		// there is.)
+		_SetUnwritablePages(unwritablePages);
+
 		if (numPages == 0) {
-			finishPendingRun();
+			if (pendingRun != NULL) {
+				finishPendingRun();
+				continue;
+			}
+
+			// Through the whole queue, and no page in it can be written now:
+			// they are busy (being filled, or written by someone else) or
+			// belong to vnodes that are being freed. With kNumPages or more
+			// of them we would be back here at once, and go round at full
+			// speed for as long as that takes, which is forever if what
+			// keeps the pages waits for someone who waits for the quota
+			// (airos-works/haiku#146). Those have been told above; rest.
+			if (!IsOverQuota())
+				sUnderQuotaCondition.NotifyAll();
+			snooze(PAGE_WRITER_IDLE_PASS_BREAK);
 			continue;
 		}
 
@@ -1138,6 +1188,7 @@ ModifiedPageQueue::StartWriter(const char* name)
 
 	fPageWriterCondition.Init("pgwr");
 	fLastAveragePageWriteDuration = 0;
+	fUnwritablePages = 0;
 
 	char threadName[B_OS_NAME_LENGTH];
 	snprintf(threadName, sizeof(threadName), "page writer: %s", name);
@@ -1150,12 +1201,41 @@ ModifiedPageQueue::StartWriter(const char* name)
 }
 
 
+void
+ModifiedPageQueue::_SetUnwritablePages(page_num_t count)
+{
+	InterruptsSpinLocker _(fLock);
+	fUnwritablePages = count;
+}
+
+
+/*!	Whether writing out the queue's pages, and \a additionalPages more, is
+	estimated to take longer than the quota allows.
+
+	Only pages the page writer can write count: those it found it cannot
+	(their vnode is being freed) leave the queue when someone else is done
+	with them, and that someone may be waiting, directly or not, for a thread
+	that waits for the quota with a file system lock held.
+
+	For the same reason a queue with nothing to write is never over its own
+	quota, whatever \a additionalPages come to: the estimate is as good as
+	the last run was typical (a single one that the device stalled in can put
+	it at seconds for a handful of pages), and nothing is written that would
+	replace it as long as nobody may add a page.
+*/
 bool
 ModifiedPageQueue::IsOverQuota(page_num_t additionalPages)
 {
 	InterruptsSpinLocker _(fLock);
 
-	bigtime_t estimatedWriteDuration = (fCount * fLastAveragePageWriteDuration);
+	// (pages the page writer could not write may have left the queue since
+	// it looked: what was added after that counts in full)
+	if (fUnwritablePages > fCount)
+		fUnwritablePages = fCount;
+	const page_num_t writablePages = fCount - fUnwritablePages;
+
+	bigtime_t estimatedWriteDuration
+		= (writablePages * fLastAveragePageWriteDuration);
 	if ((int64)fCount != fLastReportedModifiedCount
 			|| estimatedWriteDuration != fLastReportedEstimatedWriteDuration) {
 		atomic_add64(&sGlobalModifiedCount, fCount - fLastReportedModifiedCount);
@@ -1164,6 +1244,12 @@ ModifiedPageQueue::IsOverQuota(page_num_t additionalPages)
 		atomic_add64(&sGlobalEstimatedWriteDuration,
 			estimatedWriteDuration - fLastReportedEstimatedWriteDuration);
 		fLastReportedEstimatedWriteDuration = estimatedWriteDuration;
+	}
+
+	if (writablePages == 0) {
+		// only what the other queues hold can be too much
+		return atomic_get64(&sGlobalEstimatedWriteDuration)
+			> PAGES_FLUSH_DURATION_GLOBAL_QUOTA;
 	}
 
 	bigtime_t additionalPagesDuration = fLastAveragePageWriteDuration * additionalPages;
