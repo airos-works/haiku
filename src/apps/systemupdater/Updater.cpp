@@ -55,6 +55,28 @@ using BPackageKit::BPrivate::BDaemonClient;
 static const char* const kShaCacheFile = kStateDirectory "/sha256-cache";
 
 
+/*!	Loads the cache of package hashes for one check, and has it tidied up
+	on every way out of it.
+*/
+class ShaCacheSession {
+public:
+	ShaCacheSession(ShaCache& cache)
+		:
+		fCache(cache)
+	{
+		fCache.Load();
+	}
+
+	~ShaCacheSession()
+	{
+		fCache.Flush();
+	}
+
+private:
+	ShaCache&	fCache;
+};
+
+
 UpdaterListener::~UpdaterListener()
 {
 }
@@ -146,7 +168,8 @@ time_stamp()
 Updater::Updater(UpdaterListener* listener)
 	:
 	fListener(listener),
-	fCancelled(0)
+	fCancelled(0),
+	fShaCache(kShaCacheFile, kPackagesDirectory)
 {
 }
 
@@ -306,49 +329,22 @@ Updater::ComputeSha256(const char* path, BString& _sha256,
 
 /*!	The SHA-256 of an installed package, remembered by its node, size and
 	modification time, so that each check reads only what changed.
+	PlanUpdate() loads the cache before the first call and tidies it up after
+	the last one.
 */
 status_t
 Updater::_InstalledSha256(const char* fileName, BString& _sha256)
 {
+	if (fShaCache.Lookup(fileName, _sha256))
+		return B_OK;
+
 	BString path(kPackagesDirectory);
 	path << '/' << fileName;
-	struct stat st;
-	if (stat(path, &st) != 0)
-		return errno;
-
-	BString key;
-	key.SetToFormat("%" B_PRIdINO " %" B_PRIdOFF " %" B_PRIdTIME " %s",
-		st.st_ino, st.st_size, st.st_mtime, fileName);
-
-	BString cache;
-	BFile cacheFile(kShaCacheFile, B_READ_ONLY);
-	if (cacheFile.InitCheck() == B_OK) {
-		off_t size;
-		if (cacheFile.GetSize(&size) == B_OK && size < 4 * 1024 * 1024) {
-			char* buffer = cache.LockBuffer(size + 1);
-			ssize_t bytesRead = cacheFile.ReadAt(0, buffer, size);
-			cache.UnlockBuffer(bytesRead > 0 ? bytesRead : 0);
-		}
-	}
-	BStringList lines;
-	cache.Split("\n", true, lines);
-	for (int32 i = 0; i < lines.CountStrings(); i++) {
-		const BString& line = lines.StringAt(i);
-		// "<sha256> <key>"
-		if (line.Length() > 65 && line.FindFirst(key) == 65) {
-			line.CopyInto(_sha256, 0, 64);
-			return B_OK;
-		}
-	}
-
 	status_t error = ComputeSha256(path, _sha256, NULL, &fCancelled);
 	if (error != B_OK)
 		return error;
 
-	if (FILE* file = fopen(kShaCacheFile, "a")) {
-		fprintf(file, "%s %s\n", _sha256.String(), key.String());
-		fclose(file);
-	}
+	fShaCache.Add(fileName, _sha256);
 	return B_OK;
 }
 
@@ -711,6 +707,10 @@ Updater::PlanUpdate(const Release& release, const SystemState& state,
 		_error = "cannot read the installed packages";
 		return B_ERROR;
 	}
+
+	// The hashes of the installed packages: read once for this plan, and
+	// reduced to the packages that are installed when it is done.
+	ShaCacheSession cacheSession(fShaCache);
 
 	// What the installed release had, to remove what the new one drops. A
 	// record made from the installed packages (a system installed from an

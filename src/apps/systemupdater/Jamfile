@@ -14,6 +14,7 @@ Application SystemUpdater :
 	PiBoot.cpp
 	Release.cpp
 	Settings.cpp
+	ShaCache.cpp
 	SystemState.cpp
 	SystemUpdaterApp.cpp
 	Updater.cpp

@@ -1,0 +1,11 @@
+SubDir HAIKU_TOP src tests apps systemupdater ;
+
+SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src apps systemupdater ] ;
+UseHeaders [ FDirName $(HAIKU_TOP) src apps systemupdater ] ;
+
+# the System Updater's cache of package hashes: stays the size of what is
+# installed, reads files of older versions of any size
+SimpleTest SystemUpdaterShaCacheTest
+	: ShaCacheTest.cpp ShaCache.cpp
+	: be [ TargetLibstdc++ ]
+;

@@ -12,6 +12,7 @@
 
 #include "Feed.h"
 #include "Release.h"
+#include "ShaCache.h"
 #include "SystemState.h"
 
 
@@ -160,6 +161,7 @@ private:
 			BString				fFeedOverride;
 			Fetcher				fFetcher;
 			int32				fCancelled;
+			ShaCache			fShaCache;
 };
 
 
