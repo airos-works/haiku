@@ -511,6 +511,15 @@ create_sem_etc(int32 count, const char* name, team_id owner)
 		sem->u.used.name = tempName;
 		sem->u.used.owner = team->id;
 		sem->u.used.select_infos = NULL;
+		// The slot still holds what its previous semaphore left here:
+		// get_sem_info() and KDL would name a thread that never touched
+		// this one.
+		sem->u.used.last_acquirer = 0;
+#if DEBUG_SEM_LAST_ACQUIRER
+		sem->u.used.last_acquire_count = 0;
+		sem->u.used.last_releaser = 0;
+		sem->u.used.last_release_count = 0;
+#endif
 		id = sem->id;
 
 		list_add_item(&team->sem_list, &sem->u.used.team_link);

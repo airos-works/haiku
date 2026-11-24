@@ -46,6 +46,10 @@ SimpleTest fragmented_write_test : fragmented_write_test.cpp ;
 # device (it skips itself on a fast one), so not in tools/airos/ci/guest-tests.
 SimpleTest page_writer_stall_test : page_writer_stall_test.cpp ;
 
+# a new semaphore reported the latest holder of the one that had its slot
+# before (airos-works/haiku#153)
+SimpleTest sem_slot_reuse_test : sem_slot_reuse_test.cpp ;
+
 SimpleTest hello_avx : hello_avx.c ;
 local avxSource = [ FGristFiles hello_avx.c ] ;
 local avxObject = $(avxSource:S=$(SUFOBJ)) ;
