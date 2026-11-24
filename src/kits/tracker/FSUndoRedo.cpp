@@ -55,6 +55,7 @@ All rights reserved.
 #include <time.h>
 
 #include <map>
+#include <vector>
 
 #include "Attributes.h"
 
@@ -81,8 +82,16 @@ class UndoItem {
 		virtual bool ConfirmUndo() { return true; }
 			// asks the user first when undoing would destroy something
 
-		virtual void UpdateEntry(BEntry* /*entry*/, const char* /*name*/) {}
-			// updates the name of the target from the source entry "entry"
+		virtual void Done(const entry_ref& /*source*/,
+			const entry_ref& /*target*/) {}
+			// source arrived as target: see Undo::Done()
+
+		virtual bool IsEmpty() const { return false; }
+			// nothing was done that could be undone: the item is dropped
+
+		virtual bool RedoRecordsAnew() const { return false; }
+			// Redo() runs the operation again and that run makes its own
+			// undo item, of what it did this time
 };
 
 
@@ -144,6 +153,25 @@ ChangedSince(const entry_ref& ref, time_t when)
 	return entry.GetStat(&st) == B_OK && st.st_mtime > when + 2;
 }
 
+
+
+// The items of list that are still the nodes they were when the operation
+// put them there: someone else's file of the same name is none of ours.
+static BObjectList<entry_ref, true>*
+StillTheSame(const BObjectList<entry_ref, true>& list,
+	const std::vector<node_ref>& nodes)
+{
+	BObjectList<entry_ref, true>* same = new BObjectList<entry_ref, true>(10);
+	for (int32 index = 0; index < list.CountItems(); index++) {
+		BEntry entry(list.ItemAt(index));
+		node_ref node;
+		if (entry.GetNodeRef(&node) == B_OK && node == nodes[index])
+			same->AddItem(new entry_ref(*list.ItemAt(index)));
+	}
+	return same;
+}
+
+
 static BObjectList<UndoItem> sUndoList, sRedoList;
 static BLocker sLock("undo");
 
@@ -157,11 +185,16 @@ class UndoItemCopy : public UndoItem {
 		virtual status_t Redo();
 		virtual BString Description() const;
 		virtual bool ConfirmUndo();
-		virtual void UpdateEntry(BEntry* entry, const char* name);
+		virtual void Done(const entry_ref& source, const entry_ref& target);
+		virtual bool IsEmpty() const { return fTargetList.IsEmpty(); }
+		virtual bool RedoRecordsAnew() const { return true; }
 
 	private:
 		BObjectList<entry_ref, true> fSourceList;
 		BObjectList<entry_ref, true> fTargetList;
+			// what the copy made: whole files and folders, and inside
+			// folders that were there before what it put into them
+		std::vector<node_ref> fTargetNodes;
 		entry_ref	fSourceRef, fTargetRef;
 		uint32		fMoveMode;
 		time_t		fTime;
@@ -180,9 +213,19 @@ class UndoItemMove : public UndoItem {
 		virtual status_t Undo();
 		virtual status_t Redo();
 		virtual BString Description() const;
+		virtual void Done(const entry_ref& source, const entry_ref& target);
+		virtual bool IsEmpty() const { return fMovedList.IsEmpty(); }
+		virtual bool RedoRecordsAnew() const { return true; }
 
 	private:
 		BObjectList<entry_ref, true> fSourceList;
+			// what was asked to move; after Undo(), what was put back
+		BObjectList<entry_ref, true> fMovedList;
+			// the items of fSourceList that moved as a whole, where they
+			// are now, under the names they got
+		BObjectList<entry_ref, true> fMovedFromList;
+			// and where each of them was
+		std::vector<node_ref> fMovedNodes;
 		entry_ref	fSourceRef, fTargetRef;
 };
 
@@ -322,26 +365,8 @@ class UndoItemRestore : public UndoItem {
 //--------------------------
 
 
-static status_t
-ChangeListSource(BObjectList<entry_ref, true> &list, BEntry &entry)
-{
-	node_ref source;
-	if (entry.GetNodeRef(&source) != B_OK)
-		return B_ERROR;
-
-	for (int32 index = 0; index < list.CountItems(); index++) {
-		entry_ref* ref = list.ItemAt(index);
-
-		ref->device = source.device;
-		ref->directory = source.node;
-	}
-
-	return B_OK;
-}
-
-
 static void
-AddUndoItem(UndoItem* item)
+AddUndoItem(UndoItem* item, bool clearRedoList = true)
 {
 	BAutolock locker(sLock);
 
@@ -351,7 +376,7 @@ AddUndoItem(UndoItem* item)
 
 	sUndoList.AddItem(item, 0);
 
-	while (!sRedoList.IsEmpty())
+	while (clearRedoList && !sRedoList.IsEmpty())
 		delete sRedoList.RemoveItemAt(0);
 }
 
@@ -359,18 +384,47 @@ AddUndoItem(UndoItem* item)
 //	#pragma mark - Undo
 
 
+Undo::Undo()
+	:
+	fUndo(NULL),
+	fFromRedo(false)
+{
+}
+
+
 Undo::~Undo()
 {
-	if (fUndo != NULL)
-		AddUndoItem(fUndo);
+	if (fUndo == NULL)
+		return;
+
+	if (fUndo->IsEmpty()) {
+		// everything was skipped, or the operation was cancelled before it
+		// did anything: an item would only undo what it did not do
+		delete fUndo;
+	} else
+		AddUndoItem(fUndo, !fFromRedo);
 }
 
 
 void
-Undo::UpdateEntry(BEntry* entry, const char* destName)
+Undo::Done(const entry_ref& source, const BDirectory* destDir,
+	const char* destName)
 {
-	if (fUndo != NULL)
-		fUndo->UpdateEntry(entry, destName);
+	if (fUndo == NULL)
+		return;
+
+	node_ref destNode;
+	if (destDir->GetNodeRef(&destNode) != B_OK)
+		return;
+
+	fUndo->Done(source, entry_ref(destNode.device, destNode.node, destName));
+}
+
+
+void
+Undo::SetFromRedo()
+{
+	fFromRedo = true;
 }
 
 
@@ -423,7 +477,7 @@ UndoItemCopy::UndoItemCopy(BObjectList<entry_ref, true>* sourceList,
 	BDirectory &target, BList* /*pointList*/, uint32 moveMode)
 	:
 	fSourceList(*sourceList),
-	fTargetList(*sourceList),
+	fTargetList(20),
 	fMoveMode(moveMode),
 	fTime(time(NULL))
 {
@@ -436,7 +490,6 @@ UndoItemCopy::UndoItemCopy(BObjectList<entry_ref, true>* sourceList,
 	BEntry targetEntry;
 	target.GetEntry(&targetEntry);
 	targetEntry.GetRef(&fTargetRef);
-	ChangeListSource(fTargetList, targetEntry);
 }
 
 
@@ -448,7 +501,16 @@ UndoItemCopy::~UndoItemCopy()
 status_t
 UndoItemCopy::Undo()
 {
-	FSDeleteRefList(new BObjectList<entry_ref, true>(fTargetList), true, false);
+	// deletes for good, so only what the copy made, and only while it still
+	// is what the copy made
+	BObjectList<entry_ref, true>* list = StillTheSame(fTargetList,
+		fTargetNodes);
+	if (list->IsEmpty()) {
+		delete list;
+		return B_OK;
+	}
+
+	FSDeleteRefList(list, true, false);
 	return B_OK;
 }
 
@@ -456,28 +518,25 @@ UndoItemCopy::Undo()
 status_t
 UndoItemCopy::Redo()
 {
+	// a new copy, which may meet other items than the first one: it makes
+	// its own undo item (see RedoRecordsAnew())
 	FSMoveToFolder(new BObjectList<entry_ref, true>(fSourceList),
-		new BEntry(&fTargetRef), FSUndoMoveMode(fMoveMode), NULL);
+		new BEntry(&fTargetRef), FSRedoMoveMode(fMoveMode), NULL);
 
 	return B_OK;
 }
 
 
 void
-UndoItemCopy::UpdateEntry(BEntry* entry, const char* name)
+UndoItemCopy::Done(const entry_ref& /*source*/, const entry_ref& target)
 {
-	entry_ref changedRef;
-	if (entry->GetRef(&changedRef) != B_OK)
+	BEntry entry(&target);
+	node_ref node;
+	if (entry.GetNodeRef(&node) != B_OK)
 		return;
 
-	for (int32 index = 0; index < fSourceList.CountItems(); index++) {
-		entry_ref* ref = fSourceList.ItemAt(index);
-		if (changedRef != *ref)
-			continue;
-
-		ref = fTargetList.ItemAt(index);
-		ref->set_name(name);
-	}
+	fTargetList.AddItem(new entry_ref(target));
+	fTargetNodes.push_back(node);
 }
 
 
@@ -487,7 +546,9 @@ UndoItemCopy::UpdateEntry(BEntry* entry, const char* name)
 UndoItemMove::UndoItemMove(BObjectList<entry_ref, true>* sourceList,
 	BDirectory &target, BList* /*pointList*/)
 	:
-	fSourceList(*sourceList)
+	fSourceList(*sourceList),
+	fMovedList(20),
+	fMovedFromList(20)
 {
 	BEntry entry(sourceList->ItemAt(0));
 	BEntry source;
@@ -505,16 +566,82 @@ UndoItemMove::~UndoItemMove()
 }
 
 
+void
+UndoItemMove::Done(const entry_ref& source, const entry_ref& target)
+{
+	// Only items that moved as a whole go back. What moved into a folder
+	// that was there before stays: taking that folder back would take what
+	// was in it along.
+	bool asked = false;
+	for (int32 index = 0; index < fSourceList.CountItems() && !asked; index++)
+		asked = *fSourceList.ItemAt(index) == source;
+	if (!asked)
+		return;
+
+	BEntry entry(&target);
+	node_ref node;
+	if (entry.GetNodeRef(&node) != B_OK)
+		return;
+
+	fMovedList.AddItem(new entry_ref(target));
+	fMovedFromList.AddItem(new entry_ref(source));
+	fMovedNodes.push_back(node);
+}
+
+
 status_t
 UndoItemMove::Undo()
 {
-	BObjectList<entry_ref, true>* list = new BObjectList<entry_ref, true>(fSourceList);
-	BEntry entry(&fTargetRef);
-	ChangeListSource(*list, entry);
+	// only what moved, and only while it still is what moved: another item
+	// of the name is none of ours
+	BEntry target(&fTargetRef);
+	bool fromTrash = FSIsTrashDir(&target);
+	BEntry source(&fSourceRef);
+	node_ref sourceNode;
+	source.GetNodeRef(&sourceNode);
 
-	// FSMoveToFolder() owns its arguments
-	FSMoveToFolder(list, new BEntry(&fSourceRef),
-		FSUndoMoveMode(kMoveSelectionTo), NULL);
+	// Out of the Trash an item goes back to where it was under the name it
+	// had, as "Restore" does (in the Trash it may have got another one).
+	// Anything else moves back under the name it has now: one that was
+	// renamed to keep both keeps that name.
+	BObjectList<entry_ref, true>* moveList
+		= new BObjectList<entry_ref, true>(10);
+	BObjectList<entry_ref, true>* restoreList
+		= new BObjectList<entry_ref, true>(10);
+	fSourceList.MakeEmpty();
+		// Redo moves what is put back now
+	for (int32 index = 0; index < fMovedList.CountItems(); index++) {
+		entry_ref* ref = fMovedList.ItemAt(index);
+		BEntry entry(ref);
+		node_ref node;
+		BString originalPath;
+		if (entry.GetNodeRef(&node) != B_OK || node != fMovedNodes[index]) {
+			// gone, or another item of the name: none of ours
+			continue;
+		}
+
+		if (fromTrash && BNode(&entry).ReadAttrString(kAttrOriginalPath,
+				&originalPath) == B_OK) {
+			restoreList->AddItem(new entry_ref(*ref));
+			fSourceList.AddItem(new entry_ref(*fMovedFromList.ItemAt(index)));
+		} else {
+			moveList->AddItem(new entry_ref(*ref));
+			fSourceList.AddItem(new entry_ref(sourceNode.device,
+				sourceNode.node, ref->name));
+		}
+	}
+
+	// both own their arguments
+	if (!restoreList->IsEmpty())
+		FSRestoreRefList(restoreList, true, false);
+	else
+		delete restoreList;
+
+	if (!moveList->IsEmpty()) {
+		FSMoveToFolder(moveList, new BEntry(&fSourceRef),
+			FSUndoMoveMode(kMoveSelectionTo), NULL);
+	} else
+		delete moveList;
 
 	return B_OK;
 }
@@ -523,9 +650,10 @@ UndoItemMove::Undo()
 status_t
 UndoItemMove::Redo()
 {
+	// a new move, which makes its own undo item (see RedoRecordsAnew());
 	// FSMoveToFolder() owns its arguments
 	FSMoveToFolder(new BObjectList<entry_ref, true>(fSourceList),
-		new BEntry(&fTargetRef), FSUndoMoveMode(kMoveSelectionTo), NULL);
+		new BEntry(&fTargetRef), FSRedoMoveMode(kMoveSelectionTo), NULL);
 
 	return B_OK;
 }
@@ -1121,6 +1249,13 @@ FSRedo()
 
 	undoItem->Redo();
 		// ToDo: evaluate return code
+
+	if (undoItem->RedoRecordsAnew()) {
+		// the operation runs again and adds an undo item of what it does
+		// this time, when it is done
+		delete undoItem;
+		return;
+	}
 
 	if (sUndoList.CountItems() == kUndoRedoListMaxCount)
 		delete sUndoList.RemoveItemAt(sUndoList.CountItems() - 1);

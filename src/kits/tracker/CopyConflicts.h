@@ -20,7 +20,8 @@ namespace BPrivate {
 
 // Before a copy or move, every item that meets one of the same name in the
 // destination (also inside folders that are merged) is listed, and the user
-// decides for each: replace it, skip it, or keep both.
+// decides for each: replace it, skip it, or keep both. Two folders of one
+// name are not listed, they merge; a folder and a file of one name are.
 
 enum CopyConflictDecision {
 	kConflictReplace = 0,
@@ -38,7 +39,14 @@ struct CopyConflict {
 	off_t		existingSize;
 	time_t		sourceTime;
 	time_t		existingTime;
+	bool		sourceIsFolder;
+	bool		existingIsFolder;
+		// A folder that meets a file (or the other way round) cannot
+		// replace it: such a clash can only be skipped or keep both.
 	int32		decision;
+
+	bool		CanReplace() const
+					{ return sourceIsFolder == existingIsFolder; }
 };
 
 

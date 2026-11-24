@@ -103,8 +103,11 @@ CopyConflicts::_Add(const BEntry& source, const BEntry& existing,
 	conflict->existingSize = existingStat.st_size;
 	conflict->sourceTime = sourceStat.st_mtime;
 	conflict->existingTime = existingStat.st_mtime;
+	conflict->sourceIsFolder = S_ISDIR(sourceStat.st_mode);
+	conflict->existingIsFolder = S_ISDIR(existingStat.st_mode);
 	// newer items replace older ones unless the user says otherwise
-	conflict->decision = sourceStat.st_mtime > existingStat.st_mtime
+	conflict->decision = conflict->CanReplace()
+			&& sourceStat.st_mtime > existingStat.st_mtime
 		? kConflictReplace : kConflictSkip;
 
 	fByPath[conflict->existingPath.String()] = fConflicts.CountItems();
@@ -144,8 +147,11 @@ CopyConflicts::_FindIn(const BDirectory& sourceDir, const BDirectory& destDir,
 			BString subPrefix(displayName);
 			subPrefix << '/';
 			_FindIn(subSource, subDest, subPrefix, depth + 1);
-		} else if (!sourceIsDir && !existingIsDir)
+		} else {
+			// also a folder that meets a file: it has to be decided here,
+			// nothing asks later
 			_Add(entry, existing, displayName);
+		}
 	}
 }
 
@@ -173,9 +179,8 @@ CopyConflicts::Find(const BObjectList<entry_ref, true>* srcList,
 			BString prefix(ref->name);
 			prefix << '/';
 			_FindIn(subSource, subDest, prefix, 1);
-		} else if (!sourceIsDir && !existingIsDir)
+		} else
 			_Add(entry, existing, BString(ref->name));
-		// a file meeting a folder is refused later, with its own message
 	}
 
 	return !fConflicts.IsEmpty();
@@ -277,6 +282,15 @@ public:
 private:
 	void _Describe(BString& details)
 	{
+		if (!fConflict->CanReplace()) {
+			details = fConflict->sourceIsFolder
+				? B_TRANSLATE("A folder cannot replace a file: it is skipped, "
+					"or both are kept")
+				: B_TRANSLATE("A file cannot replace a folder: it is skipped, "
+					"or both are kept");
+			return;
+		}
+
 		BDateTimeFormat format;
 		char size[64];
 		BString when;
@@ -400,8 +414,13 @@ public:
 				bool selectedOnly = fList->CurrentSelection() >= 0;
 				for (int32 index = 0; index < fList->CountItems(); index++) {
 					ConflictItem* item = (ConflictItem*)fList->ItemAt(index);
-					if (!selectedOnly || item->IsSelected())
-						item->Conflict()->decision = decision;
+					if (selectedOnly && !item->IsSelected())
+						continue;
+					if (decision == kConflictReplace
+						&& !item->Conflict()->CanReplace()) {
+						continue;
+					}
+					item->Conflict()->decision = decision;
 				}
 				fList->Invalidate();
 				break;
@@ -415,9 +434,9 @@ public:
 					if (selectedOnly && !item->IsSelected())
 						continue;
 					CopyConflict* conflict = item->Conflict();
-					conflict->decision
-						= conflict->sourceTime > conflict->existingTime
-							? kConflictReplace : kConflictSkip;
+					conflict->decision = conflict->CanReplace()
+							&& conflict->sourceTime > conflict->existingTime
+						? kConflictReplace : kConflictSkip;
 				}
 				fList->Invalidate();
 				break;

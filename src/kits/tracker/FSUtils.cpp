@@ -133,6 +133,9 @@ status_t CalcItemsAndSize(CopyLoopControl* loopControl,
 status_t MoveItem(BEntry* entry, BDirectory* destDir, BPoint* loc,
 	uint32 moveMode, const char* newName, Undo &undo,
 	CopyLoopControl* loopControl);
+static bool CopyFolder(BEntry* srcEntry, BDirectory* destDir,
+	CopyLoopControl* loopControl, BPoint* loc, bool makeOriginalName,
+	Undo &undo, bool removeSource = false);
 ConflictCheckResult PreFlightNameCheck(BObjectList<entry_ref, true>* srcList,
 	const BDirectory* destDir, int32* collisionCount, uint32 moveMode);
 status_t CheckName(uint32 moveMode, const BEntry* srcEntry,
@@ -416,6 +419,13 @@ TrackerCopyLoopControl::OverwriteOnConflict(const BEntry* srcEntry,
 
 	int32 decision = fConflicts != NULL && destDir != NULL
 		? fConflicts->DecisionFor(*destDir, destName) : -1;
+
+	if (srcIsDir != dstIsDir) {
+		// A folder never takes the place of a file, nor a file that of a
+		// folder: one of them would be gone without anyone having said so.
+		return decision == kConflictSkip ? kSkip : kKeepBoth;
+	}
+
 	switch (decision) {
 		case kConflictSkip:
 			return kSkip;
@@ -1088,6 +1098,7 @@ MoveTask(BObjectList<entry_ref, true>* srcList, BEntry* destEntry, BList* pointL
 	volume.Unset();
 
 	bool fromUndo = FSIsUndoMoveMode(moveMode);
+	bool fromRedo = FSIsRedoMoveMode(moveMode);
 	moveMode = FSMoveMode(moveMode);
 
 	// if we're not passed a destEntry then we are supposed to move to trash
@@ -1136,10 +1147,14 @@ MoveTask(BObjectList<entry_ref, true>* srcList, BEntry* destEntry, BList* pointL
 		needSizeCalculation = false;
 
 	// we need the undo object later on, so we create it no matter
-	// if we really need it or not (it's very lightweight)
+	// if we really need it or not (it's very lightweight). It is told what
+	// was copied or moved as that happens (Undo::Done()), and adds itself
+	// to the undo list only if something was.
 	MoveCopyUndo undo(srcList, destDir, pointList, moveMode);
 	if (fromUndo)
 		undo.Remove();
+	else if (fromRedo)
+		undo.SetFromRedo();
 
 	TrackerCopyLoopControl loopControl;
 	CopyConflicts conflicts;
@@ -1326,13 +1341,16 @@ public:
 };
 
 
-void
+// Returns whether the file was copied, all of it: only then may the caller
+// of a move remove the source. A file that was skipped, or whose copy failed
+// and the user went on, was not.
+bool
 CopyFile(BEntry* srcFile, StatStruct* srcStat, BDirectory* destDir,
 	CopyLoopControl* loopControl, BPoint* loc, bool makeOriginalName,
 	Undo &undo)
 {
 	if (loopControl->SkipEntry(srcFile, true))
-		return;
+		return false;
 
 	node_ref node;
 	destDir->GetNodeRef(&node);
@@ -1356,29 +1374,35 @@ CopyFile(BEntry* srcFile, StatStruct* srcStat, BDirectory* destDir,
 		BString suffix(" ");
 		suffix << B_TRANSLATE_COMMENT("copy", "filename copy");
 		FSMakeOriginalName(destName, destDir, suffix);
-		undo.UpdateEntry(srcFile, destName);
 	}
 
+	bool overwritesInPlace = false;
 	BEntry conflictingEntry;
 	if (destDir->FindEntry(destName, &conflictingEntry) == B_OK) {
-		switch (loopControl->OverwriteOnConflict(srcFile, destName, destDir, false, false)) {
+		bool isDirectory = conflictingEntry.IsDirectory();
+		TrackerCopyLoopControl::OverwriteMode mode
+			= loopControl->OverwriteOnConflict(srcFile, destName, destDir,
+				false, isDirectory);
+		if (isDirectory && mode != TrackerCopyLoopControl::kSkip) {
+			// a file does not replace a folder, whatever was answered
+			mode = TrackerCopyLoopControl::kKeepBoth;
+		}
+
+		switch (mode) {
 			case TrackerCopyLoopControl::kSkip:
-				// we are about to ignore this entire directory
-				return;
+				return false;
 
 			case TrackerCopyLoopControl::kReplace:
-				if (!conflictingEntry.IsDirectory()) {
-					ThrowOnError(conflictingEntry.Remove());
-					break;
-				}
-				// fall through if not a directory
+				ThrowOnError(conflictingEntry.Remove());
+				break;
+
 			case TrackerCopyLoopControl::kMerge:
 				// This flag implies that the attributes should be kept on the file, ignore it.
+				overwritesInPlace = true;
 				break;
 
 			case TrackerCopyLoopControl::kKeepBoth:
 				MakeKeepBothName(destName, destDir);
-				undo.UpdateEntry(srcFile, destName);
 				break;
 		}
 	}
@@ -1390,6 +1414,14 @@ CopyFile(BEntry* srcFile, StatStruct* srcStat, BDirectory* destDir,
 			throw (status_t)err;
 
 		if (err != B_OK) {
+			// A part of a file under the name of the whole one is a trap,
+			// all the more when the source of a move stays because of it.
+			BEntry partEntry;
+			if (!overwritesInPlace
+				&& destDir->FindEntry(destName, &partEntry) == B_OK) {
+				partEntry.Remove();
+			}
+
 			if (!loopControl->FileError(
 					B_TRANSLATE_NOCOLLECT(kFileErrorString), destName, err,
 					true)) {
@@ -1398,8 +1430,14 @@ CopyFile(BEntry* srcFile, StatStruct* srcStat, BDirectory* destDir,
 				// user selected continue in spite of error, update status bar
 				loopControl->UpdateStatus(NULL, ref, srcStat->st_size);
 			}
+
+			// not copied: a move must leave the source where it is
+			return false;
 		}
 	}
+
+	undo.Done(ref, destDir, destName);
+	return true;
 }
 
 
@@ -1648,10 +1686,15 @@ CopyAttributes(CopyLoopControl* control, BNode* srcNode, BNode* destNode,
 }
 
 
-static void
+// Returns whether everything in the folder was copied. With removeSource,
+// each item is removed once its copy is complete, and the folder itself when
+// nothing is left in it: what was skipped, failed or is not copied at all
+// (special files, other volumes mounted below) stays where it is, with the
+// folders around it.
+static bool
 CopyFolder(BEntry* srcEntry, BDirectory* destDir,
 	CopyLoopControl* loopControl, BPoint* loc, bool makeOriginalName,
-	Undo &undo, bool removeSource = false)
+	Undo &undo, bool removeSource)
 {
 	BDirectory newDir;
 	BEntry entry;
@@ -1660,7 +1703,7 @@ CopyFolder(BEntry* srcEntry, BDirectory* destDir,
 	BEntry existingEntry;
 
 	if (loopControl->SkipEntry(srcEntry, false))
-		return;
+		return false;
 
 	entry_ref ref;
 	srcEntry->GetRef(&ref);
@@ -1674,7 +1717,6 @@ CopyFolder(BEntry* srcEntry, BDirectory* destDir,
 		BString suffix(" ");
 		suffix << B_TRANSLATE_COMMENT("copy", "filename copy");
 		FSMakeOriginalName(destName, destDir, suffix);
-		undo.UpdateEntry(srcEntry, destName);
 	}
 
 	if (destDir->FindEntry(destName, &existingEntry) == B_OK) {
@@ -1686,22 +1728,20 @@ CopyFolder(BEntry* srcEntry, BDirectory* destDir,
 			true, isDirectory)) {
 			case TrackerCopyLoopControl::kSkip:
 				// we are about to ignore this entire directory
-				return;
-
+				return false;
 
 			case TrackerCopyLoopControl::kReplace:
-				if (!isDirectory) {
-					// conflicting with a file or symbolic link, remove entry
-					ThrowOnError(existingEntry.Remove());
-					break;
-				}
-			// fall through if directory, do not replace.
 			case TrackerCopyLoopControl::kMerge:
 			case TrackerCopyLoopControl::kKeepBoth:
-				ASSERT(isDirectory);
-				// do not create a new directory, use the current one
-				newDir.SetTo(&existingEntry);
-				createDirectory = false;
+				if (isDirectory) {
+					// do not create a new directory, use the current one
+					newDir.SetTo(&existingEntry);
+					createDirectory = false;
+				} else {
+					// A file or symbolic link of that name: a folder does
+					// not replace it, whatever was answered. Both are kept.
+					MakeKeepBothName(destName, destDir);
+				}
 				break;
 		}
 	}
@@ -1727,9 +1767,16 @@ CopyFolder(BEntry* srcEntry, BDirectory* destDir,
 			}
 
 			// will allow rest of copy to continue
-			return;
+			return false;
 		}
+
+		// Undo removes the new folder as a whole. In a folder that was
+		// there before, it removes what is put into it (see below).
+		undo.Done(ref, destDir, destName);
 	}
+
+	Undo nothingToRecord;
+	Undo& undoInside = createDirectory ? nothingToRecord : undo;
 
 	char* buffer;
 	if (createDirectory && err == B_OK
@@ -1748,97 +1795,161 @@ CopyFolder(BEntry* srcEntry, BDirectory* destDir,
 	destDir->GetNodeRef(&destNodeRef);
 	SetupPoseLocation(ref.directory, destNodeRef.node, &srcDir, &newDir, loc);
 
-	while (srcDir.GetNextEntry(&entry) == B_OK) {
+	// When items are removed as they are copied, the folder is read first:
+	// not every file system goes on reading a folder correctly while entries
+	// are taken out of it (write_overlay skips some).
+	BObjectList<entry_ref, true> sourceRefs(20);
+	if (removeSource) {
+		entry_ref sourceRef;
+		while (srcDir.GetNextRef(&sourceRef) == B_OK)
+			sourceRefs.AddItem(new entry_ref(sourceRef));
+	}
+
+	bool complete = true;
+	for (int32 index = 0;; index++) {
+		if (removeSource) {
+			if (index >= sourceRefs.CountItems())
+				break;
+			entry.SetTo(sourceRefs.ItemAt(index));
+		} else if (srcDir.GetNextEntry(&entry) != B_OK)
+			break;
+
 		if (loopControl->CheckUserCanceled())
 			throw (status_t)kUserCanceled;
 
-		entry.GetStat(&statbuf);
+		if (entry.GetStat(&statbuf) != B_OK) {
+			complete = false;
+			continue;
+		}
 
 		if (S_ISDIR(statbuf.st_mode)) {
 			// entry is a mount point, do not copy it
 			if (statbuf.st_dev != sourceDeviceID) {
 				PRINT(("Avoiding mount point %" B_PRIdDEV ", %" B_PRIdDEV "\n",
 					statbuf.st_dev, sourceDeviceID));
+				complete = false;
 				continue;
 			}
 
-			CopyFolder(&entry, &newDir, loopControl, 0, false, undo, removeSource);
-			if (removeSource)
-				FSDeleteFolder(&entry, loopControl, true, true, false);
+			// removes the folder itself, if all of it was copied
+			if (!CopyFolder(&entry, &newDir, loopControl, 0, false, undoInside,
+					removeSource)) {
+				complete = false;
+			}
 		} else if (S_ISREG(statbuf.st_mode) || S_ISLNK(statbuf.st_mode)) {
-			CopyFile(&entry, &statbuf, &newDir, loopControl, 0, false, undo);
-			if (removeSource)
-				entry.Remove();
+			if (!CopyFile(&entry, &statbuf, &newDir, loopControl, 0, false,
+					undoInside)) {
+				complete = false;
+			} else if (removeSource && entry.Remove() != B_OK)
+				complete = false;
 		} else {
 			// Ignore special files
+			complete = false;
 		}
 	}
 
-	if (removeSource)
-		srcEntry->Remove();
-	else
+	if (removeSource) {
+		if (complete && srcEntry->Remove() != B_OK)
+			complete = false;
+	} else
 		srcEntry->Unset();
+
+	return complete;
 }
 
 
+// Moves a folder within a volume. Into a folder of its name that is already
+// there it moves what it contains, item by item (the folders in it likewise),
+// and removes what is empty afterwards. With newName the folder moves as a
+// whole, under that name. undo is told when it moved as a whole.
 status_t
-RecursiveMove(BEntry* entry, BDirectory* destDir, CopyLoopControl* loopControl)
+RecursiveMove(BEntry* entry, BDirectory* destDir, CopyLoopControl* loopControl,
+	const char* newName = NULL, Undo* undo = NULL)
 {
-	const char* name = entry->Name();
+	entry_ref ref;
+	MoveError::FailOnError(entry->GetRef(&ref));
 
-	if (destDir->Contains(name)) {
-		BPath path (destDir, name);
-		BDirectory subDir (path.Path());
-		entry_ref ref;
-		entry->GetRef(&ref);
-		BDirectory source(&ref);
-		if (source.InitCheck() == B_OK) {
-			// list the folder first: moving entries out of it while reading
-			// it skips some of them
-			BObjectList<entry_ref, true> entries(20);
-			source.Rewind();
-			entry_ref childRef;
-			while (source.GetNextRef(&childRef) == B_OK)
-				entries.AddItem(new entry_ref(childRef));
+	BEntry existing;
+	if (newName != NULL || destDir->FindEntry(ref.name, &existing) != B_OK
+		|| !existing.IsDirectory()) {
+		// nothing to merge with; this fails if a file of the name is in the
+		// way, it is not replaced
+		MoveError::FailOnError(entry->MoveTo(destDir, newName));
+		if (undo != NULL)
+			undo->Done(ref, destDir, newName != NULL ? newName : ref.name);
+		return B_OK;
+	}
 
-			for (int32 index = 0; index < entries.CountItems(); index++) {
-				BEntry current(entries.ItemAt(index));
-				if (current.InitCheck() != B_OK)
-					continue;
-				if (current.IsDirectory()) {
-					RecursiveMove(&current, &subDir, loopControl);
-					current.Remove();
-				} else {
-					name = current.Name();
-					switch (loopControl->OverwriteOnConflict(&current, name,
-							&subDir, false, false)) {
-						case TrackerCopyLoopControl::kSkip:
-							break;
+	BDirectory subDir(&existing);
+	BDirectory source(&ref);
+	if (source.InitCheck() == B_OK && subDir.InitCheck() == B_OK) {
+		// list the folder first: moving entries out of it while reading
+		// it skips some of them
+		BObjectList<entry_ref, true> entries(20);
+		source.Rewind();
+		entry_ref childRef;
+		while (source.GetNextRef(&childRef) == B_OK)
+			entries.AddItem(new entry_ref(childRef));
 
-						case TrackerCopyLoopControl::kKeepBoth:
-						{
-							char newName[B_FILE_NAME_LENGTH];
-							strlcpy(newName, name, sizeof(newName));
-							MakeKeepBothName(newName, &subDir);
-							MoveError::FailOnError(current.MoveTo(&subDir,
-								newName, false));
-							break;
-						}
+		for (int32 index = 0; index < entries.CountItems(); index++) {
+			BEntry current(entries.ItemAt(index));
+			if (current.InitCheck() != B_OK)
+				continue;
 
-						default:
-							MoveError::FailOnError(current.MoveTo(&subDir,
-								NULL, true));
-							break;
-					}
+			const char* name = entries.ItemAt(index)->name;
+			bool isDirectory = current.IsDirectory();
+			BEntry clash;
+			bool clashes = subDir.FindEntry(name, &clash) == B_OK;
+			bool clashIsDirectory = clashes && clash.IsDirectory();
+
+			if (isDirectory && (!clashes || clashIsDirectory)) {
+				// moves as a whole or merges, and is gone from here when
+				// nothing in it was skipped
+				RecursiveMove(&current, &subDir, loopControl);
+				continue;
+			}
+
+			TrackerCopyLoopControl::OverwriteMode mode
+				= TrackerCopyLoopControl::kReplace;
+			if (clashes) {
+				mode = loopControl->OverwriteOnConflict(&current, name,
+					&subDir, isDirectory, clashIsDirectory);
+				if (isDirectory != clashIsDirectory
+					&& mode != TrackerCopyLoopControl::kSkip) {
+					// a folder does not replace a file, nor a file a
+					// folder, whatever was answered
+					mode = TrackerCopyLoopControl::kKeepBoth;
 				}
 			}
+
+			switch (mode) {
+				case TrackerCopyLoopControl::kSkip:
+					break;
+
+				case TrackerCopyLoopControl::kKeepBoth:
+				{
+					char keepBothName[B_FILE_NAME_LENGTH];
+					strlcpy(keepBothName, name, sizeof(keepBothName));
+					MakeKeepBothName(keepBothName, &subDir);
+					MoveError::FailOnError(current.MoveTo(&subDir,
+						keepBothName, false));
+					break;
+				}
+
+				default:
+					MoveError::FailOnError(current.MoveTo(&subDir,
+						NULL, true));
+					break;
+			}
 		}
-		entry->Remove();
-	} else
-		MoveError::FailOnError(entry->MoveTo(destDir));
+	}
+
+	// stays when something in it was skipped
+	entry->Remove();
 
 	return B_OK;
 }
+
 
 status_t
 MoveItem(BEntry* entry, BDirectory* destDir, BPoint* loc, uint32 moveMode,
@@ -1862,7 +1973,6 @@ MoveItem(BEntry* entry, BDirectory* destDir, BPoint* loc, uint32 moveMode,
 			BString suffix(" ");
 			suffix << B_TRANSLATE_COMMENT("link", "filename link");
 			FSMakeOriginalName(name, destDir, suffix);
-			undo.UpdateEntry(entry, name);
 
 			BPath path(entry);
 			status_t err = B_ERROR;
@@ -1943,6 +2053,8 @@ MoveItem(BEntry* entry, BDirectory* destDir, BPoint* loc, uint32 moveMode,
 				B_TRANSLATE("Error creating link to \"%name\"."),
 				ref.name);
 
+			undo.Done(ref, destDir, name);
+
 			BFile srcFile(entry, B_READ_ONLY);
 			struct stat srcStat;
 			srcFile.GetStat(&srcStat);
@@ -1968,19 +2080,24 @@ MoveItem(BEntry* entry, BDirectory* destDir, BPoint* loc, uint32 moveMode,
 			// for "Move" the size for status is always 1 - since file
 			// size is irrelevant when simply moving to a new folder
 			loopControl->UpdateStatus(ref.name, ref, 1);
-			if (entry->IsDirectory())
-				return RecursiveMove(entry, destDir, loopControl);
+			if (entry->IsDirectory()) {
+				return RecursiveMove(entry, destDir, loopControl, newName,
+					&undo);
+			}
 
 			MoveError::FailOnError(entry->MoveTo(destDir, newName));
+			undo.Done(ref, destDir, newName != NULL ? newName : ref.name);
 		} else {
 			bool removeSource = moveMode == kMoveSelectionTo;
 			bool makeOriginalName = (moveMode == kDuplicateSelection);
 			if (S_ISDIR(statbuf.st_mode)) {
+				// removes the source itself, as far as it was copied
 				CopyFolder(entry, destDir, loopControl, loc, makeOriginalName, undo, removeSource);
-			} else {
-				CopyFile(entry, &statbuf, destDir, loopControl, loc, makeOriginalName, undo);
-				if (removeSource)
-					entry->Remove();
+			} else if (CopyFile(entry, &statbuf, destDir, loopControl, loc,
+					makeOriginalName, undo) && removeSource) {
+				// only a file that was copied: not one that was skipped, or
+				// whose copy failed
+				entry->Remove();
 			}
 		}
 	} catch (status_t error) {
@@ -2196,7 +2313,6 @@ MoveEntryToTrash(BEntry* entry, BPoint* loc, Undo &undo)
 		BString suffix(" ");
 		suffix << B_TRANSLATE_COMMENT("copy", "filename copy");
 		FSMakeOriginalName(name, &trashDir, suffix);
-		undo.UpdateEntry(entry, name);
 	}
 
 	BNode* sourceNode = 0;
@@ -2368,7 +2484,7 @@ CheckName(uint32 moveMode, const BEntry* sourceEntry,
 	// ensure that the user isn't trying to replace a file with folder
 	// or vice-versa
 	if (destIsDir != sourceIsDirectory
-		&& !(moveMode == kCreateLink || moveMode != kCreateRelativeLink)) {
+		&& moveMode != kCreateLink && moveMode != kCreateRelativeLink) {
 		BAlert* alert = new BAlert("", sourceIsDirectory
 			? B_TRANSLATE("You cannot replace a file with a folder or a "
 				"symbolic link.")

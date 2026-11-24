@@ -35,6 +35,7 @@ All rights reserved.
 #define _FS_UNDO_REDO_H
 
 
+#include <Directory.h>
 #include <Entry.h>
 #include <ObjectList.h>
 #include <String.h>
@@ -43,18 +44,30 @@ All rights reserved.
 namespace BPrivate {
 
 static const uint32_t kUndoOperation = 'U' << 24;
+static const uint32_t kRedoOperation = 'R' << 24;
 static const uint32_t kDoOperation = 'T' << 24;
 
 class UndoItem;
 
 class Undo {
 	public:
+		Undo();
 		~Undo();
-		void UpdateEntry(BEntry* entry, const char* destName);
+
+		void Done(const entry_ref& source, const BDirectory* destDir,
+			const char* destName);
+			// tells that source arrived in destDir as destName. A copy or
+			// move is undone for what was reported this way and for nothing
+			// else: not for items that were skipped or that were there
+			// before, and not at all when nothing was done.
 		void Remove();
+		void SetFromRedo();
+			// the operation is the Redo of an undone one: its undo item
+			// leaves the list of what can be redone alone
 
 	protected:
 		UndoItem* fUndo;
+		bool fFromRedo;
 };
 
 
@@ -117,6 +130,20 @@ static
 inline uint32 FSUndoMoveMode(uint32 moveMode)
 {
 	return (moveMode & 0x00FFFFFF) | kUndoOperation;
+}
+
+
+static
+inline bool FSIsRedoMoveMode(uint32 moveMode)
+{
+	return (moveMode & 0xFF000000) == kRedoOperation;
+}
+
+
+static
+inline uint32 FSRedoMoveMode(uint32 moveMode)
+{
+	return (moveMode & 0x00FFFFFF) | kRedoOperation;
 }
 
 

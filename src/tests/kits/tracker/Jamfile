@@ -1,0 +1,10 @@
+SubDir HAIKU_TOP src tests kits tracker ;
+
+UsePrivateHeaders app interface mount shared storage support tracker ;
+SubDirHdrs $(HAIKU_TOP) src kits tracker ;
+
+# Tracker's copy and move engine on two volumes: what is where afterwards.
+# Run it with a folder on each of two BFS volumes:
+#	tracker_fsops_test /Data/t /OtherVolume/t
+SimpleTest tracker_fsops_test : tracker_fsops_test.cpp
+	: be tracker shared [ TargetLibstdc++ ] ;
