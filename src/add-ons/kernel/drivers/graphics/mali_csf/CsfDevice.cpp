@@ -4,6 +4,7 @@
  */
 #include <KernelExport.h>
 #include <AutoDeleterOS.h>
+#include <condition_variable.h>
 #include <lock.h>
 #include <smp.h>
 #include <util/AutoLock.h>

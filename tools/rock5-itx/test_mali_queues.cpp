@@ -1,4 +1,5 @@
 /* Copyright 2026, Haiku, Inc. Distributed under the MIT License. */
+#include <cinttypes>
 #include "CsfQueueEngine.h"
 #define MALI_RUN_MODEL_ONLY
 #include "test_mali_run.cpp"
@@ -131,6 +132,9 @@ struct QueueModel : FirmwareModel {
 	bool commandMode = false, pending = false, userMapped = false, userLocked = false;
 	bool groupRunning = false, configured = false;
 	unsigned groupIRQs = 0, executed = 0, pauses = 0, starts = 0, suspends = 0, resumes = 0;
+	// #182: every job interrupt, the sleeps of the job wait, those it ended.
+	unsigned jobIRQs = 0, sleeps = 0, wokenSleeps = 0;
+	bool silentIRQ = false;		// the interrupt counts but wakes nobody
 	unsigned active = 0;
 	uint64_t currentRoot = 0;
 	std::array<uint32_t, 96> registers{};
@@ -162,6 +166,21 @@ struct QueueModel : FirmwareModel {
 		event.status |= group ? 1 : 0x80000000; event.raw = event.status;
 		event.cpu = 3; event.whenMicros = Now();
 		if (group) groupIRQs++;
+		jobIRQs++;
+	}
+	uint32_t JobInterrupts() { return jobIRQs; }
+	// The firmware runs during a sleep, 100 us at a time as in PauseReset();
+	// a job interrupt ends the sleep there, unless it is silent, and else
+	// the sleep runs to its bound.
+	bool WaitJobInterrupt(uint32_t seen, int64_t micros)
+	{
+		assert(commandMode && micros > 0 && micros <= kJobWaitSafetyMicros + 1);
+		sleeps++;
+		if (jobIRQs != seen) { wokenSleeps++; return true; }
+		PauseReset();
+		if (jobIRQs != seen && !silentIRQ) { wokenSleeps++; return true; }
+		if (micros > 100) elapsed += micros - 100;
+		return false;
 	}
 	uint32_t* Words() { return (uint32_t*)memory->SharedData(); }
 	uint32_t* In(unsigned field) { return Words() + (Words()[field] - 0x4000000) / 4; }
@@ -426,7 +445,13 @@ int main()
 	FirmwareMemory memory;
 	assert(PlanRuntimeFirmware(memory, image));
 	Guarded arena(memory.RequiredBytes());
+	// Mode 0 polls as before; 1 sleeps on the job interrupt (#182); 2 does
+	// too, but the interrupt never wakes the sleeper, so the wait polls on.
+	for (unsigned mode = 0; mode < 3; mode++)
 	for (unsigned fault = QueueNone; fault <= QueueBadRoot; fault++) {
+		if (mode == 2 && fault != QueueNone && fault != QueueMissingIRQ
+			&& fault != QueueFrozenClock)
+			continue;
 		assert(memory.Build(arena.data, arena.size, UINT64_C(0x182300000)));
 		PhysicalInventory inventory;
 		TestQueue a(inventory, 0), b(inventory, 1);
@@ -435,11 +460,29 @@ int main()
 		QueueModel model(memory, inventory, QueueFault(fault));
 		TestFeed feed(a, b, model);
 		QueueEngine<TestFeed> engine(feed);
+		engine.SetJobInterruptWait(mode != 0);
+		model.silentIRQ = mode == 2;
 		FirmwareRunInfo info{}; info.flags = kFirmwareAllocated;
 		CycleFirmware(model, memory, info, engine);
-		printf("queues fault=%u engine=%u firmware=%u/%u/%x jobs=%u starts=%u suspends=%u resumes=%u\n",
-			fault, engine.Error(), info.result, info.cleanupResult, info.flags,
-			feed.complete, model.starts, model.suspends, model.resumes);
+		const JobWaitStats& waits = engine.JobWait().Stats();
+		printf("queues mode=%u fault=%u engine=%u firmware=%u/%u/%x jobs=%u starts=%u suspends=%u"
+			" resumes=%u pauses=%u sleeps=%u woken=%u notified=%" PRIu64 " timedout=%" PRIu64
+			" missed=%" PRIu64 " trusted=%" PRIu64 "\n",
+			mode, fault, engine.Error(), info.result, info.cleanupResult, info.flags,
+			feed.complete, model.starts, model.suspends, model.resumes, model.pauses,
+			model.sleeps, model.wokenSleeps, waits.notified, waits.timedOut, waits.missed,
+			waits.trusted);
+		if (mode == 0) assert(model.sleeps == 0 && waits.notified + waits.timedOut == 0);
+		if (mode == 1 && fault == QueueNone) {
+			// Each job ends a sleep through its interrupt; after four the
+			// interrupt is trusted, and nothing is missed.
+			assert(engine.JobWait().Trusted() && waits.trusted == 1 && waits.missed == 0);
+			assert(waits.notified >= 526 && model.wokenSleeps == waits.notified);
+		}
+		if (mode == 2) {
+			assert(!engine.JobWait().Trusted() && waits.notified == 0 && waits.trusted == 0);
+			if (fault == QueueNone) assert(waits.timedOut >= 526);
+		}
 		assert(!model.handlers && model.gpu == NULL);
 		if (fault == QueueNone) {
 			assert(info.flags == 255 && info.result == kFirmwareRunOK && info.cleanupResult == kFirmwareRunOK);

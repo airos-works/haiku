@@ -82,9 +82,11 @@ static std::mutex sThreadLock;
 static std::map<thread_id, std::shared_ptr<Thread>> sThreads;
 static thread_id sNextThread = 1;
 static std::atomic<bool> sFailSpawn{false}, sFailResume{false};
-static thread_id spawn_kernel_thread(int32 (*entry)(void*), const char*, int, void* data)
+static std::atomic<int> sLastPriority{-1};
+static thread_id spawn_kernel_thread(int32 (*entry)(void*), const char*, int priority, void* data)
 {
 	if (sFailSpawn) return B_NO_MEMORY;
+	sLastPriority = priority;
 	std::lock_guard<std::mutex> guard(sThreadLock);
 	thread_id id = sNextThread++;
 	auto thread = std::make_shared<Thread>(); thread->entry = entry; thread->data = data;
@@ -174,8 +176,10 @@ bool MaliCSF::ClientVmRange(const ClientVmLease& lease, uint64 address, uint64 b
 	return address >= 0x100000000 && address < 0x100001000 && bytes <= 0x100001000 - address;
 }
 static std::atomic<bool> sFailHardware{false};
+static std::atomic<int> sLastNotify{-1};
 struct FirmwareHardware {
 	explicit FirmwareHardware(bool commands) { assert(commands); }
+	void SetJobNotification(bool enabled) { sLastNotify = enabled; }
 	// FullClockOperation raises the GPU divider only from SPLL/4: not here.
 	uint32 ReadClock(uint32) { return 0; }
 	void WriteClock(uint32, uint32) { assert(false); }
@@ -568,8 +572,12 @@ int main()
 	assert(Create(client, handle, true, recovery) == B_NO_MEMORY); Clean(2); sFailSpawn = false;
 	sFailResume = true;
 	assert(Create(client, handle, true, recovery) == B_NO_MEMORY); Clean(2); sFailResume = false;
+	// #182: the driver settings reach the next runtime's worker.
+	SetRuntimeOptions(true, 15);
 	sFailHardware = true;
 	assert(Create(client, handle, true, recovery) == B_IO_ERROR && !recovery); Clean(2); sFailHardware = false;
+	assert(sLastPriority == 15 && sLastNotify == 1);
+	SetRuntimeOptions(false, B_NORMAL_PRIORITY);
 	for (unsigned fail = 1; fail <= 3; fail++) {
 		sCopies = 0; sFailCopy = fail;
 		assert(Create(client, handle, true, recovery) == B_BAD_ADDRESS && !recovery);
@@ -577,6 +585,7 @@ int main()
 	}
 	sFailCopy = 0;
 	assert(Create(client, handle, true, recovery) == B_OK);
+	assert(sLastPriority == B_NORMAL_PRIORITY && sLastNotify == 0);
 	unsigned cycles = sHardwareCycles;
 	uint32 handles[kMaxRuntimeQueues]; handles[0] = handle;
 	for (unsigned i = 1; i < kMaxRuntimeQueues; i++) assert(Create(client, handles[i], false, recovery) == B_OK);

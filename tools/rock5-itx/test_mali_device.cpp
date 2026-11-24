@@ -8,6 +8,8 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <map>
 #include <mutex>
 #include <string>
@@ -125,10 +127,51 @@ public:
 	{
 		sSpinAttempts++; fLock.lock.lock(); assert(sSpinDepth++ == 0);
 	}
-	~InterruptsSpinLocker() { assert(--sSpinDepth == 0); fLock.lock.unlock(); }
+	~InterruptsSpinLocker() { if (fHeld) Unlock(); }
+	void Unlock() { assert(fHeld && --sSpinDepth == 0); fHeld = false; fLock.lock.unlock(); }
 private:
 	spinlock& fLock;
+	bool fHeld = true;
 };
+// The kernel condition variable as the job wait (#182) uses it: Add() before
+// the last look, Wait() is B_OK when notified since Add(), else B_TIMED_OUT.
+static const uint32 B_RELATIVE_TIMEOUT = 8;
+static const int B_TIMED_OUT = -12;
+static int32 atomic_get(int32* value) { return __atomic_load_n(value, __ATOMIC_SEQ_CST); }
+static int32 atomic_add(int32* value, int32 add)
+{
+	assert(sSpinDepth == 1); // counted under the handler's lock
+	return __atomic_fetch_add(value, add, __ATOMIC_SEQ_CST);
+}
+struct ConditionVariableEntry;
+struct ConditionVariable {
+	std::mutex lock;
+	std::condition_variable changed;
+	uint64_t notifications = 0;
+	void Init(const void*, const char*) {}
+	void Add(ConditionVariableEntry* entry);
+	int32 NotifyAll()
+	{
+		assert(sSpinDepth == 0); // never under the handler's spinlock
+		{ std::lock_guard<std::mutex> guard(lock); notifications++; }
+		changed.notify_all(); return 0;
+	}
+};
+struct ConditionVariableEntry {
+	ConditionVariable* variable = NULL;
+	uint64_t seen = 0;
+	status_t Wait(uint32 flags, int64_t micros)
+	{
+		assert(flags == B_RELATIVE_TIMEOUT && variable != NULL);
+		std::unique_lock<std::mutex> guard(variable->lock);
+		return variable->changed.wait_for(guard, std::chrono::microseconds(micros),
+			[&] { return variable->notifications != seen; }) ? B_OK : B_TIMED_OUT;
+	}
+};
+void ConditionVariable::Add(ConditionVariableEntry* entry)
+{
+	std::lock_guard<std::mutex> guard(lock); entry->variable = this; entry->seen = notifications;
+}
 static std::atomic<bool> sPauseCpu(false), sEntered(false), sRelease(false);
 static int smp_get_current_cpu()
 {
@@ -314,6 +357,33 @@ int main()
 			assert(Invoke(124) == B_UNHANDLED_INTERRUPT);
 		}
 		assert(io.CommandJobCount() == 50 && io.ReadFirmwareCapture(0).count == 100);
+		// #182: off, the job interrupt neither counts itself nor wakes anyone.
+		assert(io.JobInterrupts() == 0);
+		io.SetJobNotification(true);
+		uint32 seen = io.JobInterrupts();
+		auto started = std::chrono::steady_clock::now();
+		assert(!io.WaitJobInterrupt(seen, 2000)); // nothing came: the bound ends it
+		sGpu[0x1000 / 4] = sGpu[0x100c / 4] = 1;
+		assert(Invoke(124) == B_HANDLED_INTERRUPT && io.JobInterrupts() == seen + 1);
+		sGpu[0x1000 / 4] = sGpu[0x100c / 4] = 0;
+		assert(Invoke(124) == B_UNHANDLED_INTERRUPT && io.JobInterrupts() == seen + 1);
+		// It came after the count was read and before the sleep: no sleep.
+		assert(io.WaitJobInterrupt(seen, 10000000));
+		seen = io.JobInterrupts();
+		std::atomic<bool> woken(false);
+		started = std::chrono::steady_clock::now();
+		std::thread sleeper([&] { woken = io.WaitJobInterrupt(seen, 10000000); });
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		sGpu[0x1000 / 4] = sGpu[0x100c / 4] = 0x80000001;
+		assert(Invoke(124) == B_HANDLED_INTERRUPT);
+		sGpu[0x1000 / 4] = sGpu[0x100c / 4] = 0;
+		sleeper.join();
+		auto slept = std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now() - started).count();
+		assert(woken && slept < 5000 && io.JobInterrupts() == seen + 1);
+		printf("job interrupt woke a sleeper after %lld ms\n", (long long)slept);
+		assert(io.CommandJobCount() == 52);
+		io.SetJobNotification(false);
 		assert(io.ReadFirmwareCapture(0).raw == 0x80000001);
 		sGpu[0x2000 / 4] |= 2; sGpu[0x200c / 4] = 2;
 		sGpu[0x245c / 4] = 0x123; sGpu[0x2460 / 4] = 0x12345678;

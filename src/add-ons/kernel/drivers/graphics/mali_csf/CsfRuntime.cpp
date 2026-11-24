@@ -26,6 +26,18 @@ using namespace MaliCSF;
 
 static mutex sRuntimeLock = MUTEX_INITIALIZER("Mali CSF runtime");
 static uint32 sNextQueueHandle = 1;
+// Both stay as they always were unless the driver settings say otherwise.
+static bool sJobInterruptWait = false;
+static int32 sSchedulerPriority = B_NORMAL_PRIORITY;
+
+
+void
+SetRuntimeOptions(bool jobInterruptWait, int32 schedulerPriority)
+{
+	MutexLocker locker(sRuntimeLock);
+	sJobInterruptWait = jobInterruptWait;
+	sSchedulerPriority = schedulerPriority;
+}
 
 struct QueueJob {
 	QueueJob* next;
@@ -229,16 +241,26 @@ public:
 		queue.pending--;
 		changed.NotifyAll();
 		if (engine != NULL && engine->Stats().jobs % 5000 == 0)
-			LogStats(engine->Stats());
+			LogStats(*engine);
 	}
-	static void LogStats(const QueueEngineStats& stats)
+	static void LogStats(const QueueEngine<Runtime>& engine)
 	{
+		const QueueEngineStats& stats = engine.Stats();
 		int64_t span = stats.lastMicros - stats.firstMicros;
 		dprintf("mali_csf: %" B_PRIu64 " jobs, %" B_PRIu64 " queue switches;"
 			" selecting %" B_PRId64 " us, running %" B_PRId64 " us of %" B_PRId64
 			" us (%" B_PRId64 "%% busy)\n", stats.jobs, stats.switches,
 			stats.selectMicros, stats.submitMicros, span,
 			span > 0 ? (stats.selectMicros + stats.submitMicros) * 100 / span : 0);
+		const JobWaitPolicy& wait = engine.JobWait();
+		if (wait.Enabled()) {
+			const JobWaitStats& waits = wait.Stats();
+			dprintf("mali_csf: job interrupt wait: %" B_PRIu64 " sleeps woken,"
+				" %" B_PRIu64 " timed out, %" B_PRIu64 " interrupts missed;"
+				" trusted %" B_PRIu64 " times, %s now\n", waits.notified,
+				waits.timedOut, waits.missed, waits.trusted,
+				wait.Trusted() ? "trusted" : "polling");
+		}
 	}
 	void Destroyed(unsigned slot)
 	{
@@ -280,6 +302,15 @@ public:
 		Runtime* runtime = (Runtime*)data;
 		status_t status = runtime->hardware.Init(runtime->resources);
 		QueueEngine<Runtime> engine(*runtime);
+		// Before the handlers are installed (CycleFirmware()).
+		runtime->hardware.SetJobNotification(runtime->jobInterruptWait);
+		engine.SetJobInterruptWait(runtime->jobInterruptWait);
+		if (runtime->jobInterruptWait
+			|| runtime->schedulerPriority != B_NORMAL_PRIORITY) {
+			dprintf("mali_csf: scheduler at priority %" B_PRId32 ", job"
+				" interrupt wait %s\n", runtime->schedulerPriority,
+				runtime->jobInterruptWait ? "on" : "off");
+		}
 		runtime->engine = &engine;
 		FirmwareRecovery recovery(StopAdmission, runtime);
 		if (status == B_OK)
@@ -290,7 +321,7 @@ public:
 		}
 		runtime->engine = NULL;
 		if (engine.Stats().jobs > 0)
-			LogStats(engine.Stats());
+			LogStats(engine);
 		bool retained = (runtime->firmware.flags & kFirmwareNeedsRecovery) != 0
 			|| (engine.Mapped() && !recovery.recovered);
 		if (status == B_OK && (retained || !runtime->ready || engine.Error() != 0
@@ -369,6 +400,8 @@ public:
 	uint32 live = 0;
 	uint32 creating = 1;
 	uint32 nextQueue = 0;
+	bool jobInterruptWait = false;
+	int32 schedulerPriority = B_NORMAL_PRIORITY;
 	bool ready = false;
 	bool finished = false;
 	bool retained = false;
@@ -477,8 +510,10 @@ StartRuntime(const ResourceInfo& resources, void* user, uint32 bytes, Runtime*& 
 	info.memoryAttributes = FirmwareMemory::MemoryAttributes();
 	{
 		MutexLocker locker(sRuntimeLock);
+		runtime->jobInterruptWait = sJobInterruptWait;
+		runtime->schedulerPriority = sSchedulerPriority;
 		runtime->thread = spawn_kernel_thread(Runtime::Worker, "Mali CSF scheduler",
-			B_NORMAL_PRIORITY, runtime);
+			runtime->schedulerPriority, runtime);
 		if (runtime->thread >= B_OK) {
 			runtime->references += 2; // global, worker, creator
 			sRuntime = runtime;

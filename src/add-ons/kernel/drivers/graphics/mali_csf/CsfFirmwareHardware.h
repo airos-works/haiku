@@ -6,7 +6,10 @@
 
 class FirmwareHardware : public ResetHardware {
 public:
-	explicit FirmwareHardware(bool commands = false) : fCommands(commands) {}
+	explicit FirmwareHardware(bool commands = false) : fCommands(commands)
+	{
+		fJobCondition.Init(this, "Mali CSF job interrupt");
+	}
 	~FirmwareHardware() { StopFirmwareHandlers(); }
 	status_t Init(const ResourceInfo& resources)
 	{
@@ -88,6 +91,20 @@ public:
 	{
 		InterruptsSpinLocker locker(fLock);
 		return fGroupJobs;
+	}
+	/*!	Whether the job interrupt counts itself in JobInterrupts() and wakes
+		WaitJobInterrupt() (#182). Off, the handler does what it always did.
+		Set before the handlers are installed. */
+	void SetJobNotification(bool enabled) { fNotifyJobs = enabled; }
+	uint32 JobInterrupts() { return (uint32)atomic_get(&fJobInterrupts); }
+	//! True if the job interrupt came, now or since \a seen was read.
+	bool WaitJobInterrupt(uint32 seen, int64_t micros)
+	{
+		ConditionVariableEntry entry;
+		fJobCondition.Add(&entry);
+		if (JobInterrupts() != seen)
+			return true;
+		return entry.Wait(B_RELATIVE_TIMEOUT, micros) == B_OK;
 	}
 	bool ArmJob(uint32 mask, bool continuous)
 	{
@@ -204,6 +221,15 @@ private:
 			source.armed = false;
 		}
 		io.WriteGpu(mask - 4, status & io.Mask(source.index));
+		if (source.index == 0 && io.fNotifyJobs) {
+			// The waiter reads the count before it looks at the queue, so
+			// counting before the notification cannot lose a wake-up. No
+			// logging here: printing from an interrupt handler stalled the
+			// ROCK 5 before (the GICv3 ITS trace).
+			atomic_add(&io.fJobInterrupts, 1);
+			locker.Unlock();
+			io.fJobCondition.NotifyAll();
+		}
 		return B_HANDLED_INTERRUPT;
 	}
 	spinlock fLock = B_SPINLOCK_INITIALIZER;
@@ -215,6 +241,9 @@ private:
 	bool fContinuousJobs = false;
 	uint32 fJobMask = kGlobalInterrupt;
 	uint32 fGroupJobs = 0;
+	bool fNotifyJobs = false;
+	int32 fJobInterrupts = 0;
+	ConditionVariable fJobCondition;
 };
 
 #endif

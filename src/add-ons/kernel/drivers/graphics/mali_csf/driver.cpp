@@ -418,6 +418,28 @@ InitDriver(device_node* node, void** cookie)
 		controller->commandsEnabled = commands && controller->identityEnabled;
 		controller->shaderEnabled = shader && controller->identityEnabled;
 	}
+	// #182: the scheduler polls each job every 100 us at normal priority
+	// unless these say otherwise ("job_interrupt_wait true",
+	// "scheduler_priority 15" for B_DISPLAY_PRIORITY, as v3d's executor).
+	bool jobInterruptWait = false;
+	int32 schedulerPriority = B_NORMAL_PRIORITY;
+	if (valid && settings != NULL) {
+		jobInterruptWait = get_driver_boolean_parameter(settings,
+			"job_interrupt_wait", false, false);
+		const char* priority = get_driver_parameter(settings,
+			"scheduler_priority", NULL, NULL);
+		if (priority != NULL) {
+			long value = strtol(priority, NULL, 10);
+			// Never real-time: the polling path would then starve its CPU.
+			if (value >= B_LOW_PRIORITY && value <= B_URGENT_DISPLAY_PRIORITY)
+				schedulerPriority = value;
+			else {
+				dprintf("mali_csf: scheduler_priority %s ignored (%d-%d)\n",
+					priority, B_LOW_PRIORITY, B_URGENT_DISPLAY_PRIORITY);
+			}
+		}
+	}
+	SetRuntimeOptions(jobInterruptWait, schedulerPriority);
 	if (settings != NULL)
 		unload_driver_settings(settings);
 	if (parent != NULL)

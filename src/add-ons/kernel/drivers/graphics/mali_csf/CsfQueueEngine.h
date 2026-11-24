@@ -3,6 +3,7 @@
 #define MALI_CSF_QUEUE_ENGINE_H
 
 #include "CsfRun.h"
+#include "CsfJobWait.h"
 #include "CsfQueueMemory.h"
 #include "CsfHeapGrowth.h"
 #include "CsfPropertyCapture.h"
@@ -70,6 +71,9 @@ public:
 	uint32_t HeapDeclines() const { return fHeapDeclines; }
 	uint32_t SuspendBytes() const { return fInterface.suspendBytes; }
 	const QueueEngineStats& Stats() const { return fStats; }
+	// Before Run(): sleep on the job interrupt instead of polling (#182).
+	void SetJobInterruptWait(bool enabled) { fJobWait.SetEnabled(enabled); }
+	const JobWaitPolicy& JobWait() const { return fJobWait; }
 	uint32_t ProtectedBytes() const { return fInterface.protectedBytes; }
 
 	template<typename IO>
@@ -390,7 +394,7 @@ private:
 		WriteInterface64(QueueIn(work.slot), 0, progress.insert);
 		Ring(io, true);
 		fError = kQueueEngineCompletion;
-		bool done = WaitFirmware(io, 5000000, [&]() {
+		bool done = WaitJob(io, fJobWait, 5000000, [&]() {
 			Poll(io);
 			return (ReadInterface64(completion, 0) == work.sequence
 				&& ReadInterface64(QueueOut(work.slot), 0) == progress.insert
@@ -424,6 +428,7 @@ private:
 	uint64_t fFaultAddress = 0;
 	uint32_t fHeapEvents = 0, fHeapGrowths = 0, fHeapDeclines = 0;
 	QueueEngineStats fStats = {};
+	JobWaitPolicy fJobWait;
 };
 
 } // namespace MaliCSF
