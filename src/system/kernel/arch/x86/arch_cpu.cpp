@@ -91,7 +91,7 @@ extern addr_t _xsave;
 extern addr_t _xsavec;
 extern addr_t _xrstor;
 extern addr_t _vzeroall;
-extern addr_t _xrstor_initial;
+extern addr_t _vzeroall_xrstor_initial;
 uint64 gXsaveMask;
 uint64 gFPUSaveLength = 512;
 bool gHasXsave = false;
@@ -1827,9 +1827,11 @@ arch_cpu_init_post_vm(kernel_args* args)
 				arch_altcodepatch_replace(ALTCODEPATCH_TAG_CLEAR_FPU,
 					&_vzeroall, 3);
 			} else {
-				// Otherwise, use XRSTOR to reset every supported state.
+				// Otherwise, VZEROALL and an XRSTOR that resets the state
+				// components past AVX: one of every component would also
+				// reset MXCSR and the x87 control word (#167).
 				arch_altcodepatch_replace(ALTCODEPATCH_TAG_CLEAR_FPU,
-					&_xrstor_initial, 24);
+					&_vzeroall_xrstor_initial, 27);
 			}
 		}
 

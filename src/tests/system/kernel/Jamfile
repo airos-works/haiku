@@ -55,6 +55,10 @@ SimpleTest sem_slot_reuse_test : sem_slot_reuse_test.cpp ;
 # (airos-works/haiku#158). A kernel without the fix does not survive it.
 SimpleTest signal_frame_forge_test : signal_frame_forge_test.cpp ;
 
+# MXCSR and the x87 control word across system calls (airos-works/haiku#167:
+# reset by every system call on processors with AVX-512)
+SimpleTest fpu_control_syscall_test : fpu_control_syscall_test.cpp ;
+
 SimpleTest hello_avx : hello_avx.c ;
 local avxSource = [ FGristFiles hello_avx.c ] ;
 local avxObject = $(avxSource:S=$(SUFOBJ)) ;
