@@ -40,6 +40,12 @@ SimpleTest profiler_detach_test : profiler_detach_test.cpp ;
 # tools/airos/ci/guest-tests too
 SimpleTest fragmented_write_test : fragmented_write_test.cpp ;
 
+# modified pages of a file that is being removed, against a write that waits
+# for the modified page quota: the page writer went round its queue at full
+# speed and the write never returned (airos-works/haiku#146). Needs a slow
+# device (it skips itself on a fast one), so not in tools/airos/ci/guest-tests.
+SimpleTest page_writer_stall_test : page_writer_stall_test.cpp ;
+
 SimpleTest hello_avx : hello_avx.c ;
 local avxSource = [ FGristFiles hello_avx.c ] ;
 local avxObject = $(avxSource:S=$(SUFOBJ)) ;
