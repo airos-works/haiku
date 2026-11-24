@@ -1226,6 +1226,10 @@ discard_area_range(VMArea* area, addr_t address, addr_t size)
 	VMCache* cache = vm_area_get_locked_cache(area);
 	if (cache->areas.First() != area || VMArea::CacheList::GetNext(area) != NULL
 		|| !cache->consumers.IsEmpty() || cache->type != CACHE_TYPE_RAM) {
+		// The cache came locked and referenced: give both back, or the next
+		// fault on it (and, for a file, the next read or write) waits for
+		// ever.
+		cache->ReleaseRefAndUnlock();
 		return B_OK;
 	}
 
