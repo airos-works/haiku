@@ -37,6 +37,12 @@ public:
 		void					SetReport(status_t status, uint8 *report,
 									size_t length);
 
+								// For HIDReport, while a descriptor is
+								// parsed: false once it has asked for more
+								// than a descriptor may.
+		bool					ReserveItems(uint32 count);
+		bool					ReserveUsage();
+
 		void					PrintToStream();
 
 private:
@@ -48,6 +54,8 @@ private:
 		bool					fUsesReportIDs;
 		Vector<HIDReport *>		fReports;
 		HIDCollection *			fRootCollection;
+		uint32					fItemCount;
+		uint32					fUsageCount;
 };
 
 #endif // HID_PARSER_H

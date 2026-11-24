@@ -72,8 +72,9 @@ HIDCollection::UsageID()
 status_t
 HIDCollection::AddChild(HIDCollection *child)
 {
-	if (fChildren.PushBack(child) == B_NO_MEMORY) {
+	if (fChildren.PushBack(child) != B_OK) {
 		TRACE_ALWAYS("no memory when trying to resize collection child list\n");
+		return B_NO_MEMORY;
 	}
 
 	return B_OK;

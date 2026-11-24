@@ -20,8 +20,10 @@ HIDReportItem::HIDReportItem(HIDReport *report, uint32 bitOffset,
 	:	fReport(report),
 		fByteOffset(bitOffset / 8),
 		fShift(bitOffset % 8),
-		fMask(~(0xffffffff << bitLength)),
-		fBitCount(bitLength),
+		fMask(bitLength >= 32 ? 0xffffffff : ~(0xffffffff << bitLength)),
+			// (a shift by the width of the type is undefined, and gave a
+			// mask of 0 for 32 bit fields)
+		fBitCount(bitLength > 32 ? 32 : bitLength),
 		fByteCount((fShift + fBitCount + 7) / 8),
 		fHasData(hasData),
 		fArray(isArray),
@@ -56,16 +58,17 @@ HIDReportItem::UsageID()
 status_t
 HIDReportItem::Extract()
 {
-	// The specs restrict items to span at most across 4 bytes, which means
-	// that we can always just byte-align, copy four bytes and then shift and
-	// mask as needed.
+	// An item has at most 32 bits (HIDReport::AddMainItem() makes none for
+	// wider fields), but it need not start at a byte: with the shift it spans
+	// up to 5 bytes. So byte-align, copy those into 64 bits and then shift
+	// and mask as needed.
 	uint8 *report = fReport->CurrentReport();
 	if (report == NULL)
 		return B_NO_INIT;
 
-	memcpy(&fData, report + fByteOffset, fByteCount);
-	fData >>= fShift;
-	fData &= fMask;
+	uint64 value = 0;
+	memcpy(&value, report + fByteOffset, fByteCount);
+	fData = (uint32)(value >> fShift) & fMask;
 
 	if (Signed()) {
 		// sign extend if needed.
@@ -88,12 +91,13 @@ HIDReportItem::Insert()
 	if (report == NULL)
 		return B_NO_INIT;
 
-	uint32 value;
+	// up to 5 bytes, see Extract()
+	uint64 value = 0;
 	memcpy(&value, report + fByteOffset, fByteCount);
-	value &= ~(fMask << fShift);
+	value &= ~((uint64)fMask << fShift);
 
 	if (fValid)
-		value |= (fData & fMask) << fShift;
+		value |= (uint64)(fData & fMask) << fShift;
 
 	memcpy(report + fByteOffset, &value, fByteCount);
 	return B_OK;
@@ -129,6 +133,10 @@ HIDReportItem::ScaledData(uint8 scaleToBits, bool toBeSigned)
 
 	if (fBitCount == scaleToBits)
 		return source;
+	if (fBitCount == 0) {
+		// nothing to repeat (and the loop below would not end)
+		return 0;
+	}
 
 	int8 shift;
 	uint32 result = 0;
@@ -155,8 +163,13 @@ HIDReportItem::ScaledRangeData(uint32 minimum, uint32 maximum)
 	else
 		zeroBasedData = fData - fMinimum;
 
-	return zeroBasedData * (maximum - minimum + 1) / (fMaximum - fMinimum + 1)
-		+ minimum;
+	// The logical range is the device's: one that covers all 32 bits, or
+	// whose maximum is just below its minimum, has a size of 0 in 32 bits.
+	uint32 range = fMaximum - fMinimum + 1;
+	if (range == 0)
+		return minimum;
+
+	return zeroBasedData * (maximum - minimum + 1) / range + minimum;
 }
 
 

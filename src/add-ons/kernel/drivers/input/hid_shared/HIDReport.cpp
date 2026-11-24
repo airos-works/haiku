@@ -38,10 +38,13 @@ HIDReport::HIDReport(HIDParser *parser, uint8 type, uint8 id)
 
 HIDReport::~HIDReport()
 {
+	// the collections only refer to the items
+	for (int32 i = 0; i < fItems.Count(); i++)
+		delete fItems[i];
 }
 
 
-void
+status_t
 HIDReport::AddMainItem(global_item_state &globalState,
 	local_item_state &localState, main_item_data &mainData,
 	HIDCollection *collection)
@@ -103,6 +106,11 @@ HIDReport::AddMainItem(global_item_state &globalState,
 	TRACE("\t\tstring_maximum: %u\n", localState.string_maximum);
 
 	for (uint32 n = 0; n <localState.usage_stack_used; n++) {
+		if (!fParser->ReserveUsage()) {
+			// these are only kept to be looked up, and none that far in
+			break;
+		}
+
 		if (fUsages.PushBack(localState.usage_stack[n].u.extended) != B_OK) {
 			TRACE_ALWAYS("no memory allocating usages\n");
 			break;
@@ -118,31 +126,67 @@ HIDReport::AddMainItem(global_item_state &globalState,
 
 	uint32 usage = page.u.extended;
 
+	// The size and the count are the device's, and nothing in the descriptor
+	// format bounds them: limit the report, and with it everything that is
+	// sized by it (the transfer buffers, the items).
+	uint64 bits = (uint64)globalState.report_size * globalState.report_count;
+	if (bits > kMaxReportBits - fReportSize) {
+		TRACE_ALWAYS("report 0x%02x: %" B_PRIu32 " fields of %" B_PRIu32
+			" bits do not fit in a report\n", fReportID,
+			globalState.report_count, globalState.report_size);
+		return B_BAD_DATA;
+	}
+
+	if (globalState.report_size == 0 || globalState.report_size > 32) {
+		// An item's value is 32 bits: a wider field (vendor data, a sensor's
+		// 64 bit values) cannot be one, and an empty one has no value. They
+		// take their room in the report like padding.
+		if (globalState.report_size != 0 && mainData.data_constant == 0) {
+			TRACE("report 0x%02x: ignoring %" B_PRIu32 " fields of %" B_PRIu32
+				" bits\n", fReportID, globalState.report_count,
+				globalState.report_size);
+		}
+
+		fReportSize += bits;
+		return B_OK;
+	}
+
+	if (!fParser->ReserveItems(globalState.report_count)) {
+		TRACE_ALWAYS("report 0x%02x: too many fields\n", fReportID);
+		return B_BAD_DATA;
+	}
+
 	for (uint32 i = 0; i < globalState.report_count; i++) {
 		if (mainData.array_variable == 1) {
 			if (i < localState.usage_stack_used)
 				usage = localState.usage_stack[i].u.extended;
 		}
 
+		// The lists hold no NULL entries: their users do not expect any.
 		HIDReportItem *item = new(std::nothrow) HIDReportItem(this,
 			fReportSize, globalState.report_size, mainData.data_constant == 0,
 			mainData.array_variable == 0, mainData.relative != 0,
 			logicalMinimum, logicalMaximum, usage);
-		if (item == NULL)
+		if (item == NULL) {
 			TRACE_ALWAYS("no memory when creating report item\n");
+			return B_NO_MEMORY;
+		}
+
+		if (fItems.PushBack(item) != B_OK) {
+			TRACE_ALWAYS("no memory when growing report item list\n");
+			delete item;
+			return B_NO_MEMORY;
+		}
 
 		if (collection != NULL)
 			collection->AddItem(item);
 		else
 			TRACE_ALWAYS("main item not part of a collection\n");
 
-		if (fItems.PushBack(item) == B_NO_MEMORY) {
-			TRACE_ALWAYS("no memory when growing report item list\n");
-		}
-
 		fReportSize += globalState.report_size;
 	}
 
+	return B_OK;
 }
 
 

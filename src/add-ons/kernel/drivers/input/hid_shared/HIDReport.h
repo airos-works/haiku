@@ -18,6 +18,10 @@
 #define HID_REPORT_TYPE_FEATURE		0x04
 #define HID_REPORT_TYPE_ANY			0x07
 
+// The largest report a descriptor may describe, 16 KiB as in Linux
+// (HID_MAX_BUFFER_SIZE): whatever works there fits.
+const uint32 kMaxReportBits = 16384 * 8;
+
 class HIDCollection;
 class HIDReportItem;
 
@@ -34,7 +38,7 @@ public:
 		HIDParser *				Parser() { return fParser; };
 		HIDDevice *				Device() { return fParser->Device(); };
 
-		void					AddMainItem(global_item_state &globalState,
+		status_t				AddMainItem(global_item_state &globalState,
 									local_item_state &localState,
 									main_item_data &mainData,
 									HIDCollection *collection);

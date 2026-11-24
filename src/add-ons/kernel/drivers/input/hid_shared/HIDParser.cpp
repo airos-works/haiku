@@ -18,6 +18,19 @@
 #include <string.h>
 
 
+// What one descriptor may make the parser allocate. A descriptor comes from
+// the device (over Bluetooth: from whoever is in range), and its counts and
+// ranges are 32 bit values: without limits a few bytes of it describe billions
+// of items. No real device comes near these.
+static const uint32 kMaxItems = 65536;
+	// report items of all reports together
+static const uint32 kMaxUsages = 16384;
+	// usages of one main item (a usage range is cut to it)
+static const uint32 kMaxStoredUsages = 65536;
+	// usages kept in all reports together
+static const uint32 kMaxCollectionDepth = 64;
+	// the collection tree is walked recursively, on a kernel stack
+
 static uint8 sItemSize[4] = { 0, 1, 2, 4 };
 static int8 sUnitExponent[16] = {
 	// really just a 4 bit signed value
@@ -28,7 +41,9 @@ static int8 sUnitExponent[16] = {
 HIDParser::HIDParser(HIDDevice *device)
 	:	fDevice(device),
 		fUsesReportIDs(false),
-		fRootCollection(NULL)
+		fRootCollection(NULL),
+		fItemCount(0),
+		fUsageCount(0)
 {
 }
 
@@ -51,7 +66,9 @@ HIDParser::ParseReportDescriptor(const uint8 *reportDescriptor,
 	local_item_state localState;
 	memset((void*)&localState, 0, sizeof(local_item_state));
 
-	Vector<usage_value> usageStack;
+	// The vector grows by its chunk size: a usage range of thousands of
+	// entries appended ten at a time is copied again and again.
+	Vector<usage_value> usageStack(1024);
 
 	fRootCollection = new(std::nothrow) HIDCollection(NULL, COLLECTION_LOGICAL,
 		localState);
@@ -61,18 +78,36 @@ HIDParser::ParseReportDescriptor(const uint8 *reportDescriptor,
 	}
 
 	HIDCollection *collection = fRootCollection;
+	uint32 collectionDepth = 0;
+	status_t status = B_OK;
 	const uint8 *pointer = reportDescriptor;
 	const uint8 *end = pointer + descriptorLength;
 
-	while (pointer < end) {
+	while (pointer < end && status == B_OK) {
 		const item_prefix *item = (item_prefix *)pointer;
+		size_t available = end - pointer;
 		size_t itemSize = sItemSize[item->size];
 		uint32 data = 0;
 
+		// An item that the descriptor ends in is not read: its data would be
+		// whatever follows the descriptor in memory. What came before it is
+		// kept (a descriptor fetched with a guessed length ends like this).
 		if (item->type == ITEM_TYPE_LONG) {
+			if (available < sizeof(long_item)) {
+				TRACE_ALWAYS("the descriptor ends within a long item\n");
+				break;
+			}
+
 			long_item *longItem = (long_item *)item;
 			itemSize += longItem->data_size;
-		} else {
+		}
+
+		if (itemSize + sizeof(item_prefix) > available) {
+			TRACE_ALWAYS("the descriptor ends within an item\n");
+			break;
+		}
+
+		if (item->type != ITEM_TYPE_LONG) {
 			short_item *shortItem = (short_item *)item;
 			switch (itemSize) {
 				case 1:
@@ -117,16 +152,29 @@ HIDParser::ParseReportDescriptor(const uint8 *reportDescriptor,
 				}
 
 				if (item->tag == ITEM_TAG_MAIN_COLLECTION) {
+					if (collectionDepth >= kMaxCollectionDepth) {
+						TRACE_ALWAYS("collections nested too deeply\n");
+						status = B_BAD_DATA;
+						break;
+					}
+
 					HIDCollection *newCollection
 						= new(std::nothrow) HIDCollection(collection,
 							(uint8)data, localState);
 					if (newCollection == NULL) {
 						TRACE_ALWAYS("no memory to allocate new collection\n");
+						status = B_NO_MEMORY;
 						break;
 					}
 
-					collection->AddChild(newCollection);
+					status = collection->AddChild(newCollection);
+					if (status != B_OK) {
+						delete newCollection;
+						break;
+					}
+
 					collection = newCollection;
+					collectionDepth++;
 				} else if (item->tag == ITEM_TAG_MAIN_END_COLLECTION) {
 					if (collection == fRootCollection) {
 						TRACE_ALWAYS("end collection with no open one\n");
@@ -134,6 +182,7 @@ HIDParser::ParseReportDescriptor(const uint8 *reportDescriptor,
 					}
 
 					collection = collection->Parent();
+					collectionDepth--;
 				} else {
 					uint8 reportType = HID_REPORT_TYPE_ANY;
 					switch (item->tag) {
@@ -173,8 +222,8 @@ HIDParser::ParseReportDescriptor(const uint8 *reportDescriptor,
 						localState.string_index = localState.string_minimum;
 
 					main_item_data *mainData = (main_item_data *)&data;
-					target->AddMainItem(globalState, localState, *mainData,
-						collection);
+					status = target->AddMainItem(globalState, localState,
+						*mainData, collection);
 				}
 
 				// reset the local item state
@@ -272,6 +321,11 @@ HIDParser::ParseReportDescriptor(const uint8 *reportDescriptor,
 						value.is_extended = itemSize == sizeof(uint32);
 						value.u.extended = data;
 
+						if ((uint32)usageStack.Count() >= kMaxUsages) {
+							TRACE_ALWAYS("ignoring excess usage\n");
+							break;
+						}
+
 						if (usageStack.PushBack(value) == B_NO_MEMORY) {
 							TRACE_ALWAYS("no memory when growing usages\n");
 							break;
@@ -296,11 +350,19 @@ HIDParser::ParseReportDescriptor(const uint8 *reportDescriptor,
 						if (localState.usage_minimum.u.extended
 							<= localState.usage_maximum.u.extended) {
 
-							uint32 count = localState.usage_maximum.u.extended
-								- localState.usage_minimum.u.extended + 1;
+							// one less than the count: a range of all 32
+							// bit values has no count in 32 bits
+							uint32 last = localState.usage_maximum.u.extended
+								- localState.usage_minimum.u.extended;
+							uint32 room = kMaxUsages - usageStack.Count();
+							if (last >= room) {
+								TRACE_ALWAYS("usage range of %" B_PRIu32 " cut"
+									" to %" B_PRIu32 "\n", last + 1, room);
+							}
+
 							usage_value value = localState.usage_minimum;
 
-							for (uint32 n = 0; n < count ; n++) {
+							for (uint32 n = 0; n <= last && n < room; n++) {
 								if (usageStack.PushBack(value) == B_NO_MEMORY) {
 									TRACE_ALWAYS(
 										"no memory when growing usages\n");
@@ -375,7 +437,12 @@ HIDParser::ParseReportDescriptor(const uint8 *reportDescriptor,
 		state = next;
 	}
 
-	return B_OK;
+	if (status != B_OK) {
+		// half a descriptor describes other reports than the device sends
+		_Reset();
+	}
+
+	return status;
 }
 
 
@@ -494,6 +561,28 @@ HIDParser::SetReport(status_t status, uint8 *report, size_t length)
 }
 
 
+bool
+HIDParser::ReserveItems(uint32 count)
+{
+	if (count > kMaxItems - fItemCount)
+		return false;
+
+	fItemCount += count;
+	return true;
+}
+
+
+bool
+HIDParser::ReserveUsage()
+{
+	if (fUsageCount >= kMaxStoredUsages)
+		return false;
+
+	fUsageCount++;
+	return true;
+}
+
+
 void
 HIDParser::PrintToStream()
 {
@@ -505,7 +594,8 @@ HIDParser::PrintToStream()
 		report->PrintToStream();
 	}
 
-	fRootCollection->PrintToStream();
+	if (fRootCollection != NULL)
+		fRootCollection->PrintToStream();
 }
 
 
@@ -542,7 +632,7 @@ HIDParser::_CalculateResolution(global_item_state *state)
 		physicalMaximum = state->logical_maximum;
 	}
 
-	int8 unitExponent = sUnitExponent[state->unit_exponent];
+	int8 unitExponent = sUnitExponent[state->unit_exponent & 0xf];
 
 	float power = 1;
 	if (unitExponent < 0) {
@@ -573,4 +663,6 @@ HIDParser::_Reset()
 
 	fUsesReportIDs = false;
 	fRootCollection = NULL;
+	fItemCount = 0;
+	fUsageCount = 0;
 }
