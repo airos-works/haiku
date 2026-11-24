@@ -646,6 +646,29 @@ usb_disk_send_diagnostic(device_lun* lun)
 }
 
 
+/*!	The block size a READ CAPACITY reply means, or 0 when it cannot be used.
+	Everything after it divides by the block size and sizes buffers with it,
+	and it is whatever the device (a card reader's firmware, a damaged stick)
+	put there.
+*/
+static uint32
+usb_disk_block_size(uint32 reported)
+{
+	if (reported == 0) {
+		// Such devices exist, and their blocks are 512 bytes (Linux takes
+		// them so, too: "Sector size 0 reported, assuming 512").
+		return 512;
+	}
+
+	if (reported != 512 && reported != 1024 && reported != 2048
+		&& reported != 4096) {
+		return 0;
+	}
+
+	return reported;
+}
+
+
 /*!	Whether the medium still has the capacity the LUN knows. */
 static bool
 usb_disk_same_capacity(device_lun* lun)
@@ -666,7 +689,8 @@ usb_disk_same_capacity(device_lun* lun)
 	if (result != B_OK || dataLength != sizeof(parameter))
 		return false;
 
-	uint32 blockSize = B_BENDIAN_TO_HOST_INT32(parameter.logical_block_length);
+	uint32 blockSize = usb_disk_block_size(
+		B_BENDIAN_TO_HOST_INT32(parameter.logical_block_length));
 	uint32 lastBlock
 		= B_BENDIAN_TO_HOST_INT32(parameter.last_logical_block_address);
 	if (blockSize != lun->block_size)
@@ -938,12 +962,28 @@ usb_disk_update_capacity_16(device_lun* lun)
 	// on the device or the device only clears the unit atention for capacity
 	// reads.
 	for (int32 i = 0; i < 5; i++) {
+		dataLength = sizeof(scsi_read_capacity_16_parameter);
 		result = usb_disk_operation(lun, commandBlock, 16, &parameter,
 			&dataLength, true, &action);
 
 		if (result == B_OK || (action != err_act_retry
 				&& action != err_act_many_retries)) {
 			break;
+		}
+	}
+
+	// A reply that ends before the block size leaves the rest of the
+	// parameter as it was on the stack; one with a block size nothing can be
+	// done with is no better.
+	uint32 blockSize = 0;
+	if (result == B_OK) {
+		if (dataLength < offsetof(scsi_read_capacity_16_parameter, reserved))
+			result = B_BAD_DATA;
+		else {
+			blockSize = usb_disk_block_size(
+				B_BENDIAN_TO_HOST_INT32(parameter.logical_block_length));
+			if (blockSize == 0)
+				result = B_BAD_DATA;
 		}
 	}
 
@@ -957,7 +997,7 @@ usb_disk_update_capacity_16(device_lun* lun)
 
 	lun->media_present = true;
 	lun->media_changed = false;
-	lun->block_size = B_BENDIAN_TO_HOST_INT32(parameter.logical_block_length);
+	lun->block_size = blockSize;
 	lun->physical_block_size = lun->block_size;
 	lun->block_count = B_BENDIAN_TO_HOST_INT64(parameter.last_logical_block_address) + 1;
 
@@ -985,6 +1025,7 @@ usb_disk_update_capacity(device_lun* lun)
 	// on the device or the device only clears the unit atention for capacity
 	// reads.
 	for (int32 i = 0; i < 5; i++) {
+		dataLength = sizeof(scsi_read_capacity_10_parameter);
 		result = usb_disk_operation(lun, commandBlock, 10, &parameter,
 			&dataLength, true, &action);
 
@@ -1000,6 +1041,26 @@ usb_disk_update_capacity(device_lun* lun)
 		}
 	}
 
+	// As in usb_disk_update_capacity_16(): a short reply holds stack
+	// contents, and the block size is the device's.
+	uint32 blockSize = 0;
+	if (result == B_OK) {
+		if (dataLength != sizeof(scsi_read_capacity_10_parameter)) {
+			TRACE_ALWAYS("capacity reply of %" B_PRIuSIZE " bytes\n",
+				dataLength);
+			result = B_BAD_DATA;
+		} else {
+			blockSize = usb_disk_block_size(
+				B_BENDIAN_TO_HOST_INT32(parameter.logical_block_length));
+			if (blockSize == 0) {
+				TRACE_ALWAYS("unusable block size %" B_PRIu32 "\n",
+					(uint32)B_BENDIAN_TO_HOST_INT32(
+						parameter.logical_block_length));
+				result = B_BAD_DATA;
+			}
+		}
+	}
+
 	if (result != B_OK) {
 		TRACE_ALWAYS("failed to update capacity: %s\n", strerror(result));
 		lun->media_present = false;
@@ -1010,7 +1071,7 @@ usb_disk_update_capacity(device_lun* lun)
 
 	lun->media_present = true;
 	lun->media_changed = false;
-	lun->block_size = B_BENDIAN_TO_HOST_INT32(parameter.logical_block_length);
+	lun->block_size = blockSize;
 	lun->physical_block_size = lun->block_size;
 	lun->block_count =
 		B_BENDIAN_TO_HOST_INT32(parameter.last_logical_block_address) + 1;
