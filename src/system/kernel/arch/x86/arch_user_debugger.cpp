@@ -134,7 +134,7 @@ set_iframe_registers(iframe* frame, const debug_cpu_state* cpuState)
 	frame->cx = cpuState->rcx;
 	frame->bx = cpuState->rbx;
 	frame->ax = cpuState->rax;
-	frame->ip = cpuState->rip;
+	frame->ip = x86_sanitize_user_ip(cpuState->rip);
 	frame->flags = (frame->flags & ~X86_EFLAGS_USER_SETTABLE_FLAGS)
 		| (cpuState->rflags & X86_EFLAGS_USER_SETTABLE_FLAGS);
 	frame->sp = cpuState->rsp;
@@ -750,6 +750,9 @@ arch_set_debug_cpu_state(const debug_cpu_state* cpuState)
 		Thread* thread = thread_get_current_thread();
 		memcpy(thread->arch_info.user_fpu_state, &cpuState->extended_registers,
 			sizeof(cpuState->extended_registers));
+		// the debugger's values are loaded by the kernel's return path, as
+		// those of a signal frame are (see arch_restore_signal_frame())
+		x86_sanitize_user_fpu_state(thread->arch_info.user_fpu_state);
 		frame->fpu = &thread->arch_info.user_fpu_state;
 #else
 		if (gHasSSE) {

@@ -600,6 +600,14 @@
 #define	PSR_Z		0x40000000
 #define	PSR_N		0x80000000
 #define	PSR_FLAGS	0xf0000000
+#define	PSR_BTYPE	0x00000c00
+#define	PSR_SSBS	0x00001000
+#define	PSR_DIT		0x01000000
+#define	PSR_TCO		0x02000000
+/* what EL0 can change by itself: the condition flags, the branch type of a
+   guarded page's indirect branch, and the bits it has MSR access to */
+#define	PSR_USER_SETTABLE \
+	(PSR_FLAGS | PSR_BTYPE | PSR_SSBS | PSR_DIT | PSR_TCO)
 
 /* TCR_EL1 - Translation Control Register */
 #define	TCR_ASID_16	(1UL << 36)

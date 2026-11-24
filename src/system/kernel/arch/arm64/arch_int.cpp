@@ -428,6 +428,12 @@ do_sync_handler(iframe * frame)
 		case EXCP_SVC64:
 		{
 			uint32 syscall = (frame->esr & 0xffff);
+			if (syscall >= (uint32)kSyscallCount) {
+				// the immediate of the svc is the program's: nothing of the
+				// table is behind its end (#158)
+				frame->x[0] = B_BAD_VALUE;
+				return;
+			}
 			uint32 count = kExtendedSyscallInfos[syscall].parameter_count;
 
 			uint64_t args[20];

@@ -50,6 +50,11 @@ SimpleTest page_writer_stall_test : page_writer_stall_test.cpp ;
 # before (airos-works/haiku#153)
 SimpleTest sem_slot_reuse_test : sem_slot_reuse_test.cpp ;
 
+# a signal handler that changes the saved state the kernel restores with its
+# own privileges: segment selectors, instruction pointer, XSAVE area, SPSR
+# (airos-works/haiku#158). A kernel without the fix does not survive it.
+SimpleTest signal_frame_forge_test : signal_frame_forge_test.cpp ;
+
 SimpleTest hello_avx : hello_avx.c ;
 local avxSource = [ FGristFiles hello_avx.c ] ;
 local avxObject = $(avxSource:S=$(SUFOBJ)) ;

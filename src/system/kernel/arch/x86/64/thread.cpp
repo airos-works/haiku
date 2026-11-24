@@ -72,8 +72,56 @@ extern "C" void x86_64_thread_entry();
 // Initial thread saved state.
 arch_thread gInitialState _ALIGNED(64);
 extern uint64 gFPUSaveLength;
+extern uint64 gXsaveMask;
 extern bool gHasXsave;
 extern bool gHasXsavec;
+
+// The MXCSR bits this processor has: setting another one faults.
+static uint32 sMXCSRMask = 0xffbf;
+
+
+/*!	Makes an FPU state that comes from userland (a signal frame, which the
+	handler may have changed; the state a debugger sets) one the processor
+	accepts. It is loaded on the way back to userland, where a general
+	protection fault of XRSTOR or FXRSTOR is the kernel's own: a panic.
+
+	What these instructions refuse are a reserved bit in MXCSR and, with XSAVE,
+	a header that names a state component the kernel has not enabled, has
+	something in its reserved bytes, or says "compacted" in a way that does
+	not fit. The header's format is not the program's to choose: it is the
+	one the kernel saves in, and comes from there. The register contents
+	are taken as they are.
+*/
+void
+x86_sanitize_user_fpu_state(void* _state)
+{
+	savefpu* state = (savefpu*)_state;
+
+	state->fp_fxsave.mxcsr &= sMXCSRMask;
+
+	if (!gHasXsave)
+		return;
+
+	const savefpu* initialState = (const savefpu*)gInitialState.user_fpu_state;
+	state->fp_xstate.bv &= gXsaveMask;
+	state->fp_xstate.xcomp_bv = initialState->fp_xstate.xcomp_bv;
+	memset(state->fp_xstate._reserved, 0, sizeof(state->fp_xstate._reserved));
+}
+
+
+/*!	Returns an instruction pointer the kernel can return to userland with:
+	IRET to a non-canonical address faults in the kernel on Intel processors,
+	after the switch to the user's GS base. Such an address becomes a
+	canonical one of the kernel's half, where the thread gets the fault it
+	asked for, in user mode (SIGSEGV).
+*/
+addr_t
+x86_sanitize_user_ip(addr_t ip)
+{
+	if ((addr_t)((int64)(ip << 16) >> 16) != ip)
+		ip |= 0xffff800000000000;
+	return ip;
+}
 
 
 void
@@ -200,6 +248,16 @@ arch_thread_init(kernel_args* args)
 			"fnclex;"	\
 			"fxsaveq %0"
 			:: "m" (gInitialState.user_fpu_state));
+	}
+
+	// FXSAVE always stores MXCSR_MASK (XSAVEC leaves it out with the SSE state
+	// in its initial configuration); 0 stands for the default.
+	{
+		static uint8 fxsaveArea[512] _ALIGNED(64);
+		asm volatile("fxsaveq %0" :: "m" (fxsaveArea));
+		uint32 mask = ((fpu_state*)fxsaveArea)->mxcsr_mask;
+		if (mask != 0)
+			sMXCSRMask = mask;
 	}
 
 	// FNINIT does not affect MXCSR or data registers, so we reset them in the state.
@@ -463,7 +521,6 @@ arch_restore_signal_frame(struct signal_frame_data* signalFrameData)
 	frame->r14 = signalFrameData->context.uc_mcontext.r14;
 	frame->r15 = signalFrameData->context.uc_mcontext.r15;
 	frame->user_sp = signalFrameData->context.uc_mcontext.rsp;
-	frame->ip = signalFrameData->context.uc_mcontext.rip;
 	frame->flags = (frame->flags & ~(uint64)X86_EFLAGS_USER_FLAGS)
 		| (signalFrameData->context.uc_mcontext.rflags & X86_EFLAGS_USER_FLAGS);
 
@@ -471,13 +528,26 @@ arch_restore_signal_frame(struct signal_frame_data* signalFrameData)
 	// handler for information purposes only, and are not used after the signal handling is
 	// complete.
 
-	frame->cs = signalFrameData->context.uc_mcontext.fpu.fp_fxsave.cs;
-	frame->ss = signalFrameData->context.uc_mcontext.fpu.fp_fxsave.ss;
+	// The frame data comes from the user stack: the handler, or anything else
+	// in the program, may have written to it. What the kernel's return path
+	// loads from it with its own privileges (IRET the selectors and the
+	// instruction pointer, XRSTOR the FPU state) has to be what a program may
+	// have: a kernel selector there is a return to ring 0, and anything the
+	// processor refuses is a fault in the kernel (#158).
+	// The code selector is one of the two user ones; anything else, such as
+	// the 0 of a context the program built itself, stands for the 64 bit one.
+	// There is only one user stack selector.
+	frame->ip = x86_sanitize_user_ip(signalFrameData->context.uc_mcontext.rip);
+
+	uint16 cs = signalFrameData->context.uc_mcontext.fpu.fp_fxsave.cs;
+	frame->cs = cs == USER32_CODE_SELECTOR ? cs : USER_CODE_SELECTOR;
+	frame->ss = USER_DATA_SELECTOR;
 
 	Thread* thread = thread_get_current_thread();
 
 	memcpy(thread->arch_info.user_fpu_state,
 		(void*)&signalFrameData->context.uc_mcontext.fpu, min_c(gFPUSaveLength, sizeof(savefpu)));
+	x86_sanitize_user_fpu_state(thread->arch_info.user_fpu_state);
 	frame->fpu = &thread->arch_info.user_fpu_state;
 
 	// The syscall return code overwrites frame->ax with the return value of

@@ -27,6 +27,10 @@ phys_addr_t x86_next_page_directory(Thread* from, Thread* to);
 void x86_initial_return_to_userland(Thread* thread, struct iframe* iframe);
 
 void x86_restart_syscall(struct iframe* frame);
+#ifdef __x86_64__
+void x86_sanitize_user_fpu_state(void* state);
+addr_t x86_sanitize_user_ip(addr_t ip);
+#endif
 void x86_set_tls_context(Thread* thread);
 
 
