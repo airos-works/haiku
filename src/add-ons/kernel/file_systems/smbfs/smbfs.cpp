@@ -523,6 +523,25 @@ smbfs_getattr(const char* path, struct stat* st)
 }
 
 
+/*!	The request of a readlink. libsmb2 hands the target to the callback as a
+	pointer into the server's reply, and frees the reply as soon as the
+	callback returns: it has to be copied there, not after the wait.
+*/
+struct LinkRequest : Request {
+	std::string	target;
+
+	static void Callback(smb2_context* context, int status, void* data,
+		void* cookie)
+	{
+		LinkRequest* request = (LinkRequest*)cookie;
+		if (status == 0 && data != NULL)
+			request->target = (const char*)data;
+		request->status = status;
+		request->finished = true;
+	}
+};
+
+
 static int
 smbfs_readlink(const char* path, char* buffer, size_t size)
 {
@@ -532,16 +551,15 @@ smbfs_readlink(const char* path, char* buffer, size_t size)
 	const std::string serverPath = server_path(path);
 
 	return with_connection([&](Connection* connection) -> int {
-		Request request;
+		LinkRequest request;
 		int status = complete(connection,
 			smb2_readlink_async(connection->Context(), serverPath.c_str(),
-				&Request::Callback, &request),
+				&LinkRequest::Callback, &request),
 			request);
 		if (status != 0)
 			return status;
 
-		strlcpy(buffer, request.data != NULL ? (const char*)request.data : "",
-			size);
+		strlcpy(buffer, request.target.c_str(), size);
 		for (char* c = buffer; *c != '\0'; c++) {
 			if (*c == '\\')
 				*c = '/';

@@ -710,6 +710,14 @@ DirectoryWatcher::_AddEvents(Watch* watch, const uint8* buffer,
 
 		if (next == 0)
 			break;
+
+		// Where the next record starts is the server's word, too. One that
+		// does not lie further on in the reply would have us read outside of
+		// it, or the same records over and over.
+		if (next < 12 || next > length - offset) {
+			_AddEvent(kDirectoryChanged, watch, std::string());
+			return;
+		}
 		offset += next;
 	}
 }
