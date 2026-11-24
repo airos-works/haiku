@@ -47,7 +47,20 @@ typedef struct {
 	sem_id				notify;
 	status_t			status;
 	size_t				actual_length;
+
+	int32				removed;
+		// the device is going away: nothing new is started on it
+	int32				busy;
+		// ioctls in progress; the removal hook waits for them
+	bool				abandoned;
+		// a transfer never came back: this structure is never freed
 } raw_device;
+
+// How long the removal hook waits for ioctls that are in progress, and how
+// long a thread goes on cancelling a transfer of its own before it gives the
+// device up.
+#define REMOVAL_TIMEOUT				5000000LL
+#define TRANSFER_ABANDON_TIMEOUT	10000000LL
 
 int32 api_version = B_CUR_DRIVER_API_VERSION;
 static usb_module_info *gUSBModule = NULL;
@@ -85,6 +98,9 @@ usb_raw_device_added(usb_device newDevice, void **cookie)
 
 	device->device = newDevice;
 	device->reference_count = 0;
+	device->removed = 0;
+	device->busy = 0;
+	device->abandoned = false;
 
 	mutex_lock(&gDeviceListLock);
 	device->link = (void *)gDeviceList;
@@ -103,20 +119,33 @@ static void usb_raw_stream_callback(void *cookie, status_t status, void *data,
 	size_t actualLength);
 
 
-static status_t
-usb_raw_device_removed(void *cookie)
+static void
+usb_raw_free_device(raw_device *device)
 {
-	TRACE((DRIVER_NAME": device_removed(0x%p)\n", cookie));
-	raw_device *device = (raw_device *)cookie;
+	if (device->abandoned) {
+		// A transfer of it may still be out there, and its callback would
+		// use this.
+		return;
+	}
 
+	mutex_lock(&device->lock);
+	mutex_destroy(&device->lock);
+	mutex_destroy(&device->stream_lock);
+	delete_sem(device->notify);
+	free(device);
+}
+
+
+/*!	Cancels everything that is queued for the device, with the callbacks
+	called.
+*/
+static void
+usb_raw_cancel_all(raw_device *device)
+{
 	// the stream's transfers have callbacks to be called, too
 	usb_raw_stream_stop(device);
 
-	// cancel all pending transfers to make sure no one keeps waiting forever
-	// in syscalls. This has to happen here: once the device is freed, the
-	// stack cancels what is left by force, without calling the callbacks, and
-	// an ioctl waiting for one would never return while holding the device
-	// lock. That includes control requests on the default pipe.
+	// control requests on the default pipe
 	gUSBModule->cancel_queued_requests(device->device);
 
 	const usb_configuration_info *configurationInfo =
@@ -134,6 +163,19 @@ usb_raw_device_removed(void *cookie)
 			}
 		}
 	}
+}
+
+
+static status_t
+usb_raw_device_removed(void *cookie)
+{
+	TRACE((DRIVER_NAME": device_removed(0x%p)\n", cookie));
+	raw_device *device = (raw_device *)cookie;
+
+	// From here on nothing new is started on the device: an ioctl tests
+	// this mark after it has counted itself in, and again with the device
+	// lock held before it queues a transfer.
+	atomic_set(&device->removed, 1);
 
 	mutex_lock(&gDeviceListLock);
 	if (gDeviceList == device) {
@@ -152,14 +194,40 @@ usb_raw_device_removed(void *cookie)
 	gDeviceCount--;
 	mutex_unlock(&gDeviceListLock);
 
-	device->device = 0;
-	if (device->reference_count == 0) {
-		mutex_lock(&device->lock);
-		mutex_destroy(&device->lock);
-		mutex_destroy(&device->stream_lock);
-		delete_sem(device->notify);
-		free(device);
+	// Cancel all pending transfers to make sure no one keeps waiting forever
+	// in syscalls. This has to happen here: once the device is freed, the
+	// stack cancels what is left by force, without calling the callbacks, and
+	// an ioctl waiting for one would never return while holding the device
+	// lock.
+	// One round is not enough: an ioctl that was on its way when the mark
+	// was set can queue its transfer after the cancel (a download is a row
+	// of transfers, and a cancel waits for the controller). So cancel until
+	// no ioctl is in progress, and once more after that. The device, its
+	// pipes and the descriptors the ioctls read exist until this hook
+	// returns.
+	bigtime_t start = system_time();
+	while (true) {
+		bool idle = atomic_get(&device->busy) == 0;
+		usb_raw_cancel_all(device);
+		if (idle)
+			break;
+
+		if (system_time() - start > REMOVAL_TIMEOUT) {
+			dprintf(DRIVER_NAME ": %s was removed with %" B_PRId32 " ioctls "
+				"that do not end\n", device->name, atomic_get(&device->busy));
+			break;
+		}
+
+		snooze(5000);
 	}
+
+	mutex_lock(&gDeviceListLock);
+	device->device = 0;
+	bool unused = device->reference_count == 0;
+	mutex_unlock(&gDeviceListLock);
+
+	if (unused)
+		usb_raw_free_device(device);
 
 	return B_OK;
 }
@@ -266,11 +334,7 @@ usb_raw_free(void *cookie)
 	}
 	if (device->device == 0 && device->reference_count == 0) {
 		// the device is gone and this was its last user
-		mutex_lock(&device->lock);
-		mutex_destroy(&device->lock);
-		mutex_destroy(&device->stream_lock);
-		delete_sem(device->notify);
-		free(device);
+		usb_raw_free_device(device);
 	}
 
 	mutex_unlock(&gDeviceListLock);
@@ -307,6 +371,46 @@ usb_raw_callback(void *cookie, status_t status, void *data, size_t actualLength)
 
 	device->actual_length = actualLength;
 	release_sem(device->notify);
+}
+
+
+/*!	Waits for the callback of the transfer the caller has just queued, with
+	the device lock held. \a pipe is 0 for a request on the default pipe.
+
+	A thread that is killed cancels its transfer and then waits on: the
+	transfer's buffers are in use until the callback has been called. The
+	cancel is repeated, since a single one can miss a transfer the controller
+	is busy with.
+
+	Returns \c false when the callback did not come even so. The device is
+	given up then (no more ioctls), and the caller must leave everything the
+	transfer uses allocated: a leak, but the thread and with it its team can
+	end, and the device lock is not held for good.
+*/
+static bool
+usb_raw_wait_for_transfer(raw_device *device, usb_pipe pipe)
+{
+	if (acquire_sem_etc(device->notify, 1, B_KILL_CAN_INTERRUPT, 0) == B_OK)
+		return true;
+
+	bigtime_t start = system_time();
+	do {
+		if (pipe != 0)
+			gUSBModule->cancel_queued_transfers(pipe);
+		else
+			gUSBModule->cancel_queued_requests(device->device);
+
+		if (acquire_sem_etc(device->notify, 1, B_RELATIVE_TIMEOUT, 50000)
+				== B_OK) {
+			return true;
+		}
+	} while (system_time() - start < TRANSFER_ABANDON_TIMEOUT);
+
+	dprintf(DRIVER_NAME ": a cancelled transfer of %s did not come back, "
+		"giving the device up\n", device->name);
+	device->abandoned = true;
+	atomic_set(&device->removed, 1);
+	return false;
 }
 
 
@@ -710,10 +814,8 @@ usb_raw_stream_read(raw_device *device, void *userData, size_t *_length,
 
 
 static status_t
-usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
+usb_raw_do_command(raw_device *device, uint32 op, void *buffer, size_t length)
 {
-	TRACE((DRIVER_NAME": ioctl\n"));
-	raw_device *device = (raw_device *)cookie;
 	if (device->device == 0)
 		return B_DEV_NOT_READY;
 
@@ -1171,6 +1273,9 @@ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
 			}
 
 			MutexLocker deviceLocker(device->lock);
+			if (atomic_get(&device->removed) != 0)
+				return B_DEV_NOT_READY;
+
 			if (gUSBModule->queue_request(device->device,
 				command.control.request_type, command.control.request,
 				command.control.value, command.control.index,
@@ -1182,12 +1287,12 @@ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
 				break;
 			}
 
-			status = acquire_sem_etc(device->notify, 1, B_KILL_CAN_INTERRUPT, 0);
-			if (status != B_OK) {
-				gUSBModule->cancel_queued_requests(device->device);
-				acquire_sem(device->notify);
+			if (!usb_raw_wait_for_transfer(device, 0)) {
+				dataDeleter.Detach();
+				return B_DEV_NOT_READY;
 			}
 
+			status = B_OK;
 			command.control.status = device->status;
 			command.control.length = device->actual_length;
 			deviceLocker.Unlock();
@@ -1285,8 +1390,10 @@ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
 				}
 			}
 
-			status_t status;
 			MutexLocker deviceLocker(device->lock);
+			if (atomic_get(&device->removed) != 0)
+				return B_DEV_NOT_READY;
+
 			if (op == B_USB_RAW_COMMAND_INTERRUPT_TRANSFER) {
 				status = gUSBModule->queue_interrupt(endpointInfo->handle,
 					transferData, command.transfer.length,
@@ -1309,12 +1416,13 @@ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
 				break;
 			}
 
-			status = acquire_sem_etc(device->notify, 1, B_KILL_CAN_INTERRUPT, 0);
-			if (status != B_OK) {
-				gUSBModule->cancel_queued_transfers(endpointInfo->handle);
-				acquire_sem(device->notify);
+			if (!usb_raw_wait_for_transfer(device, endpointInfo->handle)) {
+				descriptorsDeleter.Detach();
+				dataDeleter.Detach();
+				return B_DEV_NOT_READY;
 			}
 
+			status = B_OK;
 			command.transfer.status = device->status;
 			command.transfer.length = device->actual_length;
 			deviceLocker.Unlock();
@@ -1433,6 +1541,26 @@ usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
 	if (user_memcpy(buffer, &command, min_c(length, sizeof(command))) != B_OK)
 		return B_BAD_ADDRESS;
 
+	return status;
+}
+
+
+static status_t
+usb_raw_ioctl(void *cookie, uint32 op, void *buffer, size_t length)
+{
+	TRACE((DRIVER_NAME": ioctl\n"));
+	raw_device *device = (raw_device *)cookie;
+
+	// Counted in before the mark is read: the removal hook sets the mark and
+	// then waits for the count, so either it waits for this ioctl or this
+	// ioctl sees the mark.
+	atomic_add(&device->busy, 1);
+
+	status_t status = B_DEV_NOT_READY;
+	if (atomic_get(&device->removed) == 0)
+		status = usb_raw_do_command(device, op, buffer, length);
+
+	atomic_add(&device->busy, -1);
 	return status;
 }
 
