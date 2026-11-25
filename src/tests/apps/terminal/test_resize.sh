@@ -4,7 +4,10 @@
 set -eu
 
 dir=$(mktemp -d)
-"${1:-/boot/system/apps/Terminal}" /bin/sh -c 'tty > "$1/tty"; exec sleep 60' sh "$dir" &
+# The shell in the terminal writes down each size the pty is given.
+"${1:-/boot/system/apps/Terminal}" /bin/sh -c 'tty > "$1/tty"
+	trap "stty size >> \"$1/sizes\"" WINCH
+	while :; do sleep 60 & wait $!; done' sh "$dir" &
 team=$!
 trap 'kill "$team" 2>/dev/null || true; rm -rf "$dir"' EXIT
 attempt=0
@@ -56,5 +59,22 @@ sleep .2
 snapshot after
 if cmp -s "$dir/before.png" "$dir/after.png"; then
 	echo 'Terminal did not present the resized frame' >&2
+	exit 1
+fi
+
+# A live resize: steps closer together than the end of a gesture is detected
+# (75 ms). The grid has to follow the steps, and the pty learn the sizes on
+# the way, not only the last one once the steps stop.
+: > "$dir/sizes"
+width=540
+while [ "$width" -lt 840 ]; do
+	width=$((width + 10))
+	resize "$width" 380
+done
+sleep .3
+sizes=$(sort -u "$dir/sizes" | wc -l)
+echo "sizes the pty was given during the steps: $(tr '\n' ',' < "$dir/sizes")"
+if [ "$sizes" -lt 3 ]; then
+	echo 'The grid did not follow a live resize' >&2
 	exit 1
 fi

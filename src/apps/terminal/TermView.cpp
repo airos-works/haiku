@@ -149,6 +149,9 @@ static const uint32 kSearchUpdate = 'TSup';
 static const bigtime_t kFrameInterval = 1000000 / 120;
 static const bigtime_t kSynchronizedRetry = 20000;
 static const bigtime_t kResizeSettleTime = 75000;
+// during a drag the pty learns the new size at most this often: every
+// SIGWINCH makes a full-screen program, maybe over SSH, draw everything
+static const bigtime_t kShellResizeInterval = 50000;
 
 // choosing between the GPU and the software renderer: large frames timed
 // in a series, after some that are not
@@ -631,6 +634,8 @@ TermView::_InitObject(const ShellParameters& shellParameters)
 	fLastFrameTime = 0;
 	fFrameNeeded = false;
 	fLastResizeTime = 0;
+	fShellSizePending = false;
+	fLastShellResize = 0;
 	fResizeViewDisableCount = 0;
 	static int32 sNextRemoteControlID = 1;
 	fRemoteControlID = atomic_add(&sNextRemoteControlID, 1);
@@ -1425,10 +1430,9 @@ TermView::SetTermSize(int rows, int columns, bool notifyShell)
 	if (fScrollBar != NULL)
 		fScrollBar->SetSteps(fFontHeight, fFontHeight * fRows);
 
-	if (notifyShell && fShell != NULL) {
-		const RenderMetrics& metrics = fGlyphs.Metrics();
-		fShell->UpdateWindowSize(fRows, fColumns, fColumns * metrics.cellWidth,
-			fRows * metrics.cellHeight);
+	if (notifyShell) {
+		fShellSizePending = true;
+		_UpdateShellSize(fResizeRunner == NULL);
 	}
 
 	_InvalidateAll();
@@ -2826,12 +2830,6 @@ TermView::_RenderFrame()
 	int32 height = std::max((int32)1,
 		(int32)ceilf((bounds.Height() + 1) * fScale));
 
-	if (fResizeRunner != NULL && fBitmap != NULL) {
-		// Output can keep painting at the current grid size during a drag.
-		width = fBitmap->Bounds().IntegerWidth() + 1;
-		height = fBitmap->Bounds().IntegerHeight() + 1;
-	}
-
 	bigtime_t frameStart = system_time();
 	for (int32 attempt = 0; attempt < 2; attempt++) {
 		fTerminal->Lock();
@@ -3842,6 +3840,33 @@ TermView::FrameResized(float width, float height)
 
 	if (fResizeViewDisableCount > 0)
 		fResizeViewDisableCount--;
+
+	// Reflow at once, as the window is dragged: the frame at the new size
+	// replaces the last one only when it is complete (see _RenderFrame()).
+	SetTermSize(rows, columns, true);
+	_ScheduleFrame();
+}
+
+
+/*!	Tells the pty the size of the grid if it changed since the last time.
+	During a live resize, \a force false sends it at most every
+	kShellResizeInterval; the resize runner sends the rest.
+*/
+void
+TermView::_UpdateShellSize(bool force)
+{
+	if (!fShellSizePending || fShell == NULL)
+		return;
+
+	bigtime_t now = system_time();
+	if (!force && now - fLastShellResize < kShellResizeInterval)
+		return;
+
+	const RenderMetrics& metrics = fGlyphs.Metrics();
+	fShell->UpdateWindowSize(fRows, fColumns, fColumns * metrics.cellWidth,
+		fRows * metrics.cellHeight);
+	fShellSizePending = false;
+	fLastShellResize = now;
 }
 
 
@@ -3850,6 +3875,7 @@ TermView::_EndResize()
 {
 	delete fResizeRunner;
 	fResizeRunner = NULL;
+	_UpdateShellSize(true);
 	if (fResizeView != NULL) {
 		if (fResizeView->Parent() != NULL)
 			RemoveChild(fResizeView);
@@ -5313,17 +5339,18 @@ TermView::MessageReceived(BMessage *message)
 		}
 		case kFinishResize:
 		{
-			if (fResizeRunner == NULL
-				|| system_time() - fLastResizeTime < kResizeSettleTime) {
-					break;
-			}
+			if (fResizeRunner == NULL)
+				break;
+			_UpdateShellSize(false);
+			if (system_time() - fLastResizeTime < kResizeSettleTime)
+				break;
 			BPoint point;
 			uint32 buttons;
 			GetMouse(&point, &buttons, false);
 			if (buttons != 0)
 				break;
 
-			// Reflow scrollback and notify the pty together at the final size.
+			// the grid follows the view already; this catches a last layout
 			_EndResize();
 			SetTermSize(Bounds(), true);
 			_ScheduleFrame();

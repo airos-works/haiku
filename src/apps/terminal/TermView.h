@@ -316,6 +316,7 @@ private:
 
 			// geometry
 			void				_EndResize();
+			void				_UpdateShellSize(bool force);
 			float				_DeviceScale() const;
 			void				_UpdateMetrics();
 			int32				_FirstRow() const;
@@ -462,8 +463,10 @@ private:
 			bigtime_t			fLastFrameTime;
 			bool				fFrameNeeded;
 
-			// frame resized flag.
+			// live resize
 			bigtime_t			fLastResizeTime;
+			bool				fShellSizePending;
+			bigtime_t			fLastShellResize;
 			int32				fResizeViewDisableCount;
 
 			// cursor blinking
