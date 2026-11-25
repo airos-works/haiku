@@ -169,9 +169,47 @@ send_wmt(bt_usb_dev* bdev, uint8 op, uint8 flag, const uint8* data,
 }
 
 
+/* Fetch one WMT event, if the radio has one: true with the event in buffer,
+ * false when it handed back nothing or a buffer it has not written an event
+ * into (its "not yet").
+ */
+static bool
+fetch_wmt(bt_usb_dev* bdev, uint8* buffer, status_t* _status)
+{
+	size_t actual = 0;
+	memset(buffer, 0, WMT_REPLY_MAX);
+
+	*_status = usb->send_request(bdev->dev, USB_VENDOR_IN, MTK_WMT_READ,
+		MTK_WMT_READ_VALUE, 0, WMT_REPLY_MAX, buffer, &actual);
+	return *_status == B_OK && actual >= 7 && buffer[0] == HCI_EVENT_WMT;
+}
+
+
+/* The radio keeps its answers queued until they are read, also across a
+ * device_open() that gave up and a warm reboot. An answer left over from such
+ * an exchange would be taken for the answer to our first command, and every
+ * answer after it for the command before. So what is queued before we start
+ * is read and dropped.
+ */
+static void
+drain_wmt(bt_usb_dev* bdev)
+{
+	uint8 buffer[WMT_REPLY_MAX];
+	status_t status;
+
+	for (int i = 0; i < 16 && fetch_wmt(bdev, buffer, &status); i++) {
+		ERROR("%s: dropped an earlier answer for WMT %#x (flag %#x)\n",
+			__func__, buffer[3], buffer[6]);
+	}
+}
+
+
 /* Collect the answer to the last command. The radio says "not yet" by handing
  * back nothing, or by handing back a buffer it has not written an event into,
- * which it does while it is finishing a section.
+ * which it does while it is finishing a section. An event for another
+ * operation is not the answer: it is late, from an exchange given up on
+ * before, or one the radio sent by itself. It is skipped, and the answer is
+ * still to come.
  */
 static status_t
 read_wmt(bt_usb_dev* bdev, uint8 expectedOp, uint8* outFlag)
@@ -180,24 +218,20 @@ read_wmt(bt_usb_dev* bdev, uint8 expectedOp, uint8* outFlag)
 	bigtime_t deadline = system_time() + WMT_TIMEOUT;
 
 	while (system_time() < deadline) {
-		size_t actual = 0;
-		memset(buffer, 0, sizeof(buffer));
-
-		status_t status = usb->send_request(bdev->dev, USB_VENDOR_IN,
-			MTK_WMT_READ, MTK_WMT_READ_VALUE, 0, sizeof(buffer), buffer,
-			&actual);
-		if (status != B_OK)
-			return status;
-
-		if (actual < 7 || buffer[0] != HCI_EVENT_WMT) {
+		status_t status;
+		if (!fetch_wmt(bdev, buffer, &status)) {
+			if (status != B_OK)
+				return status;
 			snooze(WMT_POLL_GAP);
 			continue;
 		}
 
 		if (buffer[3] != expectedOp) {
-			ERROR("%s: answer is for WMT %#x, we asked %#x\n", __func__,
-				buffer[3], expectedOp);
-			return B_IO_ERROR;
+			ERROR("%s: skipped an event for WMT %#x (%02x %02x %02x %02x %02x"
+				" %02x) while waiting for %#x\n", __func__, buffer[3],
+				buffer[1], buffer[2], buffer[3], buffer[4], buffer[5],
+				buffer[6], expectedOp);
+			continue;
 		}
 
 		*outFlag = buffer[6];
@@ -502,6 +536,8 @@ mediatek_setup(bt_usb_dev* bdev)
 		" sections\n", __func__, chipId & 0xffff, imageHardware, sectionCount);
 
 	bigtime_t started = system_time();
+
+	drain_wmt(bdev);
 
 	for (uint32 i = 0; i < sectionCount; i++) {
 		status = download_section(bdev, image, imageSize, i);
