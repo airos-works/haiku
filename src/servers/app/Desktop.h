@@ -215,6 +215,18 @@ public:
 			void				AddWindow(Window* window);
 			void				RemoveWindow(Window* window);
 
+			// Sheets: a modal window attached below the tab of its parent,
+			// sliding out from under it while the parent's content dims.
+			// All windows locked for writing.
+			status_t			SetSheetParent(Window* sheet,
+									Window* parent);
+			void				StartSheetAnimation(Window* sheet,
+									int32 direction);
+			bigtime_t			StepSheetAnimation(Window* sheet);
+									// the delay until the next step, or
+									// -1 when the slide is over
+			void				FinishSheetAnimation(Window* sheet);
+
 			bool				AddWindowToSubset(Window* subset,
 									Window* window);
 			void				RemoveWindowFromSubset(Window* subset,
@@ -363,6 +375,10 @@ private:
 			void				_PlaceWindow(Window* window, BRect frame);
 			BRect				_FitOnDisplay(Window* window, BRect frame,
 									BRect area);
+			void				_PlaceSheet(Window* sheet, float position);
+			void				_DimSheetParent(Window* sheet);
+			void				_UndimSheetParent(Window* parent);
+
 	static	BRect				_DecoratedFrame(Window* window);
 	static	bool				_IsOnDisplays(BRect decoratedFrame,
 									const BRegion& displays);
@@ -404,6 +420,7 @@ private:
 			int32				fCurrentWorkspace;
 			int32				fPreviousWorkspace;
 			int32				fWindowDrags;
+			bool				fPlacingSheet;
 
 			WindowList			fAllWindows;
 			WindowList			fSubsetWindows;

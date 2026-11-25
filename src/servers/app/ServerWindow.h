@@ -118,6 +118,7 @@ private:
 
 			void				_Show();
 			void				_Hide();
+			void				_FinishSheetAnimation();
 
 			// message handling methods.
 			void				_DispatchMessage(int32 code,

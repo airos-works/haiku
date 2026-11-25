@@ -366,6 +366,17 @@ ServerWindow::_Show()
 	// NOTE: if you do something else, other than sending a port message, PLEASE lock
 	STRACE(("ServerWindow %s: _Show\n", Title()));
 
+	if (!fQuitting && fWindow->SheetAnimation() < 0) {
+		// a sheet shown again while it slides back in: it comes out again
+		fDesktop->UnlockSingleWindow();
+		fDesktop->LockAllWindows();
+		if (fWindow->SheetAnimation() < 0)
+			fDesktop->StartSheetAnimation(fWindow.Get(), 1);
+		fDesktop->UnlockAllWindows();
+		fDesktop->LockSingleWindow();
+		return;
+	}
+
 	if (fQuitting || fWindow->IsMinimized() || !fWindow->IsHidden()
 		|| fWindow->IsOffscreenWindow() || fWindow->TopView() == NULL)
 		return;
@@ -393,8 +404,46 @@ ServerWindow::_Hide()
 		return;
 
 	fDesktop->UnlockSingleWindow();
+
+	if (fWindow->SheetParent() != NULL) {
+		fDesktop->LockAllWindows();
+		::Window* parent = fWindow->SheetParent();
+		if (parent != NULL && !fQuitting && fWindow->IsVisible()
+			&& parent->IsVisible()) {
+			// A sheet slides back in under its parent's tab first: the
+			// last step hides it (AS_SHEET_ANIMATION_STEP).
+			fDesktop->StartSheetAnimation(fWindow.Get(), -1);
+			fDesktop->UnlockAllWindows();
+			fDesktop->LockSingleWindow();
+			return;
+		}
+		fDesktop->UnlockAllWindows();
+	}
+
 	fDesktop->HideWindow(fWindow.Get());
 	fDesktop->LockSingleWindow();
+}
+
+
+/*!	The rest of a sheet's slide, right away in this thread: the window is
+	about to go away. Called without any desktop lock held.
+*/
+void
+ServerWindow::_FinishSheetAnimation()
+{
+	while (true) {
+		fDesktop->LockAllWindows();
+		bigtime_t delay = -1;
+		if (fWindow->SheetAnimation() < 0)
+			delay = fDesktop->StepSheetAnimation(fWindow.Get());
+		else if (fWindow->SheetAnimation() > 0)
+			fDesktop->FinishSheetAnimation(fWindow.Get());
+		fDesktop->UnlockAllWindows();
+
+		if (delay < 0)
+			break;
+		snooze(delay);
+	}
 }
 
 
@@ -950,6 +999,9 @@ ServerWindow::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 				// While the user moves the window, we ignore
 				// pragmatically set window positions
 				fLink.StartMessage(B_BUSY);
+			} else if (fWindow->SheetParent() != NULL) {
+				// a sheet stays where its parent has it
+				fLink.StartMessage(B_NOT_ALLOWED);
 			} else {
 				fDesktop->MoveWindowBy(fWindow.Get(),
 					xMoveTo - fWindow->Frame().left,
@@ -1081,6 +1133,47 @@ ServerWindow::_DispatchMessage(int32 code, BPrivate::LinkReceiver& link)
 			// (Desktop::ReadWindowBitmap())
 			fWindow->StartCapture();
 			break;
+
+		case AS_SET_SHEET_PARENT:
+		{
+			// Has the all-window lock
+			status_t status = B_BAD_VALUE;
+			int32 token;
+			if (link.Read<int32>(&token) == B_OK) {
+				::Window* parent = NULL;
+				if (token != B_NULL_TOKEN) {
+					parent = fDesktop->FindWindowByClientToken(token,
+						App()->ClientTeam());
+				}
+				if (token == B_NULL_TOKEN || parent != NULL)
+					status = fDesktop->SetSheetParent(fWindow.Get(), parent);
+			}
+			DTRACE(("ServerWindow %s: Message AS_SET_SHEET_PARENT: %s\n",
+				Title(), strerror(status)));
+
+			fLink.StartMessage(status);
+			fLink.Flush();
+			break;
+		}
+
+		case AS_IS_SHEET_ANIMATING:
+			fLink.StartMessage(B_OK);
+			fLink.Attach<bool>(fWindow->SheetAnimation() != 0);
+			fLink.Flush();
+			break;
+
+		case AS_SHEET_ANIMATION_STEP:
+		{
+			// Has the all-window lock
+			bigtime_t delay = fDesktop->StepSheetAnimation(fWindow.Get());
+			if (delay >= 0) {
+				DelayedMessage step(AS_SHEET_ANIMATION_STEP, delay);
+				step.AddTarget(MessagePort());
+				step.SetMerge(DM_MERGE_CANCEL);
+				step.Flush();
+			}
+			break;
+		}
 
 		case AS_SYNC:
 			DTRACE(("ServerWindow %s: Message AS_SYNC\n", Title()));
@@ -4496,6 +4589,9 @@ ServerWindow::_MessageLooper()
 				if (lockedDesktopSingleWindow)
 					fDesktop->UnlockSingleWindow();
 
+				if (fWindow->SheetAnimation() != 0)
+					_FinishSheetAnimation();
+
 				quitLoop = true;
 
 				// ServerWindow's destructor takes care of pulling this object
@@ -4762,6 +4858,8 @@ ServerWindow::_MessageNeedsAllWindowsLocked(uint32 code) const
 		case AS_SET_WINDOW_TITLE:
 		case AS_ADD_TO_SUBSET:
 		case AS_REMOVE_FROM_SUBSET:
+		case AS_SET_SHEET_PARENT:
+		case AS_SHEET_ANIMATION_STEP:
 		case AS_VIEW_CREATE_ROOT:
 		case AS_VIEW_CREATE:
 		case AS_SEND_BEHIND:

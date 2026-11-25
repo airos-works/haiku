@@ -55,6 +55,7 @@
 
 #include <binary_compatibility/Interface.h>
 #include <InterfacePrivate.h>
+#include <LooperList.h>
 #include <input_globals.h>
 #include <tracker_private.h>
 #include <util/SplayTree.h>
@@ -445,6 +446,19 @@ BWindow::BWindow(BRect frame, int32 bitmapToken)
 }
 
 
+/*!	What a window was before it became a sheet: it is again when it stops
+	being one.
+*/
+struct BWindow::sheet_state {
+	BWindow*		parent;
+	window_look		look;
+	window_feel		feel;
+	uint32			flags;
+	BPoint			position;
+	bool			automatic;
+};
+
+
 BWindow::~BWindow()
 {
 	if (BMenu* menu = dynamic_cast<BMenu*>(fFocus)) {
@@ -480,6 +494,8 @@ BWindow::~BWindow()
 
 	// TODO: release other dynamically-allocated objects
 	free(fTitle);
+	delete fSheetState;
+	fSheetState = NULL;
 
 	// disable pulsing
 	SetPulseRate(0);
@@ -2675,6 +2691,9 @@ BWindow::Hide()
 
 		_SendShowOrHideMessage();
 
+		if (fShowLevel == 1 && fSheetState != NULL)
+			_WaitForSheetToClose();
+
 		Unlock();
 	}
 }
@@ -2879,6 +2898,7 @@ BWindow::_InitData(BRect frame, const char* title, window_look look,
 	fPulseRunner = NULL;
 
 	fIsFilePanel = false;
+	fSheetState = NULL;
 
 	fMenuSem = -1;
 
@@ -4221,6 +4241,211 @@ BWindow::_SendShowOrHideMessage()
 	fLink->StartMessage(AS_SHOW_OR_HIDE_WINDOW);
 	fLink->Attach<int32>(fShowLevel);
 	fLink->Flush();
+}
+
+
+// #pragma mark - sheets
+
+
+/*!	Makes the window a sheet of \a parent: it is shown attached below the
+	parent's title bar, sliding out from under it, and the parent's content
+	is dimmed while it is up. Like a B_MODAL_SUBSET_WINDOW_FEEL window, it
+	keeps the user from the parent (and only from the parent); it moves along
+	with it, and cannot be moved by itself. Its look becomes
+	B_MODAL_WINDOW_LOOK.
+	A \c NULL \a parent makes it an ordinary window again, with the look,
+	feel and flags it had before (and the position, when it is hidden).
+	Call it before Show(), or while the window is hidden: when the window is
+	shown already, it moves into place at once, without sliding.
+	A window has one sheet at a time (B_BUSY otherwise); the parent must be a
+	B_NORMAL_WINDOW_FEEL window of the same application, and no sheet itself.
+*/
+status_t
+BWindow::SetSheetParent(BWindow* parent)
+{
+	return _SetSheetParent(parent, false);
+}
+
+
+/*!	The window this one is a sheet of, or \c NULL. */
+BWindow*
+BWindow::SheetParent() const
+{
+	if (fSheetState == NULL
+		|| !BPrivate::gLooperList.IsLooperValid(fSheetState->parent))
+		return NULL;
+	return fSheetState->parent;
+}
+
+
+/*!	Whether the window is attached to a parent window as a sheet. */
+bool
+BWindow::IsSheet() const
+{
+	return fSheetState != NULL;
+}
+
+
+status_t
+BWindow::_SetSheetParent(BWindow* parent, bool automatic)
+{
+	if (parent == this || fOffscreen
+		|| (parent != NULL && (parent->fOffscreen
+			|| parent->fFeel != B_NORMAL_WINDOW_FEEL
+			|| parent->fSheetState != NULL))) {
+		return B_BAD_VALUE;
+	}
+
+	BAutolock locker(this);
+	if (!locker.IsLocked())
+		return B_ERROR;
+
+	BWindow* current = fSheetState != NULL ? fSheetState->parent : NULL;
+	if (parent == current) {
+		if (fSheetState == NULL)
+			return B_OK;
+		fSheetState->automatic = automatic;
+
+		// still attached as far as the app_server is concerned (a hidden
+		// sheet gives way to another one of its parent)
+		status_t status = B_ERROR;
+		fLink->StartMessage(AS_SET_SHEET_PARENT);
+		fLink->Attach<int32>(_get_object_token_(parent));
+		if (fLink->FlushWithReply(status) != B_OK)
+			return B_ERROR;
+		return status;
+	}
+
+	if (parent == NULL && fSheetState == NULL)
+		return B_OK;
+
+	sheet_state* state = fSheetState;
+	if (state == NULL) {
+		state = new(std::nothrow) sheet_state;
+		if (state == NULL)
+			return B_NO_MEMORY;
+	}
+
+	status_t status = B_ERROR;
+	fLink->StartMessage(AS_SET_SHEET_PARENT);
+	fLink->Attach<int32>(parent != NULL
+		? _get_object_token_(parent) : B_NULL_TOKEN);
+	if (fLink->FlushWithReply(status) != B_OK && status == B_OK)
+		status = B_ERROR;
+	if (status != B_OK) {
+		if (state != fSheetState)
+			delete state;
+		return status;
+	}
+
+	if (fSheetState != NULL) {
+		// leaves its current parent
+		if (BPrivate::gLooperList.IsLooperValid(current))
+			RemoveFromSubset(current);
+	}
+
+	if (parent == NULL) {
+		// an ordinary window again
+		SetFlags(state->flags);
+		SetFeel(state->feel);
+		SetLook(state->look);
+		if (IsHidden())
+			MoveTo(state->position);
+		delete state;
+		fSheetState = NULL;
+		return B_OK;
+	}
+
+	if (fSheetState == NULL) {
+		state->look = fLook;
+		state->feel = fFeel;
+		state->flags = fFlags;
+		state->position = fFrame.LeftTop();
+		fSheetState = state;
+
+		SetFeel(B_MODAL_SUBSET_WINDOW_FEEL);
+		SetLook(B_MODAL_WINDOW_LOOK);
+		SetFlags(fFlags | B_NOT_MOVABLE | B_NOT_CLOSABLE | B_NOT_ZOOMABLE
+			| B_NOT_MINIMIZABLE);
+	}
+	fSheetState->parent = parent;
+	fSheetState->automatic = automatic;
+	AddToSubset(parent);
+
+	return B_OK;
+}
+
+
+/*!	Whether a dialog the window opens (an alert, a file panel) goes onto it
+	as a sheet: an ordinary titled window the user works in, shown, and not
+	showing another sheet.
+*/
+bool
+BWindow::_CanHostSheet() const
+{
+	if (fOffscreen || fFeel != B_NORMAL_WINDOW_FEEL || fSheetState != NULL
+		|| IsHidden() || IsMinimized()) {
+		return false;
+	}
+	return fLook == B_TITLED_WINDOW_LOOK || fLook == B_DOCUMENT_WINDOW_LOOK
+		|| fLook == kLeftTitledWindowLook;
+}
+
+
+/*!	Attaches the window as a sheet of \a parent when that can host one:
+	what BAlert::Go() and BFilePanel::Show() do with the window that calls
+	them. Such a sheet goes back to being an ordinary window with
+	_DetachAutomaticSheet().
+*/
+bool
+BWindow::_AttachAsAutomaticSheet(BWindow* parent)
+{
+	if (parent == NULL || parent == this)
+		return false;
+	if (fSheetState != NULL) {
+		if (fSheetState->parent == parent)
+			return true;
+		if (!fSheetState->automatic)
+			return false;
+	}
+	if (!parent->_CanHostSheet())
+		return false;
+	return _SetSheetParent(parent, true) == B_OK;
+}
+
+
+void
+BWindow::_DetachAutomaticSheet()
+{
+	if (fSheetState != NULL && fSheetState->automatic)
+		_SetSheetParent(NULL, false);
+}
+
+
+/*!	A sheet hidden from its parent's thread (a synchronous BAlert::Go()
+	returning, say) slides back in under the parent's tab; meanwhile the
+	parent draws what comes out from under it, as its thread cannot get to
+	its messages otherwise.
+*/
+void
+BWindow::_WaitForSheetToClose()
+{
+	BWindow* parent = SheetParent();
+	if (parent == NULL || parent->Thread() != find_thread(NULL))
+		return;
+
+	bigtime_t until = system_time() + 1000000;
+	while (system_time() < until) {
+		fLink->StartMessage(AS_IS_SHEET_ANIMATING);
+		int32 code;
+		bool animating = false;
+		if (fLink->FlushWithReply(code) != B_OK || code != B_OK
+			|| fLink->Read<bool>(&animating) != B_OK || !animating) {
+			break;
+		}
+		parent->UpdateIfNeeded();
+		snooze(4000);
+	}
 }
 
 

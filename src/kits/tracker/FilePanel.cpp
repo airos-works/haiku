@@ -55,6 +55,10 @@ All rights reserved.
 #endif
 
 
+// fPanelFlags
+static const uint32 kSheetDisabled = 0x01;
+
+
 //	#pragma mark - BFilePanel
 
 
@@ -79,6 +83,7 @@ BFilePanel::BFilePanel(file_panel_mode mode, BMessenger* target,
 	static_cast<TFilePanel*>(fWindow)->SetClientObject(this);
 
 	fWindow->SetIsFilePanel(true);
+	fPanelFlags = 0;
 }
 
 
@@ -105,11 +110,24 @@ BFilePanel::Show()
 		fWindow->SetWorkspaces(workspace);
 	}
 
+	TFilePanel* panel = static_cast<TFilePanel*>(fWindow);
+	BWindow* parent = dynamic_cast<BWindow*>(
+		BLooper::LooperForThread(find_thread(NULL)));
+
+	// Shown from a window's thread, the panel is a sheet of that window,
+	// attached below its title bar; otherwise a window of its own.
+	bool sheet = false;
+	if (!IsShowing() && !panel->IsMobile()) {
+		if (parent != NULL && parent != fWindow && IsSheetEnabled())
+			sheet = fWindow->_AttachAsAutomaticSheet(parent);
+		if (!sheet)
+			fWindow->_DetachAutomaticSheet();
+	} else
+		sheet = fWindow->IsSheet();
+
 	// Position like an alert, unless the parent is NULL and a position was
 	// already restored from saved settings.
-	TFilePanel* panel = static_cast<TFilePanel*>(fWindow);
-	if (!panel->IsMobile()) {
-		BWindow* parent = dynamic_cast<BWindow*>(BLooper::LooperForThread(find_thread(NULL)));
+	if (!panel->IsMobile() && !sheet) {
 		if (parent != NULL)
 			fWindow->MoveTo(fWindow->AlertPosition(parent->Frame()));
 		else if (!panel->DefaultStateRestored())
@@ -142,6 +160,27 @@ BFilePanel::Hide()
 
 	if (!fWindow->IsHidden())
 		fWindow->QuitRequested();
+}
+
+
+/*!	Whether Show(), called from a window's thread, shows the panel as a
+	sheet of that window (the default), attached below its title bar and
+	modal to it, rather than as a window of its own.
+*/
+void
+BFilePanel::SetSheetEnabled(bool enabled)
+{
+	if (enabled)
+		fPanelFlags &= ~kSheetDisabled;
+	else
+		fPanelFlags |= kSheetDisabled;
+}
+
+
+bool
+BFilePanel::IsSheetEnabled() const
+{
+	return (fPanelFlags & kSheetDisabled) == 0;
 }
 
 

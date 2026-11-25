@@ -406,6 +406,40 @@ public:
 			void				ClearCaptures(team_id team);
 			bool				IsCaptured() const
 									{ return fCaptureCount > 0; }
+
+			// Sheets: a modal window attached below the tab of its parent,
+			// which it slides out from under (see Desktop::SetSheetParent()).
+			// All windows write locked to change them.
+			Window*				SheetParent() const { return fSheetParent; }
+			Window*				Sheet() const { return fSheet; }
+			void				SetSheetParent(Window* parent);
+									// links both ways, NULL unlinks
+
+			// How far the sheet is out: 0 is all hidden above the parent's
+			// content, 1 attached. The slide's direction: 1 opening, -1
+			// closing, 0 still.
+			float				SheetPosition() const
+									{ return fSheetPosition; }
+			void				SetSheetPosition(float position)
+									{ fSheetPosition = position; }
+			int32				SheetAnimation() const
+									{ return fSheetAnimation; }
+			void				SetSheetAnimation(int32 direction,
+									bigtime_t when);
+			bigtime_t			SheetStepTime() const
+									{ return fSheetStepTime; }
+			void				SetSheetStepTime(bigtime_t when)
+									{ fSheetStepTime = when; }
+			bool				IsSheetHiddenWithParent() const
+									{ return fSheetHiddenWithParent; }
+			void				SetSheetHiddenWithParent(bool hidden)
+									{ fSheetHiddenWithParent = hidden; }
+
+			// The content of a sheet's parent is dimmed: the colors of what
+			// its client draws are multiplied by ContentDim() / 256 as each
+			// update ends. Changing it changes what is on screen at once.
+			uint32				ContentDim() const { return fContentDim; }
+			void				SetContentDim(uint32 dim);
 			bool				MoveToStackPosition(int32 index,
 									bool isMoving);
 protected:
@@ -555,6 +589,14 @@ private:
 			void				_FinishCapture(const BRegion& drawn);
 			void				_FreeCaptureEngine();
 			BRegion&			_DrawableContentRegion();
+
+			Window*				fSheetParent;
+			Window*				fSheet;
+			float				fSheetPosition;
+			int32				fSheetAnimation;
+			bigtime_t			fSheetStepTime;
+			bool				fSheetHiddenWithParent;
+			uint32				fContentDim;
 
 			BReference<WindowCaptureRequest> fCaptureRequest;
 			bool				fCaptureSessionPending;

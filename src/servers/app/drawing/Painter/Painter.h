@@ -191,6 +191,10 @@ public:
 			// fills a solid rect with color c, no blending, no clipping
 			void				FillRectNoClipping(const clipping_rect& r,
 									const rgb_color& c) const;
+			// looks up the red, green and blue of every pixel in the rect in
+			// the table (the alpha stays), no clipping
+			void				MapRectColorsNoClipping(const clipping_rect& r,
+									const uint8* table) const;
 
 								// round rects
 			BRect				StrokeRoundRect(const BRect& r, float xRadius,

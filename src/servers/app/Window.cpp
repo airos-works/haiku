@@ -128,6 +128,13 @@ Window::Window(const BRect& frame, const char *name,
 	fWorkspacesViewCount(0),
 	fCaptureCount(0),
 	fCaptureTeam(-1),
+	fSheetParent(NULL),
+	fSheet(NULL),
+	fSheetPosition(0),
+	fSheetAnimation(0),
+	fSheetStepTime(0),
+	fSheetHiddenWithParent(false),
+	fContentDim(256),
 	fCaptureSessionPending(false),
 	fCaptureSession(false)
 {
@@ -179,6 +186,13 @@ Window::Window(const BRect& frame, const char *name,
 
 Window::~Window()
 {
+	// the desktop unlinked it already when it removed the window
+	if (fSheetParent != NULL || fSheet != NULL) {
+		if (fSheet != NULL)
+			fSheet->SetSheetParent(NULL);
+		SetSheetParent(NULL);
+	}
+
 	if (fTopView.IsSet()) {
 		fTopView->DetachedFromWindow();
 	}
@@ -218,6 +232,15 @@ Window::SetClipping(BRegion* stillAvailableOnScreen)
 	GetFullRegion(&fVisibleRegion);
 	// clip to region still available on screen
 	fVisibleRegion.IntersectWith(stillAvailableOnScreen);
+
+	if (fSheetParent != NULL) {
+		// a sheet shows only below the top of its parent's content: it
+		// comes out from under the parent's tab
+		BRegion below(BRect(-kMaxWindowCoordinate,
+			fSheetParent->Frame().top, kMaxWindowCoordinate,
+			kMaxWindowCoordinate));
+		fVisibleRegion.IntersectWith(&below);
+	}
 
 	fVisibleContentRegionValid = false;
 	fEffectiveDrawingRegionValid = false;
@@ -777,7 +800,12 @@ Window::GetEffectiveDrawingRegion(View* view, BRegion& region)
 {
 	if (!fEffectiveDrawingRegionValid) {
 		fEffectiveDrawingRegion = _DrawableContentRegion();
-		if (fUpdateRequested && !fInUpdate) {
+		if (fContentDim < 256 && !fInUpdate && !fCaptureSession) {
+			// The window is dimmed behind a sheet: only an update session
+			// draws all of its region anew, which is dimmed as a whole when
+			// it ends. Drawing outside of one would show undimmed.
+			fEffectiveDrawingRegion.MakeEmpty();
+		} else if (fUpdateRequested && !fInUpdate) {
 			// We requested an update, but the client has not started it yet,
 			// so it is only allowed to draw outside the pending update sessions
 			// region
@@ -1007,8 +1035,14 @@ Window::MouseDown(BMessage* message, BPoint where,
 		// click was inside the window contents
 		int32 viewToken = B_NULL_TOKEN;
 		if (View* view = ViewAt(where)) {
-			if (HasModal())
+			if (HasModal()) {
+				if (fSheet != NULL && !fSheet->IsHidden()) {
+					// a click into a window behind its sheet brings both to
+					// the front, and the sheet gets the focus
+					fDesktop->ActivateWindow(this);
+				}
 				return;
+			}
 
 			// clicking a simple View
 			if (!IsFocus()) {
@@ -1860,8 +1894,20 @@ Window::_TriggerContentRedraw(BRegion& dirty, const BRegion& expose)
 		// draw exposed region background right now to avoid stamping artifacts
 		if (fDrawingEngine->LockParallelAccess()) {
 			bool copyToFrontEnabled = fDrawingEngine->CopyToFrontEnabled();
-			fDrawingEngine->SetCopyToFrontEnabled(true);
-			fTopView->Draw(fDrawingEngine.Get(), &expose, &fContentRegion, true);
+			if (fContentDim < 256) {
+				// dimmed behind a sheet: so is the background
+				fDrawingEngine->SetCopyToFrontEnabled(false);
+				fTopView->Draw(fDrawingEngine.Get(), &expose, &fContentRegion,
+					true);
+				BRegion exposed(expose);
+				exposed.IntersectWith(&VisibleContentRegion());
+				fDrawingEngine->ScaleRegionColors(exposed, fContentDim, 256);
+				fDrawingEngine->CopyToFront(exposed);
+			} else {
+				fDrawingEngine->SetCopyToFrontEnabled(true);
+				fTopView->Draw(fDrawingEngine.Get(), &expose, &fContentRegion,
+					true);
+			}
 			fDrawingEngine->SetCopyToFrontEnabled(copyToFrontEnabled);
 			fDrawingEngine->UnlockParallelAccess();
 		}
@@ -2079,6 +2125,17 @@ Window::EndUpdate()
 			if (dirty) {
 				dirty->IntersectWith(&VisibleContentRegion());
 
+				if (fContentDim < 256
+					&& fDrawingEngine->LockParallelAccess()) {
+					// behind a sheet: what was drawn anew is dimmed before
+					// it gets to the screen
+					fDrawingEngine->SetCopyToFrontEnabled(false);
+					fDrawingEngine->ScaleRegionColors(*dirty, fContentDim,
+						256);
+					fDrawingEngine->SetCopyToFrontEnabled(true);
+					fDrawingEngine->UnlockParallelAccess();
+				}
+
 				fDrawingEngine->CopyToFront(*dirty);
 				fRegionPool.Recycle(dirty);
 			}
@@ -2098,6 +2155,79 @@ Window::EndUpdate()
 
 	if (finishCapture)
 		_FinishCapture(captured);
+}
+
+
+// #pragma mark - sheets
+
+
+void
+Window::SetSheetParent(Window* parent)
+{
+	if (fSheetParent == parent)
+		return;
+
+	if (fSheetParent != NULL) {
+		if (fSheetParent->fSheet == this)
+			fSheetParent->fSheet = NULL;
+		fSheetParent = NULL;
+	}
+	fSheetAnimation = 0;
+	fSheetHiddenWithParent = false;
+
+	if (parent != NULL) {
+		if (parent->fSheet != NULL && parent->fSheet != this)
+			parent->fSheet->SetSheetParent(NULL);
+		parent->fSheet = this;
+		fSheetParent = parent;
+	}
+
+	fVisibleContentRegionValid = false;
+	fEffectiveDrawingRegionValid = false;
+}
+
+
+void
+Window::SetSheetAnimation(int32 direction, bigtime_t when)
+{
+	fSheetAnimation = direction;
+	fSheetStepTime = when;
+}
+
+
+void
+Window::SetContentDim(uint32 dim)
+{
+	if (dim > 256)
+		dim = 256;
+	if (dim == 0)
+		dim = 1;
+	if (dim == fContentDim)
+		return;
+
+	uint32 previous = fContentDim;
+	fContentDim = dim;
+	fEffectiveDrawingRegionValid = false;
+
+	if (!IsVisible())
+		return;
+
+	// What is on screen now was dimmed by the previous factor (or is about
+	// to be drawn anew in the update that is under way, and dimmed when it
+	// ends): it changes by the ratio.
+	BRegion region(VisibleContentRegion());
+	if (fInUpdate)
+		region.Exclude(&fCurrentUpdateSession->DirtyRegion());
+	if (region.CountRects() == 0)
+		return;
+
+	if (fDrawingEngine->LockParallelAccess()) {
+		bool copyToFrontEnabled = fDrawingEngine->CopyToFrontEnabled();
+		fDrawingEngine->SetCopyToFrontEnabled(true);
+		fDrawingEngine->ScaleRegionColors(region, dim, previous);
+		fDrawingEngine->SetCopyToFrontEnabled(copyToFrontEnabled);
+		fDrawingEngine->UnlockParallelAccess();
+	}
 }
 
 

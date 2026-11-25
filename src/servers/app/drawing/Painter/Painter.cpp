@@ -1344,6 +1344,41 @@ Painter::FillRectVerticalGradient(BRect r,
 }
 
 
+// MapRectColorsNoClipping
+void
+Painter::MapRectColorsNoClipping(const clipping_rect& logical,
+	const uint8* table) const
+{
+	clipping_rect r = logical;
+	if (fDeviceScale != 1) {
+		r.left = (int32)floorf(r.left * fDeviceScale);
+		r.top = (int32)floorf(r.top * fDeviceScale);
+		r.right = (int32)floorf((r.right + 1) * fDeviceScale) - 1;
+		r.bottom = (int32)floorf((r.bottom + 1) * fDeviceScale) - 1;
+	}
+	r.left = max_c(r.left, 0);
+	r.top = max_c(r.top, 0);
+	r.right = min_c(r.right, (int32)fBuffer.width() - 1);
+	r.bottom = min_c(r.bottom, (int32)fBuffer.height() - 1);
+	if (r.left > r.right || r.top > r.bottom)
+		return;
+
+	uint32 bpr = fBuffer.stride();
+	int32 width = r.right - r.left + 1;
+	uint8* row = fBuffer.row_ptr(r.top) + r.left * 4;
+	for (int32 y = r.top; y <= r.bottom; y++) {
+		uint8* pixel = row;
+		for (int32 x = 0; x < width; x++) {
+			pixel[0] = table[pixel[0]];
+			pixel[1] = table[pixel[1]];
+			pixel[2] = table[pixel[2]];
+			pixel += 4;
+		}
+		row += bpr;
+	}
+}
+
+
 // FillRectNoClipping
 void
 Painter::FillRectNoClipping(const clipping_rect& logical, const rgb_color& c) const

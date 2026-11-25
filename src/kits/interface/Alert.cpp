@@ -94,6 +94,9 @@ private:
 static const unsigned int kAlertButtonMsg = 'ALTB';
 static const int kSemTimeOut = 50000;
 
+// fAlertFlags
+static const uint32 kSheetDisabled = 0x01;
+
 static const int kButtonOffsetSpacing = 62;
 static const int kButtonUsualWidth = 55;
 static const int kIconStripeWidthFactor = 5;
@@ -144,6 +147,7 @@ BAlert::BAlert(BMessage* data)
 	fInvoker = NULL;
 	fAlertSem = -1;
 	fAlertValue = -1;
+	fAlertFlags = 0;
 
 	fTextView = (BTextView*)FindView("_tv_");
 
@@ -290,6 +294,7 @@ BAlert::Go()
 		BLooper::LooperForThread(find_thread(NULL)));
 
 	_Prepare();
+	_AttachToWindow(window);
 	Show();
 	_PlaySound();
 
@@ -328,6 +333,8 @@ BAlert::Go(BInvoker* invoker)
 {
 	fInvoker = invoker;
 	_Prepare();
+	_AttachToWindow(dynamic_cast<BWindow*>(
+		BLooper::LooperForThread(find_thread(NULL))));
 	Show();
 	_PlaySound();
 	return B_OK;
@@ -364,6 +371,27 @@ BAlert::MessageReceived(BMessage* msg)
 			fAlertSem = -1;
 		}
 	}
+}
+
+
+/*!	Whether Go() shows the alert as a sheet of the window whose thread
+	calls it (the default), attached below its title bar, rather than as a
+	window of its own.
+*/
+void
+BAlert::SetSheetEnabled(bool enabled)
+{
+	if (enabled)
+		fAlertFlags &= ~kSheetDisabled;
+	else
+		fAlertFlags |= kSheetDisabled;
+}
+
+
+bool
+BAlert::IsSheetEnabled() const
+{
+	return (fAlertFlags & kSheetDisabled) == 0;
 }
 
 
@@ -500,6 +528,7 @@ BAlert::_Init(const char* text, const char* button1, const char* button2,
 	fInvoker = NULL;
 	fAlertSem = -1;
 	fAlertValue = -1;
+	fAlertFlags = 0;
 
 	fIconView = new TAlertView();
 
@@ -596,6 +625,24 @@ BAlert::_CreateButton(int32 which, const char* label)
 	snprintf(name, sizeof(name), "_b%" B_PRId32 "_", which);
 
 	return new(std::nothrow) BButton(name, label, message);
+}
+
+
+/*!	An alert that a window opens goes onto that window as a sheet: it is
+	modal to that window alone then, rather than to the whole application.
+	Alerts meant for all applications (B_MODAL_ALL_WINDOW_FEEL), floating
+	ones, and those opened from other threads stay windows of their own.
+*/
+void
+BAlert::_AttachToWindow(BWindow* window)
+{
+	if (window == NULL || !IsSheetEnabled() || IsSheet()
+		|| (Feel() != B_MODAL_APP_WINDOW_FEEL
+			&& Feel() != B_MODAL_SUBSET_WINDOW_FEEL)) {
+		return;
+	}
+
+	_AttachAsAutomaticSheet(window);
 }
 
 

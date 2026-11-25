@@ -71,6 +71,11 @@ public:
 			int32				Go();
 			status_t			Go(BInvoker* invoker);
 
+			// air/OS: called from a window's thread, Go() shows the alert as
+			// a sheet of that window (see BWindow::SetSheetParent())
+			void				SetSheetEnabled(bool enabled);
+			bool				IsSheetEnabled() const;
+
 	virtual	void				MessageReceived(BMessage* message);
 	virtual	void				FrameResized(float newWidth, float newHeight);
 
@@ -109,6 +114,7 @@ private:
 			BBitmap*			_CreateTypeIcon();
 			BButton*			_CreateButton(int32 which, const char* label);
 			void				_Prepare();
+			void				_AttachToWindow(BWindow* window);
 			void				_PlaySound();
 
 private:
@@ -123,7 +129,7 @@ private:
 			uint8				fButtonSpacing;
 			uint8				fButtonWidth;
 			BInvoker*			fInvoker;
-			uint32				_reserved[1];
+			uint32				fAlertFlags;
 };
 
 

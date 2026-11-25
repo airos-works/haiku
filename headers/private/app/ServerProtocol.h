@@ -406,6 +406,14 @@ enum {
 	// up: BFont::StringWidth() sums them in the application
 	AS_GET_GLYPH_ADVANCES,
 
+	// Sheets: a window attached below the title bar of its parent window,
+	// see BWindow::SetSheetParent()
+	AS_SET_SHEET_PARENT,
+	AS_IS_SHEET_ANIMATING,
+	// app_server internal: to a sheet's ServerWindow, the next frame of its
+	// slide is due
+	AS_SHEET_ANIMATION_STEP,
+
 	AS_LAST_CODE
 };
 

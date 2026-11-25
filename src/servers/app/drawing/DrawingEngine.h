@@ -132,6 +132,11 @@ public:
 	virtual	void			StrokeRect(BRect rect, const rgb_color &color);
 	virtual	void			FillRect(BRect rect, const rgb_color &color);
 	virtual	void			FillRegion(BRegion& region, const rgb_color& color);
+			// Multiplies the red, green and blue of every pixel in the
+			// region (already clipped) by numerator / denominator: darkens
+			// or brightens what is there, without whoever drew it.
+			void			ScaleRegionColors(BRegion& region,
+								uint32 numerator, uint32 denominator);
 
 	virtual	void			StrokeRect(BRect rect);
 	virtual	void			StrokeRect(BRect rect, const BGradient& gradient);

@@ -51,6 +51,7 @@
 #include "AppServer.h"
 #include "ClickTarget.h"
 #include "DecorManager.h"
+#include "DelayedMessage.h"
 #include "DesktopSettingsPrivate.h"
 #include "DrawingEngine.h"
 #include "GlobalFontManager.h"
@@ -88,6 +89,17 @@ lid_is_closed()
 	close(fd);
 	return closed;
 }
+
+
+// Sheets: how dark the parent gets (of 256), how long the slide takes, and
+// how long a step waits for the sheet's client to draw what the last one
+// uncovered.
+static const uint32 kSheetDim = 166;
+static const bigtime_t kSheetOpenDuration = 250000;
+static const bigtime_t kSheetCloseDuration = 200000;
+static const bigtime_t kSheetFrameTime = 16667;
+static const bigtime_t kSheetClientWait = 60000;
+static const bigtime_t kSheetClientPoll = 3000;
 
 
 //#define DEBUG_DESKTOP
@@ -462,6 +474,7 @@ Desktop::Desktop(uid_t userID, const char* targetScreen)
 	fCurrentWorkspace(0),
 	fPreviousWorkspace(0),
 	fWindowDrags(0),
+	fPlacingSheet(false),
 	fAllWindows(kAllWindowList),
 	fSubsetWindows(kSubsetList),
 	fFocusList(kFocusList),
@@ -1475,8 +1488,34 @@ Desktop::ShowWindow(Window* window)
 
 	AutoWriteLocker locker(fWindowLock);
 
-	if (window->InWorkspace(fCurrentWorkspace))
+	Window* sheetParent = window->SheetParent();
+	bool slideSheet = false;
+	if (sheetParent != NULL) {
+		if (sheetParent->IsHidden()) {
+			// a sheet comes up together with its parent
+			window->SetSheetHiddenWithParent(true);
+			return;
+		}
+		// it slides out, unless it only went away with its parent
+		slideSheet = !window->IsSheetHiddenWithParent();
+		window->SetSheetHiddenWithParent(false);
+		_PlaceSheet(window, slideSheet ? 0.0f : 1.0f);
+	} else if (window->InWorkspace(fCurrentWorkspace))
 		_BringOntoDisplays(window);
+
+	Window* sheet = window->Sheet();
+	if (sheet != NULL && sheet->IsSheetHiddenWithParent()) {
+		if (sheet->ShowLevel() <= 0) {
+			// its sheet comes back with it, dimmed from the start
+			window->SetContentDim(kSheetDim);
+		} else {
+			// the sheet was closed meanwhile
+			sheet->SetSheetHiddenWithParent(false);
+			window->SetContentDim(256);
+			sheet = NULL;
+		}
+	} else
+		sheet = NULL;
 
 	window->SetHidden(false);
 	fFocusList.AddWindow(window);
@@ -1489,6 +1528,13 @@ Desktop::ShowWindow(Window* window)
 		_ShowWindow(window, true);
 		_UpdateSubsetWorkspaces(window);
 		ActivateWindow(window);
+
+		if (slideSheet)
+			StartSheetAnimation(window, 1);
+		else if (sheetParent != NULL)
+			_DimSheetParent(window);
+		if (sheet != NULL)
+			ShowWindow(sheet);
 	} else {
 		// then we don't need to send the fake mouse event either
 		_WindowChanged(window);
@@ -1517,6 +1563,14 @@ Desktop::HideWindow(Window* window, bool fromMinimize)
 
 	if (!LockAllWindows())
 		return;
+
+	Window* sheet = window->Sheet();
+	if (sheet != NULL && !sheet->IsHidden()) {
+		// the sheet goes with it, and comes back with it
+		sheet->SetSheetAnimation(0, 0);
+		sheet->SetSheetHiddenWithParent(true);
+		HideWindow(sheet);
+	}
 
 	window->SetHidden(true);
 	fFocusList.RemoveWindow(window);
@@ -1561,6 +1615,13 @@ Desktop::HideWindow(Window* window, bool fromMinimize)
 
 	NotifyWindowHidden(window, fromMinimize);
 
+	Window* sheetParent = window->SheetParent();
+	if (sheetParent != NULL && !window->IsSheetHiddenWithParent()) {
+		// the sheet is gone: its parent shows as it is again
+		window->SetSheetAnimation(0, 0);
+		_UndimSheetParent(sheetParent);
+	}
+
 	UnlockAllWindows();
 
 	if (window == fWindowUnderMouse)
@@ -1596,6 +1657,11 @@ Desktop::MoveWindowBy(Window* window, float x, float y, int32 workspace)
 
 	AutoWriteLocker _(fWindowLock);
 
+	if (window->SheetParent() != NULL && !fPlacingSheet) {
+		// a sheet stays where its parent has it (_PlaceSheet())
+		return;
+	}
+
 	Window* topWindow = window->TopLayerStackWindow();
 	if (topWindow != NULL)
 		window = topWindow;
@@ -1628,8 +1694,18 @@ Desktop::MoveWindowBy(Window* window, float x, float y, int32 workspace)
 		return;
 	}
 
+	// A sheet moves along with its parent, in the same step: the two are
+	// copied as one.
+	Window* sheet = window->Sheet();
+	if (sheet != NULL && !sheet->IsVisible()) {
+		// put in place when it is shown
+		sheet = NULL;
+	}
+
 	// the dirty region starts with the visible area of the window being moved
 	BRegion newDirtyRegion(window->VisibleRegion());
+	if (sheet != NULL)
+		newDirtyRegion.Include(&sheet->VisibleRegion());
 
 	// stop direct frame buffer access
 	bool direct = false;
@@ -1639,6 +1715,8 @@ Desktop::MoveWindowBy(Window* window, float x, float y, int32 workspace)
 	}
 
 	window->MoveBy((int32)x, (int32)y);
+	if (sheet != NULL)
+		sheet->MoveBy((int32)x, (int32)y);
 
 	BRegion background;
 	_RebuildClippingForAllWindows(background);
@@ -1646,6 +1724,8 @@ Desktop::MoveWindowBy(Window* window, float x, float y, int32 workspace)
 	// construct the region that is possible to be blitted
 	// to move the contents of the window
 	BRegion copyRegion(window->VisibleRegion());
+	if (sheet != NULL)
+		copyRegion.Include(&sheet->VisibleRegion());
 	copyRegion.OffsetBy((int32)-x, (int32)-y);
 	copyRegion.IntersectWith(&newDirtyRegion);
 		// newDirtyRegion == the windows old visible region
@@ -1653,14 +1733,19 @@ Desktop::MoveWindowBy(Window* window, float x, float y, int32 workspace)
 	// include the the new visible region of the window being
 	// moved into the dirty region (for now)
 	newDirtyRegion.Include(&window->VisibleRegion());
+	if (sheet != NULL)
+		newDirtyRegion.Include(&sheet->VisibleRegion());
 
 	// NOTE: Having all windows locked should prevent any
 	// problems with locking the drawing engine here.
 	if (GetDrawingEngine()->LockParallelAccess()) {
 		bool copied = GetDrawingEngine()->CopyRegion(&copyRegion, (int32)x,
 			(int32)y);
-		if (!copied && fWindowDrags > 0)
+		if (!copied && fWindowDrags > 0) {
 			copied = _CopyWindowApproximately(window, copyRegion, x, y);
+			if (copied && sheet != NULL)
+				sheet->SetContentApproximate(true);
+		}
 		GetDrawingEngine()->UnlockParallelAccess();
 		if (!copied)
 			copyRegion.MakeEmpty();
@@ -1675,6 +1760,8 @@ Desktop::MoveWindowBy(Window* window, float x, float y, int32 workspace)
 	MarkDirty(newDirtyRegion);
 	_SetBackground(background);
 	_WindowChanged(window);
+	if (sheet != NULL)
+		_WindowChanged(sheet);
 
 	// resume direct frame buffer access
 	if (direct) {
@@ -1685,6 +1772,8 @@ Desktop::MoveWindowBy(Window* window, float x, float y, int32 workspace)
 	}
 
 	NotifyWindowMoved(window);
+	if (sheet != NULL)
+		NotifyWindowMoved(sheet);
 }
 
 
@@ -1802,6 +1891,10 @@ Desktop::ResizeWindowBy(Window* window, float x, float y)
 	if (!window->IsVisible()) {
 		window->ResizeBy((int32)x, (int32)y, NULL);
 		NotifyWindowResized(window);
+		if (window->Sheet() != NULL)
+			_PlaceSheet(window->Sheet(), window->Sheet()->SheetPosition());
+		if (window->SheetParent() != NULL)
+			_PlaceSheet(window, window->SheetPosition());
 		return;
 	}
 
@@ -1854,6 +1947,12 @@ Desktop::ResizeWindowBy(Window* window, float x, float y)
 	}
 
 	NotifyWindowResized(window);
+
+	// a sheet stays in the middle of its parent
+	if (window->Sheet() != NULL)
+		_PlaceSheet(window->Sheet(), window->Sheet()->SheetPosition());
+	if (window->SheetParent() != NULL)
+		_PlaceSheet(window, window->SheetPosition());
 }
 
 
@@ -1965,6 +2064,11 @@ Desktop::RemoveWindow(Window *window)
 
 	if (!window->IsHidden())
 		HideWindow(window);
+
+	if (window->SheetParent() != NULL)
+		SetSheetParent(window, NULL);
+	if (window->Sheet() != NULL)
+		SetSheetParent(window->Sheet(), NULL);
 
 	fAllWindows.RemoveWindow(window);
 	if (!window->IsNormal())
@@ -4489,6 +4593,236 @@ Desktop::_FitOnDisplay(Window* window, BRect frame, BRect area)
 		dy = area.top + top - frame.top;
 	frame.OffsetBy(roundf(dx), roundf(dy));
 	return frame;
+}
+
+
+// #pragma mark - sheets
+
+
+/*!	Attaches \a sheet below the tab of \a parent, or detaches it from its
+	parent when that is \c NULL. A window has one sheet at a time: a hidden
+	one gives way to a new one. The window lock must be held for writing.
+*/
+status_t
+Desktop::SetSheetParent(Window* sheet, Window* parent)
+{
+	ASSERT_MULTI_WRITE_LOCKED(fWindowLock);
+
+	Window* previous = sheet->SheetParent();
+	if (parent == previous)
+		return B_OK;
+
+	if (parent != NULL) {
+		if (parent == sheet || sheet->Sheet() != NULL
+			|| parent->SheetParent() != NULL || !parent->IsNormal()
+			|| parent->IsOffscreenWindow() || sheet->IsOffscreenWindow()
+			|| parent->ServerWindow()->App() != sheet->ServerWindow()->App())
+			return B_BAD_VALUE;
+		Window* other = parent->Sheet();
+		if (other != NULL) {
+			if (!other->IsHidden() || other->SheetAnimation() != 0)
+				return B_BUSY;
+			SetSheetParent(other, NULL);
+		}
+	}
+
+	BRegion dirty(sheet->VisibleRegion());
+
+	if (previous != NULL) {
+		if (sheet->SheetAnimation() < 0 && sheet->ShowLevel() > 0
+			&& !sheet->IsHidden()) {
+			// it was on its way out: it is gone now
+			sheet->SetSheetAnimation(0, 0);
+			HideWindow(sheet);
+		}
+		bool hiddenWithParent = sheet->IsSheetHiddenWithParent();
+		sheet->SetSheetParent(NULL);
+		if (hiddenWithParent && sheet->ShowLevel() <= 0)
+			ShowWindow(sheet);
+		_UndimSheetParent(previous);
+	}
+
+	if (parent != NULL) {
+		sheet->SetSheetParent(parent);
+		if (!sheet->IsHidden()) {
+			// attached while it is shown: in place at once
+			_PlaceSheet(sheet, 1.0f);
+			_DimSheetParent(sheet);
+		}
+	}
+
+	if (!sheet->IsHidden()) {
+		// it is clipped differently now
+		BRegion background;
+		_RebuildClippingForAllWindows(background);
+		_SetBackground(background);
+		dirty.Include(&sheet->VisibleRegion());
+		MarkDirty(dirty);
+	}
+	return B_OK;
+}
+
+
+/*!	Starts the sheet sliding out (\a direction 1) or back in (-1): its
+	ServerWindow takes the steps (AS_SHEET_ANIMATION_STEP), and hides it
+	when it is all in. The window lock must be held for writing.
+*/
+void
+Desktop::StartSheetAnimation(Window* sheet, int32 direction)
+{
+	bool running = sheet->SheetAnimation() != 0;
+	sheet->SetSheetAnimation(direction,
+		running ? sheet->SheetStepTime() : system_time());
+	if (running)
+		return;
+
+	DelayedMessage step(AS_SHEET_ANIMATION_STEP, DM_MINIMUM_DELAY);
+	step.AddTarget(sheet->ServerWindow()->MessagePort());
+	step.SetMerge(DM_MERGE_CANCEL);
+	step.Flush();
+}
+
+
+/*!	One frame of a sheet's slide: it moves on by as much as the time since
+	the last one asks for, and the parent's dimming follows. A sheet coming
+	out waits for its client to draw what the last step uncovered (for a
+	while), so that its content slides down with it. The window lock must be
+	held for writing.
+*/
+bigtime_t
+Desktop::StepSheetAnimation(Window* sheet)
+{
+	int32 direction = sheet->SheetAnimation();
+	if (direction == 0)
+		return -1;
+
+	Window* parent = sheet->SheetParent();
+	if (parent == NULL || !sheet->IsVisible() || !parent->IsVisible()) {
+		FinishSheetAnimation(sheet);
+		return -1;
+	}
+
+	bigtime_t now = system_time();
+	bigtime_t elapsed = now - sheet->SheetStepTime();
+	if (direction > 0 && sheet->NeedsUpdate() && elapsed < kSheetClientWait)
+		return kSheetClientPoll;
+	if (elapsed > 2 * kSheetFrameTime)
+		elapsed = 2 * kSheetFrameTime;
+	sheet->SetSheetStepTime(now);
+
+	// the slide decelerates as the sheet comes out (an ease-out cubic), and
+	// goes back in along the same curve
+	float linear = 1.0f - cbrtf(1.0f - sheet->SheetPosition());
+	linear += direction * (float)elapsed / (direction > 0
+		? kSheetOpenDuration : kSheetCloseDuration);
+	bool done = false;
+	if (linear >= 1.0f) {
+		linear = 1.0f;
+		done = direction > 0;
+	} else if (linear <= 0.0f) {
+		linear = 0.0f;
+		done = direction < 0;
+	}
+	float remaining = 1.0f - linear;
+	_PlaceSheet(sheet, 1.0f - remaining * remaining * remaining);
+	_DimSheetParent(sheet);
+
+	if (!done)
+		return kSheetFrameTime;
+
+	FinishSheetAnimation(sheet);
+	return -1;
+}
+
+
+/*!	Ends the sheet's slide where it was going: out and attached, or in and
+	hidden (unless its client wants it shown again by now). The window lock
+	must be held for writing.
+*/
+void
+Desktop::FinishSheetAnimation(Window* sheet)
+{
+	int32 direction = sheet->SheetAnimation();
+	sheet->SetSheetAnimation(0, 0);
+
+	Window* parent = sheet->SheetParent();
+	if (direction == 0 || parent == NULL)
+		return;
+
+	if (direction < 0 && sheet->ShowLevel() > 0) {
+		HideWindow(sheet);
+		return;
+	}
+
+	_PlaceSheet(sheet, 1.0f);
+	_DimSheetParent(sheet);
+	if (parent->IsVisible()) {
+		// The dimming came in steps, each rounded: the parent draws once
+		// more, dimmed exactly as everything it draws from now on.
+		BRegion dirty(parent->VisibleContentRegion());
+		parent->ProcessDirtyRegion(dirty, BRegion());
+	}
+}
+
+
+/*!	Puts the sheet below the top of its parent's content, centered, as far
+	out as \a position says: at 0 all of it is still above, under the tab.
+*/
+void
+Desktop::_PlaceSheet(Window* sheet, float position)
+{
+	Window* parent = sheet->SheetParent();
+	if (parent == NULL)
+		return;
+
+	if (position < 0)
+		position = 0;
+	else if (position > 1)
+		position = 1;
+	sheet->SetSheetPosition(position);
+
+	BRect parentFrame = parent->Frame();
+	BRect frame = sheet->Frame();
+	BRect decorated = _DecoratedFrame(sheet);
+
+	float left = roundf(parentFrame.left
+		+ (parentFrame.Width() - frame.Width()) / 2);
+	float shownTop = parentFrame.top;
+	float hiddenTop = shownTop - (decorated.bottom - frame.top) - 1;
+	float top = roundf(hiddenTop + (shownTop - hiddenTop) * position);
+
+	bool placing = fPlacingSheet;
+	fPlacingSheet = true;
+	MoveWindowBy(sheet, left - frame.left, top - frame.top);
+	fPlacingSheet = placing;
+}
+
+
+//!	The parent of the sheet is as dark as the sheet is far out.
+void
+Desktop::_DimSheetParent(Window* sheet)
+{
+	Window* parent = sheet->SheetParent();
+	if (parent == NULL)
+		return;
+
+	parent->SetContentDim(256 - (uint32)roundf((256 - kSheetDim)
+		* sheet->SheetPosition()));
+}
+
+
+//!	Its sheet is gone: the window draws once more, as bright as ever.
+void
+Desktop::_UndimSheetParent(Window* parent)
+{
+	if (parent->ContentDim() == 256)
+		return;
+
+	parent->SetContentDim(256);
+	if (parent->IsVisible()) {
+		BRegion dirty(parent->VisibleContentRegion());
+		parent->ProcessDirtyRegion(dirty, BRegion());
+	}
 }
 
 

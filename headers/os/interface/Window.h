@@ -237,6 +237,11 @@ public:
 			status_t			AddToSubset(BWindow* window);
 			status_t			RemoveFromSubset(BWindow* window);
 
+			// air/OS: sheets, modal windows attached to a parent window
+			status_t			SetSheetParent(BWindow* parent);
+			BWindow*			SheetParent() const;
+			bool				IsSheet() const;
+
 	virtual status_t			Perform(perform_code code, void* data);
 
 			status_t			SetType(window_type type);
@@ -294,6 +299,7 @@ private:
 private:
 	typedef BLooper inherited;
 	struct unpack_cookie;
+	struct sheet_state;
 	class Shortcut;
 
 	friend class BAlert;
@@ -370,6 +376,13 @@ private:
 									float* _tabHeight) const;
 			BRect				_DisplayFrame();
 			void				_SendShowOrHideMessage();
+
+			status_t			_SetSheetParent(BWindow* parent,
+									bool automatic);
+			bool				_CanHostSheet() const;
+			bool				_AttachAsAutomaticSheet(BWindow* parent);
+			void				_DetachAutomaticSheet();
+			void				_WaitForSheetToClose();
 			void				_PropagateMessageToChildViews(BMessage*);
 
 private:
@@ -387,7 +400,7 @@ private:
 			BMenuBar*			fKeyMenuBar;
 			BButton*			fDefaultButton;
 			void*				fShortcuts;
-			void*				_unused2;
+			sheet_state*		fSheetState;
 			int32				_unused3[5];
 			int32				fTopViewToken;
 			bool				fUpdateRequested;

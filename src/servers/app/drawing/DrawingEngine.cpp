@@ -1023,6 +1023,37 @@ DrawingEngine::FillRegion(BRegion& r, const rgb_color& color)
 }
 
 
+void
+DrawingEngine::ScaleRegionColors(BRegion& r, uint32 numerator,
+	uint32 denominator)
+{
+	ASSERT_PARALLEL_LOCKED();
+
+	if (denominator == 0 || numerator == denominator || r.CountRects() == 0)
+		return;
+
+	BRect frame = r.Frame();
+	if (!fPainter->Bounds().Contains(frame))
+		return;
+
+	uint8 table[256];
+	for (uint32 value = 0; value < 256; value++) {
+		uint32 scaled = (value * numerator + denominator / 2) / denominator;
+		table[value] = scaled > 255 ? 255 : scaled;
+	}
+
+	BRegion scaled;
+	if (fPainter->DeviceScale() != 1)
+		_ScaleRegion(r, scaled);
+	DrawTransaction transaction(this,
+		fPainter->DeviceScale() != 1 ? scaled : r);
+
+	int32 count = r.CountRects();
+	for (int32 i = 0; i < count; i++)
+		fPainter->MapRectColorsNoClipping(r.RectAtInt(i), table);
+}
+
+
 // #pragma mark - DrawState
 
 

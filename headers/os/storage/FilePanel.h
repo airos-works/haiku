@@ -78,6 +78,11 @@ class BFilePanel {
 		void			SetHideWhenDone(bool hideWhenDone);
 		bool			HidesWhenDone() const;
 
+		// air/OS: shown from a window's thread, the panel is a sheet of
+		// that window (see BWindow::SetSheetParent())
+		void			SetSheetEnabled(bool enabled);
+		bool			IsSheetEnabled() const;
+
 		void			Refresh();
 		void			Rewind();
 		status_t		GetNextSelectedRef(entry_ref* ref);
@@ -93,7 +98,8 @@ class BFilePanel {
 		virtual	void	_ReservedFilePanel8();
 
 		BWindow*		fWindow;
-		uint32			_reserved[10];
+		uint32			fPanelFlags;
+		uint32			_reserved[9];
 };
 
 #endif	/* _FILE_PANEL_H */
