@@ -89,6 +89,9 @@ const uint32 kUpdatePreferences = 'Pref';
 // realign replicants message constant
 const uint32 kRealignReplicants = 'Algn';
 
+// the Deskbar menu opened for the first time
+const uint32 kStartIconPreloader = 'SIPl';
+
 /* --------------------------------------------- */
 
 class BBitmap;

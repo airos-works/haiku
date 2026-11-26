@@ -38,6 +38,7 @@ All rights reserved.
 #include <fs_attr.h>
 #include <fs_info.h>
 #include <image.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <strings.h>
 #include <sys/resource.h>
@@ -172,26 +173,26 @@ InitIconPreloader()
 	if (IconCache::sIconCache != NULL)
 		return;
 
-	// only start the node preloader if its Tracker or the Deskbar itself,
-	// don't start it for file panels
-
-	bool preload = dynamic_cast<TTracker*>(be_app) != NULL;
-	if (!preload) {
-		// check for deskbar
-		app_info info;
-		if (be_app->GetAppInfo(&info) == B_OK
-			&& !strcmp(info.signature, kDeskbarSignature))
-			preload = true;
-	}
-
-	if (preload) {
-		gPreloader = NodePreloader::InstallNodePreloader("NodePreloader",
-			be_app);
-	}
-
 	IconCache::sIconCache = new IconCache();
 
 	atomic_add(&lock, -1);
+}
+
+
+/*!	Keeps the mini icons of the applications and preferences warm, and
+	watches them, from the first time they are needed on: the Deskbar calls
+	this when its menu first opens. Tracker draws them only where it shows
+	them, like any other icon, and loads them then.
+*/
+void
+StartIconPreloader()
+{
+	static int32 started = 0;
+	if (atomic_add(&started, 1) != 0)
+		return;
+
+	InitIconPreloader();
+	gPreloader = NodePreloader::InstallNodePreloader("NodePreloader", be_app);
 }
 
 }	// namespace BPrivate
@@ -1635,9 +1636,6 @@ TTracker::ReadyToRun()
 
 	fTaskLoop = new StandAloneTaskLoop(true);
 
-	// kick off building the mime type list for find panels, etc.
-	fMimeTypeList = new MimeTypeList();
-
 	if (!BootedInSafeMode()) {
 		// kick of transient query killer
 		DeleteTransientQueriesTask::StartUpTransientQueryCleaner();
@@ -1650,6 +1648,14 @@ TTracker::ReadyToRun()
 MimeTypeList*
 TTracker::MimeTypes() const
 {
+	// Built when a Find panel or a query window first needs it, not at
+	// login: it reads every installed type.
+	static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+	pthread_mutex_lock(&lock);
+	if (fMimeTypeList == NULL)
+		fMimeTypeList = new MimeTypeList();
+	pthread_mutex_unlock(&lock);
+
 	return fMimeTypeList;
 }
 

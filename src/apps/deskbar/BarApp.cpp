@@ -418,6 +418,10 @@ void
 TBarApp::MessageReceived(BMessage* message)
 {
 	switch (message->what) {
+		case kStartIconPreloader:
+			StartIconPreloader();
+			break;
+
 		// BDeskbar originating messages we can handle
 		case kMsgIsAlwaysOnTop:
 		{

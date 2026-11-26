@@ -223,7 +223,7 @@ private:
 			const BMessage* messageToBundle = NULL,
 			uint32 openFlags = 0);
 
-	MimeTypeList*			fMimeTypeList;
+	mutable MimeTypeList*	fMimeTypeList;
 	WindowList				fWindowList;
 	BClipboardRefsWatcher*	fClipboardRefsWatcher;
 	BTrashWatcher*			fTrashWatcher;

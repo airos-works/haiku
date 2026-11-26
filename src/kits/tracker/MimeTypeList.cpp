@@ -105,13 +105,19 @@ ShortMimeInfo::IsCommonMimeType() const
 
 MimeTypeList::MimeTypeList()
 	:
-	fMimeList(100),
 	fCommonMimeList(30),
 	fLock("mimeListLock")
 {
 	fLock.Lock();
 	Thread::Launch(NewMemberFunctionObject(&MimeTypeList::Build, this),
 		B_NORMAL_PRIORITY);
+}
+
+
+MimeTypeList::~MimeTypeList()
+{
+	// wait for Build() to finish
+	fLock.Lock();
 }
 
 
@@ -125,6 +131,9 @@ MatchOneShortDescription(const ShortMimeInfo* a, const ShortMimeInfo* b)
 const ShortMimeInfo*
 MimeTypeList::FindMimeType(const char* shortDescription) const
 {
+	AutoLock<Benaphore> locker(fLock);
+		// the list is sorted once Build() is done
+
 	ShortMimeInfo tmp(shortDescription);
 	const ShortMimeInfo* result = fCommonMimeList.BinarySearch(tmp,
 		&MatchOneShortDescription);
@@ -169,10 +178,12 @@ MimeTypeList::Build()
 		if (mimetype.InitCheck() != B_OK)
 			continue;
 
+		// the lookups only ever return common types, keep only those
 		ShortMimeInfo* mimeInfo = new ShortMimeInfo(mimetype);
-		fMimeList.AddItem(mimeInfo);
 		if (mimeInfo->IsCommonMimeType())
 			fCommonMimeList.AddItem(mimeInfo);
+		else
+			delete mimeInfo;
 	}
 
 	fCommonMimeList.SortItems(&ShortMimeInfo::CompareShortDescription);

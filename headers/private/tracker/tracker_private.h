@@ -51,6 +51,10 @@ namespace BPrivate {
 _IMPEXP_TRACKER
 #endif
 void InitIconPreloader();
+#ifdef _IMPEXP_TRACKER
+_IMPEXP_TRACKER
+#endif
+void StartIconPreloader();
 
 // commands that may be issued to the tracker by other apps using messengers
 

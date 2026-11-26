@@ -69,6 +69,7 @@ private:
 class MimeTypeList {
 public:
 	MimeTypeList();
+	~MimeTypeList();
 
 	// attributes for type
 	// internal name from short description
@@ -82,8 +83,7 @@ protected:
 	void Build();
 
 private:
-	BObjectList<ShortMimeInfo, true> fMimeList;
-	BObjectList<ShortMimeInfo> fCommonMimeList;
+	BObjectList<ShortMimeInfo, true> fCommonMimeList;
 	mutable Benaphore fLock;
 };
 

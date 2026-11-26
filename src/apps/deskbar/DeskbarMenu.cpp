@@ -92,6 +92,14 @@ TDeskbarMenu::TDeskbarMenu(TBarView* barView)
 void
 TDeskbarMenu::AttachedToWindow()
 {
+	// the menu needs the application and preference icons from now on;
+	// the preloader runs in the application thread
+	static bool sIconPreloaderRequested = false;
+	if (!sIconPreloaderRequested) {
+		sIconPreloaderRequested = true;
+		be_app->PostMessage(kStartIconPreloader);
+	}
+
 	if (fBarView != NULL && fBarView->LockLooper()) {
 		if (fBarView->Dragging()) {
 			SetTypesList(fBarView->CachedTypesList());

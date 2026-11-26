@@ -204,19 +204,10 @@ NodePreloader::PreloadOne(const char* dirPath)
 void
 NodePreloader::Preload()
 {
-	for (int32 count = 100; count >= 0; count--) {
-		// wait for a little bit before going ahead to reduce disk access
-		// contention
-		snooze(100000);
-		if (fQuitRequested) {
-			fLock.Unlock();
-			return;
-		}
-	}
-
-	BMessenger messenger(kTrackerSignature);
-	if (!messenger.IsValid()) {
-		// put out some message here!
+	// started on first need, not at login: no need to wait for the disk
+	// to calm down
+	if (fQuitRequested) {
+		fLock.Unlock();
 		return;
 	}
 
