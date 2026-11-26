@@ -28,12 +28,17 @@ executing can finish; disabling access does not undo commands or stop jobs that
 an agent previously launched. Re-enabling retains the credential.
 
 The service starts through `data/launch/system` after initial volumes mount,
-outside safe mode, and remains idle while disabled. It is a native `BServer`
-with local `BMessenger` control. It attaches to app_server only when a GUI tool
-needs it, so other tools can still work when the desktop is unresponsive. The
-preferences app can launch the service if it is not running.
+outside safe mode. While MCP is off it does not stay resident: it quits 30
+seconds after the last request, and turns its launch job off first so that
+launch_daemon does not start it again. The preferences app and the command line
+start it again when they need it (`MCPServerMessenger()` in
+`headers/private/shared/MCPServer.h`; `B_LAUNCH_JOB` turns the job back on), and
+the next boot starts it as before. While MCP is on it runs for good, and
+launch_daemon restarts it if it ends. It is a native `BServer` with local
+`BMessenger` control. It attaches to app_server only when a GUI tool needs it,
+so other tools can still work when the desktop is unresponsive.
 
-Local administration (does not start a second server):
+Local administration (starts the service if it is not running; never a second one):
 
 ```sh
 /boot/system/servers/mcp_server --status

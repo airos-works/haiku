@@ -105,11 +105,6 @@ private:
 	void _Update(uint32 what)
 	{
 		bool toggle = what == kToggle;
-		BMessenger server(kMCPServerSignature);
-		if (!server.IsValid()) {
-			be_roster->Launch(kMCPServerSignature);
-			server = BMessenger(kMCPServerSignature);
-		}
 		BMessage request(toggle ? kMCPSetEnabled : kMCPGetStatus);
 		if (toggle)
 			request.AddBool("enabled", fEnabled->Value() == B_CONTROL_ON);
@@ -118,7 +113,8 @@ private:
 			request.AddBool("ui_access", fUIAccess->Value() == B_CONTROL_ON);
 		}
 		BMessage reply;
-		status_t error = server.SendMessage(&request, &reply, 1000000, 1000000);
+		// The service quits while MCP is off and nobody asks; this starts it.
+		status_t error = MCPServerSendRequest(request, reply, 1000000);
 		bool available = error == B_OK;
 		if (available)
 			reply.FindInt32("error", &error);

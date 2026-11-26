@@ -1,6 +1,6 @@
 SubDir HAIKU_TOP src preferences mcp ;
 
-UsePrivateHeaders shared ;
+UsePrivateHeaders app shared ;
 
 Application MCP : MCP.cpp
 	: be localestub [ TargetLibstdc++ ]

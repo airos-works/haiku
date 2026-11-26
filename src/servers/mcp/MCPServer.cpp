@@ -15,7 +15,9 @@
 #include <Directory.h>
 #include <File.h>
 #include <FindDirectory.h>
+#include <LaunchRoster.h>
 #include <Message.h>
+#include <MessageRunner.h>
 #include <Messenger.h>
 #include <NetworkInterface.h>
 #include <NetworkRoster.h>
@@ -26,6 +28,13 @@
 #include "Tools.h"
 #include "Transport.h"
 #include "Util.h"
+
+
+// While MCP is off the service only answers the preferences panel and the
+// command line, which start it again when they need it (MCPServerMessenger()):
+// it quits once nobody has asked for this long.
+static const bigtime_t kIdleQuitDelay = 30000000;
+static const uint32 kMsgIdleCheck = 'mcpi';
 
 
 static status_t
@@ -83,7 +92,9 @@ public:
 		fTransport(fServer),
 		fEnabled(false),
 		fUIAccess(true),
-		fError(B_OK)
+		fError(B_OK),
+		fIdleRunner(NULL),
+		fLastRequest(0)
 	{
 		RegisterSyslogTools(fServer);
 		RegisterRunTools(fServer);
@@ -98,7 +109,35 @@ public:
 		RegisterUITools(fServer);
 	}
 
+	virtual ~MCPService()
+	{
+		delete fIdleRunner;
+	}
+
 	virtual void ReadyToRun()
+	{
+		_ReadSettings();
+		_UpdateIdleQuit();
+	}
+
+	virtual void MessageReceived(BMessage* message)
+	{
+		if (message->what == kMsgIdleCheck) {
+			_IdleCheck();
+			return;
+		}
+		if (message->what != kMCPGetStatus && message->what != kMCPSetEnabled
+			&& message->what != kMCPSetUIAccess) {
+			BServer::MessageReceived(message);
+			return;
+		}
+		_HandleRequest(message);
+		fLastRequest = system_time();
+		_UpdateIdleQuit();
+	}
+
+private:
+	void _ReadSettings()
 	{
 		BPath path;
 		fError = SettingsPath(path);
@@ -132,13 +171,8 @@ public:
 		}
 	}
 
-	virtual void MessageReceived(BMessage* message)
+	void _HandleRequest(BMessage* message)
 	{
-		if (message->what != kMCPGetStatus && message->what != kMCPSetEnabled
-			&& message->what != kMCPSetUIAccess) {
-			BServer::MessageReceived(message);
-			return;
-		}
 		status_t error = fError;
 		if (message->what == kMCPSetEnabled) {
 			bool enabled;
@@ -164,7 +198,38 @@ public:
 		message->SendReply(&reply);
 	}
 
-private:
+	// Off, the service is not worth a resident team: it quits after
+	// kIdleQuitDelay without requests. On, it stays as it always did.
+	void _UpdateIdleQuit()
+	{
+		bool idle = !fEnabled && !fTransport.IsRunning();
+		if (!idle) {
+			delete fIdleRunner;
+			fIdleRunner = NULL;
+		} else if (fIdleRunner == NULL) {
+			fLastRequest = system_time();
+			BMessage check(kMsgIdleCheck);
+			fIdleRunner = new(std::nothrow) BMessageRunner(be_app_messenger,
+				&check, kIdleQuitDelay / 3);
+		}
+	}
+
+	void _IdleCheck()
+	{
+		_UpdateIdleQuit();
+		if (fIdleRunner == NULL
+			|| system_time() - fLastRequest < kIdleQuitDelay)
+			return;
+		// launch_daemon restarts a service that quits; with its job off it
+		// does not, until a client asks for it (B_LAUNCH_JOB enables it).
+		// The job is on again at the next boot, where this repeats.
+		BLaunchRoster().SetEnabled(kMCPServerJob, false);
+		syslog(LOG_INFO, "MCP is off; quitting until it is needed");
+		delete fIdleRunner;
+		fIdleRunner = NULL;
+		PostMessage(B_QUIT_REQUESTED);
+	}
+
 	status_t _Save(bool enabled)
 	{
 		BPath path;
@@ -285,6 +350,8 @@ private:
 	bool fUIAccess;
 	status_t fError;
 	std::string fToken;
+	BMessageRunner* fIdleRunner;
+	bigtime_t fLastRequest;
 };
 
 
@@ -307,8 +374,7 @@ main(int argc, char** argv)
 			return 1;
 		}
 		BMessage reply;
-		status_t error = BMessenger(kMCPServerSignature).SendMessage(&request,
-			&reply, 5000000, 5000000);
+		status_t error = MCPServerSendRequest(request, reply, 5000000);
 		if (error == B_OK)
 			reply.FindInt32("error", &error);
 		bool enabled = false, running = false, uiAccess = false;

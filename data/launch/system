@@ -24,6 +24,9 @@ service x-vnd.Haiku-mount_server {
 	launch /system/servers/mount_server
 }
 
+# Quits soon when MCP is off, after turning this job off; Preferences > MCP and
+# "mcp_server --status/--enable" start it again (headers/private/shared/
+# MCPServer.h).
 service x-vnd.Haiku-mcp_server {
 	launch /system/servers/mcp_server
 	no_safemode
