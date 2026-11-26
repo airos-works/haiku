@@ -1,5 +1,5 @@
 /*
- * Copyright 2006, Haiku Inc. All rights reserved.
+ * Copyright 2006-2026, Haiku Inc. All rights reserved.
  * Distributed under the terms of the MIT License.
  *
  * Authors:
@@ -19,7 +19,7 @@ public:
 									PhysicalMemoryAllocator(const char *name,
 										size_t minSize,
 										size_t maxSize,
-										uint32 minCountPerBlock,
+										uint32 maxBlockCount,
 										bool uncached = false);
 									~PhysicalMemoryAllocator();
 
@@ -28,7 +28,7 @@ public:
 static	area_id					AllocateArea(const char* name, size_t size,
 										void** logicalAddress,
 										phys_addr_t* physicalAddress,
-										bool uncached);
+										bool uncached, uint32 flags = 0);
 
 		status_t					Allocate(size_t size,
 										void **logicalAddress,
@@ -39,32 +39,32 @@ static	area_id					AllocateArea(const char* name, size_t size,
 										void *logicalAddress,
 										phys_addr_t physicalAddress);
 
-		void						PrintToStream();
-		void						DumpArrays();
-		void						DumpLastArray();
-		void						DumpFreeSlots();
-
 private:
-		char						*fName;
+		struct Chunk;
 
-		size_t						fOverhead;
-		size_t						fManagedMemory;
+		Chunk*						_CreateChunk(bool debugReserve);
+		bool						_AllocateFromChunk(Chunk* chunk,
+										int32 arrayToUse, size_t& offset);
+
+		char						*fName;
 		status_t					fStatus;
+		bool						fUncached;
 
 		mutex						fLock;
-		area_id						fArea;
-		void						*fLogicalBase;
-		phys_addr_t					fPhysicalBase;
+		Chunk*						fChunks;
+		uint32						fChunkCount;
+		uint32						fMaxChunkCount;
+		size_t						fChunkSize;
+		bool						fGrowing;
 
 		int32						fArrayCount;
 		size_t						*fBlockSize;
 		size_t						*fArrayLength;
-		size_t						*fArrayOffset;
-		uint8						**fArray;
 
 		ConditionVariable			fNoMemoryCondition;
 
-		uint32						fDebugBase;
+		uint8						*fDebugLogicalBase;
+		phys_addr_t					fDebugPhysicalBase;
 		uint32						fDebugChunkSize;
 		uint64						fDebugUseMap;
 };

@@ -9,6 +9,7 @@
 #include <malloc.h>
 #include <string.h>
 #include <KernelExport.h>
+#include <heap.h>
 #include <SupportDefs.h>
 #include <util/AutoLock.h>
 #include <util/kernel_cpp.h>
@@ -27,10 +28,44 @@
 #endif
 
 
+// The pool grows by chunks of this many blocks of the largest size, each a
+// contiguous area of its own, up to the maximum its owner gives. Booting from
+// a USB disk with a keyboard and a tablet had at most 145 KiB in use at once
+// and a few hundred bytes once the desktop was up; the pools used to take
+// their whole maximum (8 MiB of contiguous low memory and 2 MiB of
+// bookkeeping each) at once.
+static const uint32 kChunkBlocks = 1;
+
+// In the kernel debugger, transfers come from a reserve of 64 small slots at
+// the end of the first chunk, as nothing can be allocated or locked there.
+static const uint32 kDebugChunkSize = 128;
+static const size_t kDebugReserveSize = 64 * kDebugChunkSize;
+
+
+struct PhysicalMemoryAllocator::Chunk {
+	Chunk*			next;
+	area_id			area;
+	uint8*			logicalBase;
+	phys_addr_t		physicalBase;
+	size_t			usedBytes;
+	size_t*			arrayOffset;
+	uint8**			array;
+};
+
+
 PhysicalMemoryAllocator::PhysicalMemoryAllocator(const char *name,
-	size_t minSize, size_t maxSize, uint32 minCountPerBlock, bool uncached)
-	:	fOverhead(0),
-		fStatus(B_NO_INIT)
+	size_t minSize, size_t maxSize, uint32 maxBlockCount, bool uncached)
+	:	fStatus(B_NO_INIT),
+		fUncached(uncached),
+		fChunks(NULL),
+		fChunkCount(0),
+		fMaxChunkCount(0),
+		fChunkSize(0),
+		fGrowing(false),
+		fDebugLogicalBase(NULL),
+		fDebugPhysicalBase(0),
+		fDebugChunkSize(kDebugChunkSize),
+		fDebugUseMap(0)
 {
 	fName = strdup(name);
 	mutex_init_etc(&fLock, fName, MUTEX_FLAG_CLONE_NAME);
@@ -42,45 +77,21 @@ PhysicalMemoryAllocator::PhysicalMemoryAllocator(const char *name,
 		biggestSize *= 2;
 	}
 
-	size_t size = fArrayCount * sizeof(uint8 *);
-	fArray = (uint8 **)malloc(size);
-	fOverhead += size;
+	fBlockSize = (size_t *)malloc(fArrayCount * sizeof(size_t));
+	fArrayLength = (size_t *)malloc(fArrayCount * sizeof(size_t));
+	if (fName == NULL || fBlockSize == NULL || fArrayLength == NULL)
+		return;
 
-	size = fArrayCount * sizeof(size_t);
-	fBlockSize = (size_t *)malloc(size);
-	fArrayLength = (size_t *)malloc(size);
-	fArrayOffset = (size_t *)malloc(size);
-	fOverhead += size * 3;
-
-	size_t arraySlots = biggestSize / minSize;
+	size_t arraySlots = biggestSize / minSize * kChunkBlocks;
 	for (int32 i = 0; i < fArrayCount; i++) {
-		size = arraySlots * minCountPerBlock * sizeof(uint8);
-		fArrayLength[i] = arraySlots * minCountPerBlock;
-		fBlockSize[i] = biggestSize / arraySlots;
-		fArrayOffset[i] = fArrayLength[i] - 1;
-
-		fArray[i] = (uint8 *)malloc(size);
-		memset(fArray[i], 0, fArrayLength[i]);
-
-		fOverhead += size;
+		fBlockSize[i] = minSize << i;
+		fArrayLength[i] = arraySlots;
 		arraySlots /= 2;
 	}
 
-	fManagedMemory = fBlockSize[0] * fArrayLength[0];
-
-	size_t roundedSize = biggestSize * minCountPerBlock;
-	fDebugBase = roundedSize;
-	fDebugChunkSize = 128;
-	fDebugUseMap = 0;
-	roundedSize += sizeof(fDebugUseMap) * 8 * fDebugChunkSize;
-	roundedSize = (roundedSize + B_PAGE_SIZE - 1) & ~(B_PAGE_SIZE - 1);
-
-	fArea = AllocateArea(fName, roundedSize, &fLogicalBase, &fPhysicalBase,
-		uncached);
-	if (fArea < B_OK) {
-		TRACE_ERROR(("PMA: failed to create memory area\n"));
-		return;
-	}
+	fChunkSize = biggestSize * kChunkBlocks;
+	fMaxChunkCount = (max_c(maxBlockCount, 1) + kChunkBlocks - 1)
+		/ kChunkBlocks;
 
 	fNoMemoryCondition.Init(this, "USB PMA");
 	fStatus = B_OK;
@@ -91,23 +102,25 @@ PhysicalMemoryAllocator::~PhysicalMemoryAllocator()
 {
 	mutex_lock(&fLock);
 
-	for (int32 i = 0; i < fArrayCount; i++)
-		free(fArray[i]);
+	while (fChunks != NULL) {
+		Chunk* chunk = fChunks;
+		fChunks = chunk->next;
+		delete_area(chunk->area);
+		free(chunk);
+	}
 
-	free(fArray);
 	free(fArrayLength);
 	free(fBlockSize);
-	free(fArrayOffset);
 	free(fName);
 
-	delete_area(fArea);
 	mutex_destroy(&fLock);
 }
 
 
 area_id
 PhysicalMemoryAllocator::AllocateArea(const char* name, size_t size,
-	void** logicalAddress, phys_addr_t* physicalAddress, bool uncached)
+	void** logicalAddress, phys_addr_t* physicalAddress, bool uncached,
+	uint32 flags)
 {
 	if (size == 0 || size > SIZE_MAX - (B_PAGE_SIZE - 1))
 		return B_BAD_VALUE;
@@ -117,8 +130,12 @@ PhysicalMemoryAllocator::AllocateArea(const char* name, size_t size,
 #endif
 	void* address;
 	size = (size + B_PAGE_SIZE - 1) & ~(B_PAGE_SIZE - 1);
-	area_id area = create_area(name, &address, B_ANY_KERNEL_ADDRESS, size,
-		B_32_BIT_CONTIGUOUS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA);
+	virtual_address_restrictions virtualRestrictions = {};
+	virtualRestrictions.address_specification = B_ANY_KERNEL_ADDRESS;
+	physical_address_restrictions physicalRestrictions = {};
+	area_id area = create_area_etc(B_SYSTEM_TEAM, name, size,
+		B_32_BIT_CONTIGUOUS, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, flags, 0,
+		&virtualRestrictions, &physicalRestrictions, &address);
 	if (area < B_OK)
 		return area;
 	physical_entry entry;
@@ -156,6 +173,100 @@ PhysicalMemoryAllocator::AllocateArea(const char* name, size_t size,
 }
 
 
+/*!	Creates a chunk of the pool with its bookkeeping. It is called where
+	transfers are submitted, also for the I/O that is to free memory: it must
+	not wait for memory, the caller waits for a free block instead.
+*/
+PhysicalMemoryAllocator::Chunk*
+PhysicalMemoryAllocator::_CreateChunk(bool debugReserve)
+{
+	size_t bookkeeping = sizeof(Chunk)
+		+ fArrayCount * (sizeof(size_t) + sizeof(uint8*));
+	for (int32 i = 0; i < fArrayCount; i++)
+		bookkeeping += fArrayLength[i];
+
+	Chunk* chunk = (Chunk*)malloc_etc(bookkeeping,
+		HEAP_DONT_WAIT_FOR_MEMORY | HEAP_PRIORITY_VIP);
+	if (chunk == NULL)
+		return NULL;
+	memset(chunk, 0, bookkeeping);
+
+	chunk->arrayOffset = (size_t*)(chunk + 1);
+	chunk->array = (uint8**)(chunk->arrayOffset + fArrayCount);
+	uint8* array = (uint8*)(chunk->array + fArrayCount);
+	for (int32 i = 0; i < fArrayCount; i++) {
+		chunk->array[i] = array;
+		chunk->arrayOffset[i] = fArrayLength[i] - 1;
+		array += fArrayLength[i];
+	}
+
+	void* logicalBase;
+	chunk->area = AllocateArea(fName,
+		fChunkSize + (debugReserve ? kDebugReserveSize : 0), &logicalBase,
+		&chunk->physicalBase, fUncached,
+		CREATE_AREA_DONT_WAIT | CREATE_AREA_PRIORITY_VIP);
+	if (chunk->area < B_OK) {
+		TRACE_ERROR(("PMA: \"%s\" could not grow: %s\n", fName,
+			strerror(chunk->area)));
+		free(chunk);
+		return NULL;
+	}
+
+	chunk->logicalBase = (uint8*)logicalBase;
+	return chunk;
+}
+
+
+/*!	Takes a free block of fBlockSize[arrayToUse] bytes from \a chunk, if it
+	has one. Called with the lock held.
+*/
+bool
+PhysicalMemoryAllocator::_AllocateFromChunk(Chunk* chunk, int32 arrayToUse,
+	size_t& offset)
+{
+	if (fChunkSize - chunk->usedBytes < fBlockSize[arrayToUse])
+		return false;
+
+	// look for a free slot, from the one after the last one taken
+	uint8* targetArray = chunk->array[arrayToUse];
+	const size_t arrayLength = fArrayLength[arrayToUse];
+	size_t start = chunk->arrayOffset[arrayToUse] + 1;
+	if (start >= arrayLength)
+		start = 0;
+	uint8* slot = (uint8*)memchr(targetArray + start, 0, arrayLength - start);
+	if (slot == NULL)
+		slot = (uint8*)memchr(targetArray, 0, start);
+	if (slot == NULL)
+		return false;
+
+	const size_t i = slot - targetArray;
+	chunk->arrayOffset[arrayToUse] = i;
+	chunk->usedBytes += fBlockSize[arrayToUse];
+
+	// fill upwards to the smallest block
+	size_t fillSize = 1;
+	size_t arrayIndex = i;
+	for (int32 j = arrayToUse; j >= 0; j--) {
+		memset(&chunk->array[j][arrayIndex], 1, fillSize);
+		fillSize <<= 1;
+		arrayIndex <<= 1;
+	}
+
+	// fill downwards to the biggest block
+	arrayIndex = i >> 1;
+	for (int32 j = arrayToUse + 1; j < fArrayCount; j++) {
+		chunk->array[j][arrayIndex]++;
+		if (chunk->array[j][arrayIndex] > 1)
+			break;
+
+		arrayIndex >>= 1;
+	}
+
+	offset = fBlockSize[arrayToUse] * i;
+	return true;
+}
+
+
 status_t
 PhysicalMemoryAllocator::Allocate(size_t size, void **logicalAddress,
 	phys_addr_t *physicalAddress)
@@ -167,15 +278,15 @@ PhysicalMemoryAllocator::Allocate(size_t size, void **logicalAddress,
 				size, fDebugChunkSize);
 			return B_NO_MEMORY;
 		}
+		if (fDebugLogicalBase == NULL)
+			return B_NO_MEMORY;
 
 		for (size_t i = 0; i < sizeof(fDebugUseMap) * 8; i++) {
 			uint64 mask = 1LL << i;
 			if ((fDebugUseMap & mask) == 0) {
 				fDebugUseMap |= mask;
-				*logicalAddress = (void *)((uint8 *)fLogicalBase + fDebugBase
-					+ i * fDebugChunkSize);
-				*physicalAddress = (phys_addr_t)(fPhysicalBase + fDebugBase
-					+ i * fDebugChunkSize);
+				*logicalAddress = fDebugLogicalBase + i * fDebugChunkSize;
+				*physicalAddress = fDebugPhysicalBase + i * fDebugChunkSize;
 				return B_OK;
 			}
 		}
@@ -188,74 +299,79 @@ PhysicalMemoryAllocator::Allocate(size_t size, void **logicalAddress,
 		return B_BAD_VALUE;
 	}
 
-	size_t arrayLength = 0;
 	int32 arrayToUse = 0;
-	for (int32 i = 0; i < fArrayCount; i++) {
-		if (fBlockSize[i] >= size) {
-			arrayToUse = i;
-			arrayLength = fArrayLength[i];
-			break;
-		}
-	}
+	while (fBlockSize[arrayToUse] < size)
+		arrayToUse++;
 
 	MutexLocker locker(&fLock);
 	if (!locker.IsLocked())
 		return B_ERROR;
 
 	const bigtime_t limit = system_time() + 2 * 1000 * 1000;
-	do {
+	while (true) {
 		TRACE(("PMA: will use array %ld (blocksize: %ld) to allocate %ld bytes\n", arrayToUse, fBlockSize[arrayToUse], size));
-		uint8 *targetArray = fArray[arrayToUse];
-		uint32 arrayOffset = fArrayOffset[arrayToUse] % arrayLength;
-		for (size_t i = arrayOffset + 1; i != arrayOffset; i++) {
-			if (i >= arrayLength)
-				i -= arrayLength;
-
- 			if (targetArray[i] == 0) {
-				// found a free slot
-				fArrayOffset[arrayToUse] = i;
-
-				// fill upwards to the smallest block
-				uint32 fillSize = 1;
-				uint32 arrayIndex = i;
-				for (int32 j = arrayToUse; j >= 0; j--) {
-					memset(&fArray[j][arrayIndex], 1, fillSize);
-					fillSize <<= 1;
-					arrayIndex <<= 1;
-				}
-
-				// fill downwards to the biggest block
-				arrayIndex = i >> 1;
-				for (int32 j = arrayToUse + 1; j < fArrayCount; j++) {
-					fArray[j][arrayIndex]++;
-					if (fArray[j][arrayIndex] > 1)
-						break;
-
-					arrayIndex >>= 1;
-				}
-
-				size_t offset = fBlockSize[arrayToUse] * i;
-				*logicalAddress = (void *)((uint8 *)fLogicalBase + offset);
-				*physicalAddress = (phys_addr_t)(fPhysicalBase + offset);
+		for (Chunk* chunk = fChunks; chunk != NULL; chunk = chunk->next) {
+			size_t offset;
+			if (_AllocateFromChunk(chunk, arrayToUse, offset)) {
+				*logicalAddress = chunk->logicalBase + offset;
+				*physicalAddress = chunk->physicalBase + offset;
 				return B_OK;
+			}
+		}
+
+		if (!fGrowing && fChunkCount < fMaxChunkCount) {
+			// Add a chunk. Frees go on meanwhile; other allocations wait
+			// for it or for a free block.
+			const bool first = fChunks == NULL;
+			fGrowing = true;
+			locker.Unlock();
+
+			Chunk* chunk = _CreateChunk(first);
+
+			if (!locker.Lock())
+				return B_ERROR;
+			fGrowing = false;
+
+			if (chunk != NULL) {
+				// The earlier chunks are searched first: append it.
+				Chunk** last = &fChunks;
+				while (*last != NULL)
+					last = &(*last)->next;
+				*last = chunk;
+				fChunkCount++;
+
+				if (first) {
+					fDebugLogicalBase = chunk->logicalBase + fChunkSize;
+					fDebugPhysicalBase = chunk->physicalBase + fChunkSize;
+				}
+
+				fNoMemoryCondition.NotifyAll();
+				continue;
 			}
 		}
 
 		// no slot found, we need to wait some being Deallocate()'d
 
+		const bigtime_t now = system_time();
+		if (now >= limit)
+			break;
+
 		ConditionVariableEntry entry;
 		fNoMemoryCondition.Add(&entry);
 
+		const bool growing = fGrowing;
 		locker.Unlock();
 
-		TRACE_ERROR(("PMA: found no free slot to store %ld bytes, waiting\n", size));
+		if (!growing) {
+			TRACE_ERROR(("PMA: found no free slot to store %ld bytes, waiting\n",
+				size));
+		}
 
-		if (entry.Wait(B_RELATIVE_TIMEOUT, 1 * 1000 * 1000) == B_TIMED_OUT)
-			break;
+		entry.Wait(B_RELATIVE_TIMEOUT, min_c(limit - now, 1000 * 1000));
 
 		if (!locker.Lock())
 			return B_ERROR;
-	} while (system_time() < limit);
+	}
 
 	TRACE_ERROR(("PMA: timed out waiting for a free slot, giving up\n"));
 	return B_NO_MEMORY;
@@ -267,8 +383,8 @@ PhysicalMemoryAllocator::Deallocate(size_t size, void *logicalAddress,
 	phys_addr_t physicalAddress)
 {
 	if (debug_debugger_running()) {
-		uint32 index = ((uint8 *)logicalAddress - (uint8 *)fLogicalBase
-			- fDebugBase) / fDebugChunkSize;
+		uint32 index = ((uint8 *)logicalAddress - fDebugLogicalBase)
+			/ fDebugChunkSize;
 		fDebugUseMap &= ~(1LL << index);
 		return B_OK;
 	}
@@ -278,46 +394,56 @@ PhysicalMemoryAllocator::Deallocate(size_t size, void *logicalAddress,
 		return B_BAD_VALUE;
 	}
 
-	int32 arrayToUse = 0;
-	for (int32 i = 0; i < fArrayCount; i++) {
-		if (fBlockSize[i] >= size) {
-			arrayToUse = i;
-			break;
-		}
-	}
-
-	phys_addr_t offset;
-	if (logicalAddress)
-		offset = (addr_t)logicalAddress - (addr_t)fLogicalBase;
-	else if (physicalAddress)
-		offset = (addr_t)physicalAddress - fPhysicalBase;
-	else {
+	if (logicalAddress == NULL && physicalAddress == 0) {
 		TRACE_ERROR(("PMA: no value given for either physical or logical address\n"));
 		return B_BAD_VALUE;
 	}
 
-	uint32 index = offset / fBlockSize[arrayToUse];
-	if (index >= fArrayLength[arrayToUse]) {
-		TRACE_ERROR(("PMA: provided address resulted in invalid index\n"));
-		return B_BAD_VALUE;
-	}
-
-	TRACE(("PMA: will use array %ld (index: %ld) to deallocate %ld bytes\n", arrayToUse, index, size));
+	int32 arrayToUse = 0;
+	while (fBlockSize[arrayToUse] < size)
+		arrayToUse++;
 
 	MutexLocker locker(&fLock);
 	if (!locker.IsLocked())
 		return B_ERROR;
 
-	if (fArray[arrayToUse][index] == 0) {
+	Chunk* chunk = fChunks;
+	size_t offset = 0;
+	for (; chunk != NULL; chunk = chunk->next) {
+		if (logicalAddress != NULL) {
+			offset = (addr_t)logicalAddress - (addr_t)chunk->logicalBase;
+			if ((addr_t)logicalAddress >= (addr_t)chunk->logicalBase
+				&& offset < fChunkSize) {
+				break;
+			}
+		} else {
+			offset = physicalAddress - chunk->physicalBase;
+			if (physicalAddress >= chunk->physicalBase
+				&& offset < fChunkSize) {
+				break;
+			}
+		}
+	}
+
+	if (chunk == NULL) {
+		TRACE_ERROR(("PMA: provided address is not in the pool\n"));
+		return B_BAD_VALUE;
+	}
+
+	uint32 index = offset / fBlockSize[arrayToUse];
+
+	TRACE(("PMA: will use array %ld (index: %ld) to deallocate %ld bytes\n", arrayToUse, index, size));
+
+	if (chunk->array[arrayToUse][index] == 0) {
 		TRACE_ERROR(("PMA: address was not allocated!\n"));
 		return B_BAD_VALUE;
 	}
 
 	// clear upwards to the smallest block
-	uint32 fillSize = 1;
-	uint32 arrayIndex = index;
+	size_t fillSize = 1;
+	size_t arrayIndex = index;
 	for (int32 i = arrayToUse; i >= 0; i--) {
-		memset(&fArray[i][arrayIndex], 0, fillSize);
+		memset(&chunk->array[i][arrayIndex], 0, fillSize);
 		fillSize <<= 1;
 		arrayIndex <<= 1;
 	}
@@ -325,104 +451,15 @@ PhysicalMemoryAllocator::Deallocate(size_t size, void *logicalAddress,
 	// clear downwards to the biggest block
 	arrayIndex = index >> 1;
 	for (int32 i = arrayToUse + 1; i < fArrayCount; i++) {
-		fArray[i][arrayIndex]--;
-		if (fArray[i][arrayIndex] > 0)
+		chunk->array[i][arrayIndex]--;
+		if (chunk->array[i][arrayIndex] > 0)
 			break;
 
 		arrayIndex >>= 1;
 	}
 
+	chunk->usedBytes -= fBlockSize[arrayToUse];
 	fNoMemoryCondition.NotifyAll();
 
 	return B_OK;
-}
-
-
-void
-PhysicalMemoryAllocator::PrintToStream()
-{
-	dprintf("PhysicalMemoryAllocator \"%s\":\n", fName);
-	dprintf("\tMin block size:\t\t\t%ld bytes\n", fBlockSize[0]);
-	dprintf("\tMax block size:\t\t\t%ld bytes\n", fBlockSize[fArrayCount - 1]);
-	dprintf("\tMin count per block:\t%ld\n\n", fArrayLength[fArrayCount - 1]);
-	dprintf("\tArray count:\t\t\t%" B_PRId32 "\n", fArrayCount);
-
-	dprintf("\tArray slots:\t\t\t% 8ld", fArrayLength[0]);
-	for (int32 i = 1; i < fArrayCount; i++)
-		dprintf(", % 8ld", fArrayLength[i]);
-	dprintf("\n");
-	DumpFreeSlots();
-
-	dprintf("\tBlock sizes:\t\t\t% 8ld", fBlockSize[0]);
-	for (int32 i = 1; i < fArrayCount; i++)
-		dprintf(", % 8ld", fBlockSize[i]);
-	dprintf("\n");
-	DumpLastArray();
-	dprintf("\n");
-
-	dprintf("\tManaged memory:\t\t\t%ld bytes\n", fManagedMemory);
-	dprintf("\tGranularity:\t\t\t%ld bytes\n", fBlockSize[0]);
-	dprintf("\tMemory overhead:\t\t%ld bytes\n", fOverhead);
-}
-
-
-void
-PhysicalMemoryAllocator::DumpArrays()
-{
-	uint32 padding = 2;
-	for (int32 i = 0; i < fArrayCount; i++) {
-		dprintf("\tArray(%" B_PRId32 "):\t", i);
-		for (size_t j = 0; j < fArrayLength[i]; j++) {
-			if (padding > 2) {
-				for (uint32 k = 0; k < (padding - 2) / 4; k++)
-					dprintf(" ");
-				dprintf("\\");
-				for (uint32 k = 0; k < (padding - 2) / 4; k++)
-					dprintf("-");
-				dprintf("%d", fArray[i][j]);
-				for (uint32 k = 0; k < (padding - 2) / 4; k++)
-					dprintf("-");
-				dprintf("/");
-				for (uint32 k = 0; k < (padding - 2) / 4 + 1; k++)
-					dprintf(" ");
-			} else {
-				dprintf("%d ", fArray[i][j]);
-			}
-		}
-
-		padding *= 2;
-		dprintf("\n");
-	}
-
-	dprintf("\n");
-}
-
-
-void
-PhysicalMemoryAllocator::DumpLastArray()
-{
-	dprintf("\tLast array:\t\t\t\t");
-	for (size_t i = 0; i < fArrayLength[fArrayCount - 1]; i++)
-		dprintf("%d", fArray[fArrayCount - 1][i]);
-	dprintf("\n");
-}
-
-
-void
-PhysicalMemoryAllocator::DumpFreeSlots()
-{
-	dprintf("\tFree slots:\t\t\t\t");
-	for (int32 i = 0; i < fArrayCount; i++) {
-		uint32 freeSlots = 0;
-		for (size_t j = 0; j < fArrayLength[i]; j++) {
-			if (fArray[i][j] == 0)
-				freeSlots++;
-		}
-
-		if (i > 0)
-			dprintf(", %8" B_PRIu32, freeSlots);
-		else
-			dprintf("%8" B_PRIu32, freeSlots);
-	}
-	dprintf("\n");
 }
