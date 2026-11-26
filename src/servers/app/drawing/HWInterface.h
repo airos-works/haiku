@@ -430,6 +430,9 @@ private:
 									// copies go through the threads
 			thread_id			fFlushKnobThread;
 			bool				fFlushWanted;
+			bool				fFlushHasBlanks;
+									// a retrace semaphore to wait for:
+									// without, no shadows, copies as drawn
 
 			// What the flush copies from: two shadows of the back buffer.
 			// Drawing ops copy their finished areas into the current one;

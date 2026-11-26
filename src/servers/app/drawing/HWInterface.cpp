@@ -87,6 +87,7 @@ HWInterface::HWInterface()
 	fFlushing(false),
 	fFlushKnobThread(-1),
 	fFlushWanted(false),
+	fFlushHasBlanks(true),
 	fShadowCurrent(0),
 	fShadowReaders(0),
 	fDeviceCopyOff(false),
@@ -1273,10 +1274,10 @@ HWInterface::_DumpFlushState()
 		return;
 	bigtime_t now = system_time();
 	RenderingBuffer* backBuffer = BackBuffer();
-	debug_printf("app_server: flush dump: flushing %d wanted %d per output %d"
-		" shadow current %" B_PRId32 " readers %" B_PRId32 " back %" B_PRIu32
-		"x%" B_PRIu32 "\n", fFlushing, fFlushWanted, fFlushPerOutput,
-		fShadowCurrent, fShadowReaders,
+	debug_printf("app_server: flush dump: flushing %d wanted %d blanks %d per "
+		"output %d shadow current %" B_PRId32 " readers %" B_PRId32 " back %"
+		B_PRIu32 "x%" B_PRIu32 "\n", fFlushing, fFlushWanted, fFlushHasBlanks,
+		fFlushPerOutput, fShadowCurrent, fShadowReaders,
 		backBuffer != NULL ? backBuffer->Width() : 0,
 		backBuffer != NULL ? backBuffer->Height() : 0);
 	for (int32 i = 0; i < 2; i++) {
@@ -1327,7 +1328,7 @@ HWInterface::_SetFlushing(bool flushing)
 {
 	if (fFlushLock.Lock()) {
 		fFlushWanted = flushing;
-		fFlushing = flushing && fFlushTargets != NULL;
+		fFlushing = flushing && fFlushTargets != NULL && fFlushHasBlanks;
 		fFlushLock.Unlock();
 	}
 	if (!flushing && fFlushTargets != NULL) {
@@ -1472,33 +1473,6 @@ HWInterface::_UpdateFlushTargets()
 	IntRect bufferFrame = backBuffer != NULL
 		? IntRect(backBuffer->Bounds()) : IntRect(0, 0, -1, -1);
 
-	// the shadows, the back buffer's size (the flush copies from them)
-	for (int32 i = 0; backBuffer != NULL && i < 2; i++) {
-		if (fFlushShadow[i].IsSet()
-			&& fFlushShadow[i]->Width() == backBuffer->Width()
-			&& fFlushShadow[i]->Height() == backBuffer->Height())
-			continue;
-		fFlushShadow[i].Unset();
-		RenderingBuffer* shadow = _CreateFlushShadow(backBuffer->Width(),
-			backBuffer->Height());
-		if (shadow != NULL && shadow->InitCheck() == B_OK) {
-			// the back buffer as it is, so that nothing stale is copied
-			bool filled = true;
-			if (shadow->Bits() != NULL) {
-				memcpy(shadow->Bits(), backBuffer->Bits(),
-					min_c(shadow->BitsLength(), backBuffer->BitsLength()));
-			} else {
-				filled = _CopyBackToShadowByDevice(shadow,
-					IntRect(backBuffer->Bounds()));
-			}
-			if (filled)
-				fFlushShadow[i].SetTo(shadow);
-			else
-				delete shadow;
-		} else
-			delete shadow;
-	}
-
 	// The screen's one semaphore follows the main display, the one the mode
 	// describes.
 	display_mode mode = {};
@@ -1543,6 +1517,65 @@ HWInterface::_UpdateFlushTargets()
 		fFlushLock.Unlock();
 	}
 	free(outputs);
+
+	// Without a blank to wait for (neither the screen's semaphore nor an
+	// output's), the copies are made as drawn: the screen's thread would
+	// switch the flush off at its first copy anyway. Then the two shadows,
+	// each as large as the back buffer, are not made at all (6 MiB at
+	// 1024x768, 63 MiB at 3840x2160). Asked once a mode is set, as the flush
+	// thread asked before; the accelerant's answer does not change, the
+	// outputs' may with the layout, so it is asked at every mode set.
+	bool blanks = fFlushHasBlanks;
+	sem_id screenSemaphore = B_UNSUPPORTED;
+	if (backBuffer != NULL) {
+		screenSemaphore = RetraceSemaphore();
+		blanks = fFlushPerOutput || screenSemaphore >= 0;
+	}
+
+	// the shadows, the back buffer's size (the flush copies from them)
+	for (int32 i = 0; backBuffer != NULL && i < 2; i++) {
+		if (!blanks) {
+			fFlushShadow[i].Unset();
+			continue;
+		}
+		if (fFlushShadow[i].IsSet()
+			&& fFlushShadow[i]->Width() == backBuffer->Width()
+			&& fFlushShadow[i]->Height() == backBuffer->Height())
+			continue;
+		fFlushShadow[i].Unset();
+		RenderingBuffer* shadow = _CreateFlushShadow(backBuffer->Width(),
+			backBuffer->Height());
+		if (shadow != NULL && shadow->InitCheck() == B_OK) {
+			// the back buffer as it is, so that nothing stale is copied
+			bool filled = true;
+			if (shadow->Bits() != NULL) {
+				memcpy(shadow->Bits(), backBuffer->Bits(),
+					min_c(shadow->BitsLength(), backBuffer->BitsLength()));
+			} else {
+				filled = _CopyBackToShadowByDevice(shadow,
+					IntRect(backBuffer->Bounds()));
+			}
+			if (filled)
+				fFlushShadow[i].SetTo(shadow);
+			else
+				delete shadow;
+		} else
+			delete shadow;
+	}
+
+	if (fFlushLock.Lock()) {
+		if (!blanks && fFlushHasBlanks) {
+			debug_printf("app_server: vertical blank flush: no retrace "
+				"semaphore (%s), copies as drawn\n",
+				strerror(screenSemaphore));
+		} else if (blanks && !fFlushHasBlanks) {
+			debug_printf("app_server: vertical blank flush: retrace "
+				"semaphore found, copies at the blanks\n");
+		}
+		fFlushHasBlanks = blanks;
+		fFlushing = fFlushWanted && blanks;
+		fFlushLock.Unlock();
+	}
 }
 
 
@@ -1702,14 +1735,18 @@ HWInterface::_FlushThread(FlushTarget& target)
 				}
 			} else if (target.outputID == 0) {
 				// no retrace semaphore at all: copy as drawn, from now on
+				// (the next mode set decides again; the thread stays for
+				// when the flush is switched on again)
 				debug_printf("app_server: vertical blank flush: no retrace "
 					"semaphore (%s), copies as drawn\n", strerror(status));
 				if (fFlushLock.Lock()) {
+					fFlushHasBlanks = false;
 					fFlushing = false;
 					fFlushLock.Unlock();
 				}
 				_FlushPending(target, 0, which);
-				return;
+				_FlushPending(target, 0, _FlipShadow());
+				continue;
 			} else {
 				// the output's semaphore went away: copy as drawn, and
 				// ask again later
