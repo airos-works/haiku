@@ -113,8 +113,10 @@ struct VMCacheRef {
 
 
 struct vm_page {
+private:
 	const page_num_t		physical_page_number;
 
+public:
 	DoublyLinkedListLink<vm_page> queue_link;
 
 private:
@@ -154,6 +156,9 @@ public:
 	uint8					usage_count;
 
 	inline vm_page(page_num_t pageNumber);
+
+	page_num_t PhysicalPageNumber() const
+		{ return physical_page_number; }
 
 	VMCacheRef* CacheRef() const			{ return cache_ref; }
 	void SetCacheRef(VMCacheRef* cacheRef)	{ this->cache_ref = cacheRef; }
@@ -238,7 +243,7 @@ vm_page_debug_access_start(vm_page* page)
 	if (previousThread != -1) {
 		panic("Invalid concurrent access to page 0x%" B_PRIXPHYSADDR " (start), currently "
 			"accessed by: %" B_PRId32 "@! page -m %p; sc %" B_PRId32 "; cache _cache",
-			page->physical_page_number * B_PAGE_SIZE, previousThread, page, previousThread);
+			page->PhysicalPageNumber() * B_PAGE_SIZE, previousThread, page, previousThread);
 	}
 }
 
@@ -252,7 +257,7 @@ vm_page_debug_access_end(vm_page* page)
 	if (previousThread != threadID) {
 		panic("Invalid concurrent access to page 0x%" B_PRIXPHYSADDR " (end) by "
 			"current thread, current accessor is: %" B_PRId32 "@! page -m %p; "
-			"sc %" B_PRId32 "; cache _cache", page->physical_page_number * B_PAGE_SIZE,
+			"sc %" B_PRId32 "; cache _cache", page->PhysicalPageNumber() * B_PAGE_SIZE,
 			previousThread, page, previousThread);
 	}
 }
@@ -265,7 +270,7 @@ vm_page_debug_access_check(vm_page* page)
 	if (thread != thread_get_current_thread_id()) {
 		panic("Invalid concurrent access to page 0x%" B_PRIXPHYSADDR " (check), currently "
 			"accessed by: %" B_PRId32 "@! page -m %p; sc %" B_PRId32 "; cache _cache",
-			page->physical_page_number * B_PAGE_SIZE, thread, page, thread);
+			page->PhysicalPageNumber() * B_PAGE_SIZE, thread, page, thread);
 	}
 }
 

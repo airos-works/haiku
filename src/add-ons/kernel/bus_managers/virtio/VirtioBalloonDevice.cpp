@@ -157,7 +157,7 @@ VirtioBalloonDevice::_Thread()
 				}
 				PageInfo* info = new PageInfo;
 				info->page = page;
-				fBuffer[i] = (phys_addr_t)page->physical_page_number
+				fBuffer[i] = (phys_addr_t)page->PhysicalPageNumber()
 					>> (PAGE_SHIFT - VIRTIO_BALLOON_PFN_SHIFT);
 				fPages.Add(info);
 			}
@@ -176,7 +176,7 @@ VirtioBalloonDevice::_Thread()
 					break;
 				}
 				vm_page* page = info->page;
-				fBuffer[i] = (phys_addr_t)page->physical_page_number
+				fBuffer[i] = (phys_addr_t)page->PhysicalPageNumber()
 					>> (PAGE_SHIFT - VIRTIO_BALLOON_PFN_SHIFT);
 				vm_page_free(NULL, page);
 			}

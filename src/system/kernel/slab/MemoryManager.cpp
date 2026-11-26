@@ -1536,7 +1536,7 @@ MemoryManager::_MapChunk(VMArea* vmArea, addr_t address, size_t size,
 		vm_page_add_mapped_pages(1);
 
 		translationMap->Map(vmArea->Base() + offset,
-			page->physical_page_number * B_PAGE_SIZE,
+			page->PhysicalPageNumber() * B_PAGE_SIZE,
 			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
 			vmArea->MemoryType(), &reservation);
 

@@ -243,7 +243,7 @@ X86PagingMethod64Bit::PageDirectoryForAddress(uint64* virtualPMLTop,
 			DEBUG_PAGE_ACCESS_END(page);
 
 			phys_addr_t physicalPDPT
-				= (phys_addr_t)page->physical_page_number * B_PAGE_SIZE;
+				= (phys_addr_t)page->PhysicalPageNumber() * B_PAGE_SIZE;
 
 			TRACE("X86PagingMethod64Bit::PageTableForAddress(): creating PML4T"
 				" for va %#" B_PRIxADDR " at %#" B_PRIxPHYSADDR "\n",
@@ -274,7 +274,7 @@ X86PagingMethod64Bit::PageDirectoryForAddress(uint64* virtualPMLTop,
 		DEBUG_PAGE_ACCESS_END(page);
 
 		phys_addr_t physicalPDPT
-			= (phys_addr_t)page->physical_page_number * B_PAGE_SIZE;
+			= (phys_addr_t)page->PhysicalPageNumber() * B_PAGE_SIZE;
 
 		TRACE("X86PagingMethod64Bit::PageTableForAddress(): creating PDPT "
 			"for va %#" B_PRIxADDR " at %#" B_PRIxPHYSADDR "\n", virtualAddress,
@@ -304,7 +304,7 @@ X86PagingMethod64Bit::PageDirectoryForAddress(uint64* virtualPMLTop,
 		DEBUG_PAGE_ACCESS_END(page);
 
 		phys_addr_t physicalPageDir
-			= (phys_addr_t)page->physical_page_number * B_PAGE_SIZE;
+			= (phys_addr_t)page->PhysicalPageNumber() * B_PAGE_SIZE;
 
 		TRACE("X86PagingMethod64Bit::PageTableForAddress(): creating page "
 			"directory for va %#" B_PRIxADDR " at %#" B_PRIxPHYSADDR "\n",
@@ -367,7 +367,7 @@ X86PagingMethod64Bit::PageTableForAddress(uint64* virtualPMLTop,
 		DEBUG_PAGE_ACCESS_END(page);
 
 		phys_addr_t physicalPageTable
-			= (phys_addr_t)page->physical_page_number * B_PAGE_SIZE;
+			= (phys_addr_t)page->PhysicalPageNumber() * B_PAGE_SIZE;
 
 		TRACE("X86PagingMethod64Bit::PageTableForAddress(): creating page "
 			"table for va %#" B_PRIxADDR " at %#" B_PRIxPHYSADDR "\n",

@@ -201,7 +201,7 @@ PrecacheIO::Prepare(vm_page_reservation* reservation)
 		DEBUG_PAGE_ACCESS_END(page);
 
 		add_to_iovec(fVecs, fVecCount, fPageCount,
-			page->physical_page_number * B_PAGE_SIZE, B_PAGE_SIZE);
+			page->PhysicalPageNumber() * B_PAGE_SIZE, B_PAGE_SIZE);
 		fPages[i++] = page;
 	}
 
@@ -249,7 +249,7 @@ PrecacheIO::IOFinished(status_t status, bool partialTransfer,
 			// clear partial page
 			size_t bytesTouched = bytesTransferred % B_PAGE_SIZE;
 			vm_memset_physical(
-				((phys_addr_t)fPages[i]->physical_page_number << PAGE_SHIFT)
+				((phys_addr_t)fPages[i]->PhysicalPageNumber() << PAGE_SHIFT)
 					+ bytesTouched,
 				0, B_PAGE_SIZE - bytesTouched);
 		}
@@ -457,7 +457,7 @@ read_into_cache(file_cache_ref* ref, off_t offset,
 		DEBUG_PAGE_ACCESS_END(page);
 
 		add_to_iovec(vecs, vecCount, MAX_IO_VECS,
-			page->physical_page_number * B_PAGE_SIZE, B_PAGE_SIZE);
+			page->PhysicalPageNumber() * B_PAGE_SIZE, B_PAGE_SIZE);
 			// TODO: check if the array is large enough (currently panics)!
 	}
 
@@ -496,7 +496,7 @@ read_into_cache(file_cache_ref* ref, off_t offset,
 			size_t bytes = min_c(bufferSize, (size_t)B_PAGE_SIZE - pageOffset);
 
 			status = vm_memcpy_from_physical((void*)buffer,
-				pages[i]->physical_page_number * B_PAGE_SIZE + pageOffset,
+				pages[i]->PhysicalPageNumber() * B_PAGE_SIZE + pageOffset,
 				bytes, IS_USER_ADDRESS(buffer));
 			if (status != B_OK)
 				break;
@@ -599,7 +599,7 @@ write_to_cache(file_cache_ref* ref, off_t offset,
 		DEBUG_PAGE_ACCESS_END(page);
 
 		add_to_iovec(vecs, vecCount, MAX_IO_VECS,
-			page->physical_page_number * B_PAGE_SIZE, B_PAGE_SIZE);
+			page->PhysicalPageNumber() * B_PAGE_SIZE, B_PAGE_SIZE);
 	}
 
 	push_access(ref, offset, bufferSize, true);
@@ -976,7 +976,7 @@ do_cache_io(void* _cacheRef, off_t offset, addr_t buffer,
 					const size_t bytes = min_c(
 						size_t(B_PAGE_SIZE - copyPageOffset), copyLeft);
 					status = vm_memcpy_from_physical((void*)copyBuffer,
-						(phys_addr_t)run[copied]->physical_page_number
+						(phys_addr_t)run[copied]->PhysicalPageNumber()
 							* B_PAGE_SIZE + copyPageOffset, bytes, userBuffer);
 					if (status != B_OK)
 						break;
@@ -1049,7 +1049,7 @@ do_cache_io(void* _cacheRef, off_t offset, addr_t buffer,
 
 				// copy the contents of the page already in memory
 				phys_addr_t pageAddress
-					= (phys_addr_t)page->physical_page_number * B_PAGE_SIZE
+					= (phys_addr_t)page->PhysicalPageNumber() * B_PAGE_SIZE
 						+ pageOffset;
 				bool userBuffer = IS_USER_ADDRESS(buffer);
 				if (doWrite) {
@@ -1560,7 +1560,7 @@ file_cache_init(void)
 		PAGE_STATE_WIRED | VM_PAGE_ALLOC_CLEAR);
 	vm_page_unreserve_pages(&reservation);
 
-	sZeroPage = (phys_addr_t)page->physical_page_number * B_PAGE_SIZE;
+	sZeroPage = (phys_addr_t)page->PhysicalPageNumber() * B_PAGE_SIZE;
 
 	for (uint32 i = 0; i < kZeroVecCount; i++) {
 		sZeroVecs[i].base = sZeroPage;

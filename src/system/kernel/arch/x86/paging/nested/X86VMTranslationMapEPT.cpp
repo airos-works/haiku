@@ -404,7 +404,7 @@ X86VMTranslationMapEPT::UnmapPages(VMArea* area, addr_t base, size_t size,
 	uint32 freeFlags = CACHE_DONT_WAIT_FOR_MEMORY
 		| (isKernelSpace ? CACHE_DONT_LOCK_KERNEL_SPACE : 0);
 	while (vm_page_mapping* mapping = queue.RemoveHead())
-		vm_free_page_mapping(mapping->page->physical_page_number, mapping, freeFlags);
+		vm_free_page_mapping(mapping->page->PhysicalPageNumber(), mapping, freeFlags);
 }
 
 

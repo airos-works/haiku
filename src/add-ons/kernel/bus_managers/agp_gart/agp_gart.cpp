@@ -681,7 +681,7 @@ Aperture::BindMemory(aperture_memory *memory, addr_t address, size_t size)
 				page = memory->pages[index];
 
 			physicalAddress
-				= (phys_addr_t)page->physical_page_number << PAGE_SHIFT;
+				= (phys_addr_t)page->PhysicalPageNumber() << PAGE_SHIFT;
 		}
 
 		status = fModule->bind_page(fPrivateAperture, start + offset,
@@ -1056,7 +1056,7 @@ allocate_memory(aperture_id id, size_t size, size_t alignment, uint32 flags,
 	if (_physicalBase != NULL && (flags & B_APERTURE_NEED_PHYSICAL) != 0) {
 #if !defined(GART_TEST)
 		*_physicalBase
-			= (phys_addr_t)memory->page->physical_page_number * B_PAGE_SIZE;
+			= (phys_addr_t)memory->page->PhysicalPageNumber() * B_PAGE_SIZE;
 #else
 		physical_entry entry;
 		status = get_memory_map((void *)memory->base, B_PAGE_SIZE, &entry, 1);

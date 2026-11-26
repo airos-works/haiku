@@ -550,7 +550,7 @@ map_tmap(vm_translation_map *map, addr_t va, addr_t pa, uint32 attributes)
 
 		DEBUG_PAGE_ACCESS_END(page);
 
-		pgdir = page->physical_page_number * B_PAGE_SIZE;
+		pgdir = page->PhysicalPageNumber() * B_PAGE_SIZE;
 
 		TRACE(("map_tmap: asked for free page for pgdir. 0x%lx\n", pgdir));
 
@@ -595,7 +595,7 @@ map_tmap(vm_translation_map *map, addr_t va, addr_t pa, uint32 attributes)
 
 		DEBUG_PAGE_ACCESS_END(page);
 
-		pgtable = page->physical_page_number * B_PAGE_SIZE;
+		pgtable = page->PhysicalPageNumber() * B_PAGE_SIZE;
 
 		TRACE(("map_tmap: asked for free page for pgtable. 0x%lx\n", pgtable));
 

@@ -395,7 +395,7 @@ X86VMTranslationMapPAE::Map(addr_t virtualAddress, phys_addr_t physicalAddress,
 		DEBUG_PAGE_ACCESS_END(page);
 
 		phys_addr_t physicalPageTable
-			= (phys_addr_t)page->physical_page_number * B_PAGE_SIZE;
+			= (phys_addr_t)page->PhysicalPageNumber() * B_PAGE_SIZE;
 
 		TRACE("X86VMTranslationMapPAE::Map(): asked for free page for "
 			"page table: %#" B_PRIxPHYSADDR "\n", physicalPageTable);
@@ -661,7 +661,7 @@ X86VMTranslationMapPAE::UnmapPages(VMArea* area, addr_t base, size_t size,
 	uint32 freeFlags = CACHE_DONT_WAIT_FOR_MEMORY
 		| (isKernelSpace ? CACHE_DONT_LOCK_KERNEL_SPACE : 0);
 	while (vm_page_mapping* mapping = queue.RemoveHead())
-		vm_free_page_mapping(mapping->page->physical_page_number, mapping, freeFlags);
+		vm_free_page_mapping(mapping->page->PhysicalPageNumber(), mapping, freeFlags);
 }
 
 

@@ -434,7 +434,7 @@ wired_area_memory_map(area_id id, size_t offset, size_t size,
 			return B_BAD_ADDRESS;
 		}
 		entries[count].address
-			= (phys_addr_t)page->physical_page_number * B_PAGE_SIZE;
+			= (phys_addr_t)page->PhysicalPageNumber() * B_PAGE_SIZE;
 		entries[count].size = B_PAGE_SIZE;
 		count++;
 	}

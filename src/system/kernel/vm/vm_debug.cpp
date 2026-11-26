@@ -657,7 +657,7 @@ dump_mapping_info(int argc, char** argv)
 		phys_addr_t physicalAddress;
 		if (pageLookup) {
 			vm_page* page = (vm_page*)(addr_t)addressValue;
-			physicalAddress = page->physical_page_number * B_PAGE_SIZE;
+			physicalAddress = page->PhysicalPageNumber() * B_PAGE_SIZE;
 		} else {
 			physicalAddress = (phys_addr_t)addressValue;
 			physicalAddress -= physicalAddress % B_PAGE_SIZE;
@@ -819,7 +819,7 @@ vm_debug_copy_page_memory(team_id teamID, void* unsafeMemory, void* buffer,
 		return B_UNSUPPORTED;
 
 	// copy from/to physical memory
-	phys_addr_t physicalAddress = page->physical_page_number * B_PAGE_SIZE
+	phys_addr_t physicalAddress = page->PhysicalPageNumber() * B_PAGE_SIZE
 		+ (addr_t)unsafeMemory % B_PAGE_SIZE;
 
 	if (copyToUnsafe) {

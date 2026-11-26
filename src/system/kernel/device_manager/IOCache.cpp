@@ -29,7 +29,7 @@
 static inline bool
 page_physical_number_less(const vm_page* a, const vm_page* b)
 {
-	return a->physical_page_number < b->physical_page_number;
+	return a->PhysicalPageNumber() < b->PhysicalPageNumber();
 }
 
 
@@ -535,7 +535,7 @@ IOCache::_TransferPages(size_t firstPage, size_t pageCount, bool isWrite,
 	phys_addr_t vecsEndAddress = 0;
 	for (size_t i = firstPage; i < endPage; i++) {
 		phys_addr_t pageAddress
-			= (phys_addr_t)fPages[i]->physical_page_number * B_PAGE_SIZE;
+			= (phys_addr_t)fPages[i]->PhysicalPageNumber() * B_PAGE_SIZE;
 		if (vecCount == 0 || pageAddress != vecsEndAddress) {
 			fVecs[vecCount].base = pageAddress;
 			fVecs[vecCount++].length = B_PAGE_SIZE;
@@ -683,7 +683,7 @@ IOCache::_CopyPages(IORequest* request, size_t pagesRelativeOffset,
 			void* handle;
 			addr_t address;
 			error = vm_get_physical_page(
-				fPages[i]->physical_page_number * B_PAGE_SIZE, &address,
+				fPages[i]->PhysicalPageNumber() * B_PAGE_SIZE, &address,
 				&handle);
 			if (error != B_OK)
 				return error;
@@ -754,7 +754,7 @@ IOCache::_MapPages(size_t firstPage, size_t endPage)
 			"page: %p @! page -m %p", page, page);
 
 		translationMap->Map((addr_t)fAreaBase + i * B_PAGE_SIZE,
-			page->physical_page_number * B_PAGE_SIZE,
+			page->PhysicalPageNumber() * B_PAGE_SIZE,
 			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, 0, &fMappingReservation);
 		// NOTE: We don't increment gMappedPagesCount. Our pages have state
 		// PAGE_STATE_UNUSED anyway and we map them only for a short time.

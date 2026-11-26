@@ -366,7 +366,7 @@ guarded_heap_allocate(guarded_heap& heap, size_t size, size_t alignment,
 		vm_page* page = vm_page_allocate_page(&reservation,
 			PAGE_STATE_WIRED | VM_PAGE_ALLOC_CLEAR);
 		heap.cache->InsertPage(page, mapAddress);
-		map->Map(mapAddress, page->physical_page_number * B_PAGE_SIZE,
+		map->Map(mapAddress, page->PhysicalPageNumber() * B_PAGE_SIZE,
 			B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
 			heap.cache->areas.First()->MemoryType(), &reservation);
 		page->IncrementWiredCount();

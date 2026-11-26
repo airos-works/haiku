@@ -94,7 +94,7 @@ RISCV64VMTranslationMap::LookupPte(addr_t virtAdr, bool alloc,
 			return NULL;
 		vm_page* page = vm_page_allocate_page(reservation,
 			PAGE_STATE_WIRED | VM_PAGE_ALLOC_CLEAR);
-		fPageTable = page->physical_page_number * B_PAGE_SIZE;
+		fPageTable = page->PhysicalPageNumber() * B_PAGE_SIZE;
 		if (fPageTable == 0)
 			return NULL;
 		DEBUG_PAGE_ACCESS_END(page);
@@ -122,7 +122,7 @@ RISCV64VMTranslationMap::LookupPte(addr_t virtAdr, bool alloc,
 				return NULL;
 			vm_page* page = vm_page_allocate_page(reservation,
 				PAGE_STATE_WIRED | VM_PAGE_ALLOC_CLEAR);
-			page_num_t ppn = page->physical_page_number;
+			page_num_t ppn = page->PhysicalPageNumber();
 			if (ppn == 0)
 				return NULL;
 			DEBUG_PAGE_ACCESS_END(page);
@@ -413,7 +413,7 @@ RISCV64VMTranslationMap::UnmapPages(VMArea* area, addr_t base, size_t size,
 		| (isKernelSpace ? CACHE_DONT_LOCK_KERNEL_SPACE : 0);
 
 	while (vm_page_mapping* mapping = queue.RemoveHead())
-		vm_free_page_mapping(mapping->page->physical_page_number, mapping, freeFlags);
+		vm_free_page_mapping(mapping->page->PhysicalPageNumber(), mapping, freeFlags);
 }
 
 

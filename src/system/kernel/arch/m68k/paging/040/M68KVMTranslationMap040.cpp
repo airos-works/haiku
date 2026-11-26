@@ -243,7 +243,7 @@ M68KVMTranslationMap040::Map(addr_t va, phys_addr_t pa, uint32 attributes,
 
 		DEBUG_PAGE_ACCESS_END(page);
 
-		pgdir = (phys_addr_t)page->physical_page_number * B_PAGE_SIZE;
+		pgdir = (phys_addr_t)page->PhysicalPageNumber() * B_PAGE_SIZE;
 
 		TRACE("::Map: asked for free page for pgdir. 0x%lx\n", pgdir);
 
@@ -294,7 +294,7 @@ M68KVMTranslationMap040::Map(addr_t va, phys_addr_t pa, uint32 attributes,
 
 		DEBUG_PAGE_ACCESS_END(page);
 
-		pgtable = (phys_addr_t)page->physical_page_number * B_PAGE_SIZE;
+		pgtable = (phys_addr_t)page->PhysicalPageNumber() * B_PAGE_SIZE;
 
 		TRACE("::Map: asked for free page for pgtable. 0x%lx\n", pgtable);
 
@@ -609,7 +609,7 @@ M68KVMTranslationMap040::UnmapPages(VMArea* area, addr_t base, size_t size,
 	uint32 freeFlags = CACHE_DONT_WAIT_FOR_MEMORY
 		| (isKernelSpace ? CACHE_DONT_LOCK_KERNEL_SPACE : 0);
 	while (vm_page_mapping* mapping = queue.RemoveHead())
-		vm_free_page_mapping(mapping->page->physical_page_number, mapping, freeFlags);
+		vm_free_page_mapping(mapping->page->PhysicalPageNumber(), mapping, freeFlags);
 }
 
 

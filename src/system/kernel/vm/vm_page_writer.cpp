@@ -323,7 +323,7 @@ PageWriteTransfer::SetTo(PageWriterRun* run, vm_page* page, int32 maxPages)
 	fMaxPages = maxPages;
 	fStatus = B_OK;
 
-	fVecs[0].base = (phys_addr_t)page->physical_page_number << PAGE_SHIFT;
+	fVecs[0].base = (phys_addr_t)page->PhysicalPageNumber() << PAGE_SHIFT;
 	fVecs[0].length = B_PAGE_SIZE;
 	fVecCount = 1;
 }
@@ -341,7 +341,7 @@ PageWriteTransfer::AddPage(vm_page* page)
 	phys_addr_t nextBase = fVecs[fVecCount - 1].base
 		+ fVecs[fVecCount - 1].length;
 
-	if ((phys_addr_t)page->physical_page_number << PAGE_SHIFT == nextBase
+	if ((phys_addr_t)page->PhysicalPageNumber() << PAGE_SHIFT == nextBase
 		&& (off_t)page->cache_offset == fOffset + fPageCount) {
 		// append to last iovec
 		fVecs[fVecCount - 1].length += B_PAGE_SIZE;
@@ -350,7 +350,7 @@ PageWriteTransfer::AddPage(vm_page* page)
 	}
 
 	nextBase = fVecs[0].base - B_PAGE_SIZE;
-	if ((phys_addr_t)page->physical_page_number << PAGE_SHIFT == nextBase
+	if ((phys_addr_t)page->PhysicalPageNumber() << PAGE_SHIFT == nextBase
 		&& (off_t)page->cache_offset == fOffset - 1) {
 		// prepend to first iovec and adjust offset
 		fVecs[0].base = nextBase;
@@ -376,7 +376,7 @@ PageWriteTransfer::AddPage(vm_page* page)
 			vectorIndex = fVecCount;
 
 		fVecs[vectorIndex].base
-			= (phys_addr_t)page->physical_page_number << PAGE_SHIFT;
+			= (phys_addr_t)page->PhysicalPageNumber() << PAGE_SHIFT;
 		fVecs[vectorIndex].length = B_PAGE_SIZE;
 
 		fVecCount++;

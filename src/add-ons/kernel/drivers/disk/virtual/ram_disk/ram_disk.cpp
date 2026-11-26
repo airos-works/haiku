@@ -463,11 +463,11 @@ struct RawDevice : Device, DoublyLinkedListLinkImpl<RawDevice> {
 			for (size_t i = 0; i < pagesToWrite; i++) {
 				if (vm_page* page = pages[i]) {
 					error = vm_memcpy_from_physical(buffer + i * B_PAGE_SIZE,
-						page->physical_page_number * B_PAGE_SIZE, B_PAGE_SIZE,
+						page->PhysicalPageNumber() * B_PAGE_SIZE, B_PAGE_SIZE,
 						false);
 					if (error != B_OK) {
 						dprintf("ramdisk: error copying page %" B_PRIu64
-							" data: %s\n", (uint64)page->physical_page_number,
+							" data: %s\n", (uint64)page->PhysicalPageNumber(),
 							strerror(error));
 						break;
 					}
@@ -700,7 +700,7 @@ private:
 			thread_pin_to_current_cpu(thread);
 			addr_t virtualAddress;
 			status_t error = vm_get_physical_page_current_cpu(
-				page->physical_page_number * B_PAGE_SIZE, &virtualAddress,
+				page->PhysicalPageNumber() * B_PAGE_SIZE, &virtualAddress,
 				&handle);
 			if (error != B_OK) {
 				thread_unpin_from_current_cpu(thread);
@@ -813,7 +813,7 @@ private:
 			for (size_t i = 0; i < pagesRead; i++) {
 				vm_page* page = pages[i];
 				error = vm_memcpy_to_physical(
-					page->physical_page_number * B_PAGE_SIZE,
+					page->PhysicalPageNumber() * B_PAGE_SIZE,
 					buffer.Get() + i * B_PAGE_SIZE, B_PAGE_SIZE, false);
 				if (error != B_OK)
 					break;

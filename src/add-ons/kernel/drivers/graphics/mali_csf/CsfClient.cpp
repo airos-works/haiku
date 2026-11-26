@@ -727,7 +727,7 @@ ReferenceContiguousPages(VMArea* area, addr_t address, size_t bytes, uint64* pag
 			status = B_BAD_ADDRESS;
 			break;
 		}
-		pages[i] = (uint64)page->physical_page_number * B_PAGE_SIZE;
+		pages[i] = (uint64)page->PhysicalPageNumber() * B_PAGE_SIZE;
 		if (!GpuPageTable::ValidPhysical(pages[i]))
 			status = B_BAD_VALUE;
 	}

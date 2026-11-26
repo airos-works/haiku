@@ -86,6 +86,12 @@ struct vm_page *vm_page_allocate_page_run(uint32 flags, page_num_t length,
 struct vm_page *vm_page_at_index(int32 index);
 struct vm_page *vm_lookup_page(page_num_t pageNumber);
 bool vm_page_is_dummy(struct vm_page *page);
+page_num_t vm_page_physical_page_number(const struct vm_page *page);
+	// The same as vm_page::PhysicalPageNumber(), but out of line: for
+	// add-ons built outside the tree, so that they do not depend on how the
+	// number is found. They can test for it with
+	// HAVE_VM_PAGE_PHYSICAL_PAGE_NUMBER.
+#define HAVE_VM_PAGE_PHYSICAL_PAGE_NUMBER	1
 
 #ifdef __cplusplus
 }

@@ -747,7 +747,7 @@ static void
 list_page(vm_page* page)
 {
 	kprintf("0x%08" B_PRIxADDR " ",
-		(addr_t)(page->physical_page_number * B_PAGE_SIZE));
+		(addr_t)(page->PhysicalPageNumber() * B_PAGE_SIZE));
 	switch (page->State()) {
 		case PAGE_STATE_ACTIVE:   kprintf("A"); break;
 		case PAGE_STATE_INACTIVE: kprintf("I"); break;
@@ -963,7 +963,7 @@ dump_page_long(int argc, char **argv)
 
 	kprintf("queue_next,prev: %p, %p\n", page->queue_link.next,
 		page->queue_link.previous);
-	kprintf("physical_number: %#" B_PRIxPHYSADDR "\n", page->physical_page_number);
+	kprintf("physical_number: %#" B_PRIxPHYSADDR "\n", page->PhysicalPageNumber());
 	kprintf("cache:           %p\n", page->Cache());
 	kprintf("cache_offset:    %" B_PRIuPHYSADDR "\n", page->cache_offset);
 	kprintf("cache_next:      %p\n", page->cache_next);
@@ -1025,7 +1025,7 @@ dump_page_long(int argc, char **argv)
 		while (addressSpace != NULL) {
 			callback.fAddressSpace = addressSpace;
 			addressSpace->TranslationMap()->DebugGetReverseMappingInfo(
-				page->physical_page_number * B_PAGE_SIZE, callback);
+				page->PhysicalPageNumber() * B_PAGE_SIZE, callback);
 			addressSpace = VMAddressSpace::DebugNext(addressSpace);
 		}
 	}
@@ -1173,10 +1173,10 @@ dump_page_stats(int argc, char **argv)
 	kprintf("mapped pages: %" B_PRId32 "\n", vm_page_mapped_pages_count());
 	kprintf("longest free pages run: %" B_PRIuPHYSADDR " pages (at %"
 		B_PRIuPHYSADDR ")\n", longestFreeRun.Length(),
-		sPages[longestFreeRun.start].physical_page_number);
+		sPages[longestFreeRun.start].PhysicalPageNumber());
 	kprintf("longest free/cached pages run: %" B_PRIuPHYSADDR " pages (at %"
 		B_PRIuPHYSADDR ")\n", longestCachedRun.Length(),
-		sPages[longestCachedRun.start].physical_page_number);
+		sPages[longestCachedRun.start].PhysicalPageNumber());
 
 	kprintf("waiting threads:\n");
 	for (PageReservationWaiterList::Iterator it
@@ -1773,7 +1773,7 @@ free_page(vm_page* page, bool clear)
 	if (fromQueue != NULL)
 		fromQueue->RemoveUnlocked(page);
 
-	TA(FreePage(page->physical_page_number));
+	TA(FreePage(page->PhysicalPageNumber()));
 
 #if VM_PAGE_ALLOCATION_TRACKING_AVAILABLE
 	page->allocation_tracking_info.Clear();
@@ -1867,7 +1867,7 @@ set_page_state(vm_page *page, int pageState)
 static void
 clear_page(struct vm_page *page)
 {
-	vm_memset_physical(page->physical_page_number << PAGE_SHIFT, 0,
+	vm_memset_physical(page->PhysicalPageNumber() << PAGE_SHIFT, 0,
 		B_PAGE_SIZE);
 }
 
@@ -3138,9 +3138,9 @@ vm_page_allocate_page(vm_page_reservation* reservation, uint32 flags)
 
 #if VM_PAGE_ALLOCATION_TRACKING_AVAILABLE
 	page->allocation_tracking_info.Init(
-		TA(AllocatePage(page->physical_page_number)));
+		TA(AllocatePage(page->PhysicalPageNumber())));
 #else
-	TA(AllocatePage(page->physical_page_number));
+	TA(AllocatePage(page->PhysicalPageNumber()));
 #endif
 
 	return page;
@@ -3515,6 +3515,13 @@ bool
 vm_page_is_dummy(struct vm_page *page)
 {
 	return page < sPages || page >= sPages + sNumPages;
+}
+
+
+page_num_t
+vm_page_physical_page_number(const struct vm_page *page)
+{
+	return page->PhysicalPageNumber();
 }
 
 

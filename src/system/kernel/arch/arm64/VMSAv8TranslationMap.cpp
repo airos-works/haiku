@@ -396,7 +396,7 @@ VMSAv8TranslationMap::GetOrMakeTable(phys_addr_t ptPa, int level, int index,
 	} else if (reservation != nullptr) {
 		// Create new table there
 		vm_page* page = vm_page_allocate_page(reservation, PAGE_STATE_WIRED | VM_PAGE_ALLOC_CLEAR);
-		phys_addr_t newTablePa = page->physical_page_number << fPageBits;
+		phys_addr_t newTablePa = page->PhysicalPageNumber() << fPageBits;
 		DEBUG_PAGE_ACCESS_END(page);
 
 		// We only create mappings at the final level so we don't need to handle
@@ -643,7 +643,7 @@ VMSAv8TranslationMap::Map(addr_t va, phys_addr_t pa, uint32 attributes, uint32 m
 	if (fPageTable == 0) {
 		vm_page* page = vm_page_allocate_page(reservation, PAGE_STATE_WIRED | VM_PAGE_ALLOC_CLEAR);
 		DEBUG_PAGE_ACCESS_END(page);
-		fPageTable = page->physical_page_number << fPageBits;
+		fPageTable = page->PhysicalPageNumber() << fPageBits;
 	}
 
 	ProcessRange(fPageTable, fInitialLevel, va, B_PAGE_SIZE, reservation,
@@ -791,7 +791,7 @@ VMSAv8TranslationMap::UnmapPages(VMArea* area, addr_t address, size_t size,
 		| (isKernelSpace ? CACHE_DONT_LOCK_KERNEL_SPACE : 0);
 
 	while (vm_page_mapping* mapping = queue.RemoveHead())
-		vm_free_page_mapping(mapping->page->physical_page_number, mapping, freeFlags);
+		vm_free_page_mapping(mapping->page->PhysicalPageNumber(), mapping, freeFlags);
 }
 
 
@@ -1196,7 +1196,7 @@ VMSAv8TranslationMap::MapLarge(addr_t va, phys_addr_t pa, uint32 attributes,
 		vm_page* page = vm_page_allocate_page(reservation,
 			PAGE_STATE_WIRED | VM_PAGE_ALLOC_CLEAR);
 		DEBUG_PAGE_ACCESS_END(page);
-		fPageTable = page->physical_page_number << fPageBits;
+		fPageTable = page->PhysicalPageNumber() << fPageBits;
 	}
 
 	uint64_t* entry = LargePageEntry(va, reservation);
@@ -1269,7 +1269,7 @@ VMSAv8TranslationMap::SplitLargePage(addr_t va, uint64_t* entry)
 	vm_page* page = vm_page_allocate_page(&fSplitReservation,
 		PAGE_STATE_WIRED | VM_PAGE_ALLOC_CLEAR);
 	DEBUG_PAGE_ACCESS_END(page);
-	phys_addr_t tablePa = page->physical_page_number << fPageBits;
+	phys_addr_t tablePa = page->PhysicalPageNumber() << fPageBits;
 	uint64_t* table = TableFromPa(tablePa);
 
 	const size_t largeSize = LargePageSize();

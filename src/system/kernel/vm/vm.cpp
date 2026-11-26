@@ -743,7 +743,7 @@ map_page(VMArea* area, vm_page* page, addr_t address, uint32 protection,
 		DEBUG_PAGE_ACCESS_CHECK(page);
 
 		bool isKernelSpace = area->address_space == VMAddressSpace::Kernel();
-		vm_page_mapping* mapping = allocate_page_mapping(page->physical_page_number,
+		vm_page_mapping* mapping = allocate_page_mapping(page->PhysicalPageNumber(),
 			CACHE_DONT_WAIT_FOR_MEMORY
 				| (isKernelSpace ? CACHE_DONT_LOCK_KERNEL_SPACE : 0));
 		if (mapping == NULL)
@@ -754,7 +754,7 @@ map_page(VMArea* area, vm_page* page, addr_t address, uint32 protection,
 
 		map->Lock();
 
-		map->Map(address, page->physical_page_number * B_PAGE_SIZE, protection,
+		map->Map(address, page->PhysicalPageNumber() * B_PAGE_SIZE, protection,
 			area->MemoryType(), reservation);
 
 		// insert mapping into lists
@@ -769,7 +769,7 @@ map_page(VMArea* area, vm_page* page, addr_t address, uint32 protection,
 		DEBUG_PAGE_ACCESS_CHECK(page);
 
 		map->Lock();
-		map->Map(address, page->physical_page_number * B_PAGE_SIZE, protection,
+		map->Map(address, page->PhysicalPageNumber() * B_PAGE_SIZE, protection,
 			area->MemoryType(), reservation);
 		map->Unlock();
 
@@ -1982,7 +1982,7 @@ vm_create_anonymous_area(team_id team, const char *name, addr_t size,
 			// just map them in the address space
 			VMTranslationMap* map = addressSpace->TranslationMap();
 			phys_addr_t physicalAddress
-				= (phys_addr_t)page->physical_page_number * B_PAGE_SIZE;
+				= (phys_addr_t)page->PhysicalPageNumber() * B_PAGE_SIZE;
 			addr_t virtualAddress = area->Base();
 			off_t offset = 0;
 
@@ -2027,7 +2027,7 @@ vm_create_anonymous_area(team_id team, const char *name, addr_t size,
 err1:
 	if (wiring == B_CONTIGUOUS) {
 		// we had reserved the area space upfront...
-		phys_addr_t pageNumber = page->physical_page_number;
+		phys_addr_t pageNumber = page->PhysicalPageNumber();
 		int32 i;
 		for (i = size / B_PAGE_SIZE; i-- > 0; pageNumber++) {
 			page = vm_lookup_page(pageNumber);
@@ -3076,8 +3076,8 @@ vm_copy_on_write_area(VMCache* lowerCache,
 					wiredPagesReservation, PAGE_STATE_ACTIVE);
 
 				vm_memcpy_physical_page(
-					copiedPage->physical_page_number * B_PAGE_SIZE,
-					page->physical_page_number * B_PAGE_SIZE);
+					copiedPage->PhysicalPageNumber() * B_PAGE_SIZE,
+					page->PhysicalPageNumber() * B_PAGE_SIZE);
 
 				// move the wired page to the upper cache (note: removing is OK
 				// with the SplayTree iterator) and insert the copy
@@ -4229,7 +4229,7 @@ fault_read_pages(PageFaultContext& context, VMCache* cache)
 	generic_size_t vecsLength = 0;
 	for (uint32 i = 0; i <= pageCount && status == B_OK; i++) {
 		phys_addr_t base = i < pageCount
-			? (phys_addr_t)pages[i]->physical_page_number * B_PAGE_SIZE : 0;
+			? (phys_addr_t)pages[i]->PhysicalPageNumber() * B_PAGE_SIZE : 0;
 		if (i < pageCount && vecCount > 0
 			&& vecs[vecCount - 1].base + vecs[vecCount - 1].length == base) {
 			vecs[vecCount - 1].length += B_PAGE_SIZE;
@@ -4260,7 +4260,7 @@ fault_read_pages(PageFaultContext& context, VMCache* cache)
 	const status_t aroundStatus = status;
 	if (status < B_OK && pageCount > 1) {
 		generic_io_vec vec;
-		vec.base = (phys_addr_t)pages[faultIndex]->physical_page_number
+		vec.base = (phys_addr_t)pages[faultIndex]->PhysicalPageNumber()
 			* B_PAGE_SIZE;
 		vec.length = B_PAGE_SIZE;
 		generic_size_t bytesRead = B_PAGE_SIZE;
@@ -4535,7 +4535,7 @@ fault_map_large_page(PageFaultContext& context, VMArea* area, addr_t address)
 	page_num_t mapped = 0;
 	for (; mapped < count; mapped++) {
 		vm_page_mapping* mapping = allocate_page_mapping(
-			pages[mapped].physical_page_number, mappingFlags);
+			pages[mapped].PhysicalPageNumber(), mappingFlags);
 		if (mapping == NULL)
 			break;
 		// The objects come from per page number caches: keep each with its
@@ -4546,13 +4546,13 @@ fault_map_large_page(PageFaultContext& context, VMArea* area, addr_t address)
 
 	map->Lock();
 	status_t status = mapped < count ? B_NO_MEMORY : map->MapLarge(base,
-		(phys_addr_t)pages[0].physical_page_number * B_PAGE_SIZE,
+		(phys_addr_t)pages[0].PhysicalPageNumber() * B_PAGE_SIZE,
 		get_area_page_protection(area, base), area->MemoryType(),
 		&context.reservation);
 	if (status != B_OK) {
 		map->Unlock();
 		while (vm_page_mapping* mapping = mappings.RemoveHead()) {
-			vm_free_page_mapping(mapping->page->physical_page_number, mapping,
+			vm_free_page_mapping(mapping->page->PhysicalPageNumber(), mapping,
 				mappingFlags);
 		}
 		for (page_num_t i = 0; i < count; i++)
@@ -4647,7 +4647,7 @@ fault_get_page(PageFaultContext& context)
 		page = vm_page_allocate_page(&context.reservation,
 			PAGE_STATE_ACTIVE | VM_PAGE_ALLOC_CLEAR);
 		FTRACE(("vm_soft_fault: just allocated page 0x%" B_PRIxPHYSADDR "\n",
-			page->physical_page_number));
+			page->PhysicalPageNumber()));
 
 		// insert the new page into our cache
 		cache->InsertPage(page, context.cacheOffset);
@@ -4671,8 +4671,8 @@ fault_get_page(PageFaultContext& context)
 		context.cacheChainLocker.UnlockKeepRefs(true);
 
 		// copy the page
-		vm_memcpy_physical_page(page->physical_page_number * B_PAGE_SIZE,
-			sourcePage->physical_page_number * B_PAGE_SIZE);
+		vm_memcpy_physical_page(page->PhysicalPageNumber() * B_PAGE_SIZE,
+			sourcePage->PhysicalPageNumber() * B_PAGE_SIZE);
 
 		context.cacheChainLocker.RelockCaches(true);
 		sourcePage->Cache()->MarkPageUnbusy(sourcePage);
@@ -4879,7 +4879,7 @@ vm_soft_fault(VMAddressSpace* addressSpace, addr_t originalAddress,
 		// mapped (a write to one mapped read-only, as after an mprotect()
 		// of JIT code) just changes its protection below.
 		if (area->wiring == B_NO_LOCK && !wasMapped) {
-			mapping = allocate_page_mapping(context.page->physical_page_number,
+			mapping = allocate_page_mapping(context.page->PhysicalPageNumber(),
 				CACHE_DONT_WAIT_FOR_MEMORY
 					| (addressSpace == VMAddressSpace::Kernel()
 						? CACHE_DONT_LOCK_KERNEL_SPACE : 0));
@@ -4911,7 +4911,7 @@ vm_soft_fault(VMAddressSpace* addressSpace, addr_t originalAddress,
 			&& (mapping != NULL || (area->wiring != B_NO_LOCK && !wasMapped))) {
 			DEBUG_PAGE_ACCESS_CHECK(context.page);
 			context.map->Map(address,
-				context.page->physical_page_number * B_PAGE_SIZE, newProtection,
+				context.page->PhysicalPageNumber() * B_PAGE_SIZE, newProtection,
 				area->MemoryType(), &context.reservation);
 			if (mapping != NULL) {
 				mapping->page = context.page;
@@ -4928,7 +4928,7 @@ vm_soft_fault(VMAddressSpace* addressSpace, addr_t originalAddress,
 		context.map->Unlock();
 
 		if (mapping != NULL) {
-			vm_free_page_mapping(context.page->physical_page_number, mapping,
+			vm_free_page_mapping(context.page->PhysicalPageNumber(), mapping,
 				CACHE_DONT_WAIT_FOR_MEMORY
 					| (addressSpace == VMAddressSpace::Kernel()
 						? CACHE_DONT_LOCK_KERNEL_SPACE : 0));
@@ -4998,7 +4998,7 @@ vm_soft_fault(VMAddressSpace* addressSpace, addr_t originalAddress,
 				context.UnlockAll();
 
 				if (object_cache_reserve(page_mapping_object_cache_for(
-							context.page->physical_page_number), 1, 0)
+							context.page->PhysicalPageNumber()), 1, 0)
 						!= B_OK) {
 					// Apparently the situation is serious. (We ought to have
 					// blocked waiting for pages or failed to reserve memory
@@ -5765,7 +5765,7 @@ vm_wire_page(team_id team, addr_t address, bool writable,
 	}
 
 	info->physicalAddress
-		= (phys_addr_t)page->physical_page_number * B_PAGE_SIZE
+		= (phys_addr_t)page->PhysicalPageNumber() * B_PAGE_SIZE
 			+ address % B_PAGE_SIZE;
 	info->page = page;
 

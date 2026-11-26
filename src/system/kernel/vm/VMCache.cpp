@@ -708,7 +708,7 @@ VMCache::Delete()
 		page_count--;
 
 		TRACE(("vm_cache_release_ref: freeing page 0x%lx\n",
-			page->physical_page_number));
+			page->PhysicalPageNumber()));
 		vm_page_free_etc(this, page, &reservation);
 	}
 	vm_page_unreserve_pages(&reservation);
@@ -1212,7 +1212,7 @@ VMCache::Resize(off_t newSize, int priority)
 		if (partialBytes != 0) {
 			vm_page* page = LookupPage(newSize - partialBytes);
 			if (page != NULL) {
-				vm_memset_physical(page->physical_page_number * B_PAGE_SIZE
+				vm_memset_physical(page->PhysicalPageNumber() * B_PAGE_SIZE
 					+ partialBytes, 0, B_PAGE_SIZE - partialBytes);
 			}
 		}
@@ -1550,7 +1550,7 @@ VMCache::Dump(bool showPages) const
 			if (!vm_page_is_dummy(page)) {
 				kprintf("\t%p ppn %#" B_PRIxPHYSADDR " offset %#" B_PRIxPHYSADDR
 					" state %u (%s) wired_count %u\n", page,
-					page->physical_page_number, page->cache_offset,
+					page->PhysicalPageNumber(), page->cache_offset,
 					page->State(), page_state_to_string(page->State()),
 					page->WiredCount());
 			} else {

@@ -475,7 +475,7 @@ X86VMTranslationMap64Bit::UnmapPages(VMArea* area, addr_t base, size_t size,
 	uint32 freeFlags = CACHE_DONT_WAIT_FOR_MEMORY
 		| (isKernelSpace ? CACHE_DONT_LOCK_KERNEL_SPACE : 0);
 	while (vm_page_mapping* mapping = queue.RemoveHead())
-		vm_free_page_mapping(mapping->page->physical_page_number, mapping, freeFlags);
+		vm_free_page_mapping(mapping->page->PhysicalPageNumber(), mapping, freeFlags);
 }
 
 
@@ -924,7 +924,7 @@ X86VMTranslationMap64Bit::_SplitLargePage(addr_t address, uint64* pde)
 		PAGE_STATE_WIRED | VM_PAGE_ALLOC_CLEAR);
 	DEBUG_PAGE_ACCESS_END(page);
 	phys_addr_t physicalTable
-		= (phys_addr_t)page->physical_page_number * B_PAGE_SIZE;
+		= (phys_addr_t)page->PhysicalPageNumber() * B_PAGE_SIZE;
 
 	uint64* table = (uint64*)fPageMapper->GetPageTableAt(physicalTable);
 	phys_addr_t base = oldEntry & X86_64_PDE_ADDRESS_MASK

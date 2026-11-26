@@ -406,7 +406,7 @@ vm_page::IncrementWiredCount()
 inline void
 vm_page::DecrementWiredCount()
 {
-	ASSERT_PRINT(fWiredCount > 0, "page: %#" B_PRIx64, physical_page_number * B_PAGE_SIZE);
+	ASSERT_PRINT(fWiredCount > 0, "page: %#" B_PRIx64, PhysicalPageNumber() * B_PAGE_SIZE);
 
 	if (--fWiredCount == 0)
 		cache_ref->cache->DecrementWiredPagesCount();

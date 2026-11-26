@@ -23,7 +23,7 @@ using BPackageKit::BHPKG::BBufferDataReader;
 static inline bool
 page_physical_number_less(const vm_page* a, const vm_page* b)
 {
-	return a->physical_page_number < b->physical_page_number;
+	return a->PhysicalPageNumber() < b->PhysicalPageNumber();
 }
 
 
@@ -49,7 +49,7 @@ struct CachedDataReader::PagesDataOutput : public BDataIO {
 			size_t toCopy = std::min(bytesRemaining,
 				B_PAGE_SIZE - fInPageOffset);
 			status_t error = vm_memcpy_to_physical(
-				fPages[0]->physical_page_number * B_PAGE_SIZE + fInPageOffset,
+				fPages[0]->PhysicalPageNumber() * B_PAGE_SIZE + fInPageOffset,
 				buffer, toCopy, false);
 			if (error != B_OK)
 				return error;
@@ -370,7 +370,7 @@ CachedDataReader::_WritePages(vm_page** pages, size_t pagesRelativeOffset,
 		void* handle;
 		addr_t address;
 		status_t error = vm_get_physical_page(
-			pages[i]->physical_page_number * B_PAGE_SIZE, &address,
+			pages[i]->PhysicalPageNumber() * B_PAGE_SIZE, &address,
 			&handle);
 		if (error != B_OK)
 			return error;

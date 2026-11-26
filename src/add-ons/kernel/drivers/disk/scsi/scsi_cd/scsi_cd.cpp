@@ -131,7 +131,7 @@ test_capacity(cd_driver_info *info)
 		vm_page* page = vm_page_allocate_page(&reservation,
 			PAGE_STATE_WIRED | VM_PAGE_ALLOC_BUSY);
 
-		entries[numEntries].address = page->physical_page_number * B_PAGE_SIZE;
+		entries[numEntries].address = page->PhysicalPageNumber() * B_PAGE_SIZE;
 		entries[numEntries].size = bytes;
 
 		left -= bytes;

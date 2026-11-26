@@ -863,7 +863,7 @@ X86PagingMethodPAE::Allocate32BitPage(phys_addr_t& _physicalAddress,
 
 	// map the page
 	phys_addr_t physicalAddress
-		= (phys_addr_t)page->physical_page_number * B_PAGE_SIZE;
+		= (phys_addr_t)page->PhysicalPageNumber() * B_PAGE_SIZE;
 	addr_t virtualAddress;
 	if (fPhysicalPageMapper->GetPage(physicalAddress, &virtualAddress, &_handle)
 			!= B_OK) {
