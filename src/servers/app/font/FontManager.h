@@ -73,7 +73,8 @@ protected:
 
 			status_t			_AddFont(FT_Face face, node_ref nodeRef,
 									const char* path,
-									uint16& familyID, uint16& styleID);
+									uint16& familyID, uint16& styleID,
+									bool openOnDemand = false);
 			FontStyle*			_RemoveFont(uint16 familyID, uint16 styleID);
 			void				_RemoveAllFonts();
 

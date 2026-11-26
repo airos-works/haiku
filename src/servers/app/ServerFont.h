@@ -69,7 +69,7 @@ class ServerFont {
 			const char*			Path() const
 									{ return fStyle->Path(); }
 			long				FaceIndex() const
-									{ return fStyle->FreeTypeFace()->face_index; }
+									{ return fStyle->FaceIndex(); }
 
 			void				SetStyle(FontStyle* style);
 			status_t			SetFamilyAndStyle(uint16 familyID,

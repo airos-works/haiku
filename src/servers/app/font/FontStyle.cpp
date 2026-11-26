@@ -16,22 +16,69 @@
 
 #include <FontPrivate.h>
 
+#include <Autolock.h>
 #include <Entry.h>
 
 
 static BLocker sFontLock("font lock");
 
+/*!	The most faces of styles opened on demand that stay open while nothing
+	uses them. Such a face is only needed for the less common queries (glyph
+	shapes, Unicode blocks, the bounding box, the fallback font coverage);
+	this is more than the fallback fonts and the default fonts take.
+*/
+static const int32 kMaxOpenFaces = 32;
+
+FontStyle::OpenFaceList FontStyle::sOpenFaces;
+int32 FontStyle::sOpenFaceCount = 0;
+FT_Library FontStyle::sFaceLibrary = NULL;
+
+
+/*!	Whether the printable ASCII characters of \a face all have the same
+	advance.
+*/
+static bool
+is_full_and_half_fixed(FT_Face face)
+{
+	FT_Int32 loadFlags = FT_LOAD_NO_SCALE | FT_LOAD_TARGET_NORMAL;
+	if (FT_Load_Char(face, (uint32)' ', loadFlags) != 0)
+		return false;
+
+	int firstWidth = face->glyph->advance.x;
+	for (uint32 c = ' ' + 1; c <= 0x7e; c++) {
+		if (FT_Load_Char(face, c, loadFlags) != 0)
+			return false;
+
+		if (face->glyph->advance.x != firstWidth)
+			return false;
+	}
+
+	return true;
+}
+
 
 /*!
 	\brief Constructor
 	\param filepath path to a font file
-	\param face FreeType handle for the font file after it is loaded - it will
-		   be kept open until the FontStyle is destroyed
+	\param face FreeType handle for the font file after it is loaded
+	\param openOnDemand if false, the style keeps \a face open until it is
+		destroyed. If true, it takes what it needs from \a face and closes it;
+		FreeTypeFace() opens the file again when it is asked for the face.
+		A font manager that knows every installed font uses this, as an open
+		face maps its whole file and keeps the pages it read.
 */
 FontStyle::FontStyle(node_ref& nodeRef, const char* path, FT_Face face,
-	FontManager* fontManager)
+	FontManager* fontManager, bool openOnDemand)
 	:
 	fFreeTypeFace(face),
+	fFaceIndex(face->face_index),
+	fOpenOnDemand(openOnDemand),
+	fIsFixedWidth(FT_IS_FIXED_WIDTH(face)),
+	fIsScalable(FT_IS_SCALABLE(face)),
+	fHasKerning(FT_HAS_KERNING(face)),
+	fTunedCount(face->num_fixed_sizes),
+	fGlyphCount(face->num_glyphs),
+	fCharMapCount(face->num_charmaps),
 	fName(face->style_name),
 	fPath(path),
 	fNodeRef(nodeRef),
@@ -71,25 +118,14 @@ FontStyle::FontStyle(node_ref& nodeRef, const char* path, FT_Face face,
 			+ metrics.descender) / size;
 	}
 
-	if (IsFixedWidth())
-		return;
-
 	// manually check if all applicable chars are the same width
+	if (!IsFixedWidth())
+		fFullAndHalfFixed = is_full_and_half_fixed(face);
 
-	FT_Int32 loadFlags = FT_LOAD_NO_SCALE | FT_LOAD_TARGET_NORMAL;
-	if (FT_Load_Char(face, (uint32)' ', loadFlags) != 0)
-		return;
-
-	int firstWidth = face->glyph->advance.x;
-	for (uint32 c = ' ' + 1; c <= 0x7e; c++) {
-		if (FT_Load_Char(face, c, loadFlags) != 0)
-			return;
-
-		if (face->glyph->advance.x != firstWidth)
-			return;
+	if (fOpenOnDemand) {
+		FT_Done_Face(face);
+		fFreeTypeFace = NULL;
 	}
-
-	fFullAndHalfFixed = true;
 }
 
 
@@ -101,7 +137,15 @@ FontStyle::~FontStyle()
 		fFontManager->Unlock();
 	}
 
-	FT_Done_Face(fFreeTypeFace);
+	if (fOpenOnDemand) {
+		BAutolock locker(sFontLock);
+		if (fFreeTypeFace != NULL) {
+			sOpenFaces.Remove(this);
+			sOpenFaceCount--;
+			FT_Done_Face(fFreeTypeFace);
+		}
+	} else
+		FT_Done_Face(fFreeTypeFace);
 
 	if (fFontData != NULL)
 		free(fFontData);
@@ -118,7 +162,41 @@ FontStyle::Lock()
 void
 FontStyle::Unlock()
 {
+	// When the last lock goes, nobody uses a face any more
+	if (sOpenFaceCount > kMaxOpenFaces && sFontLock.IsLocked()
+		&& sFontLock.CountLocks() == 1) {
+		_CloseUnusedFaces();
+	}
+
 	sFontLock.Unlock();
+}
+
+
+/*!	Returns the FreeType face of this style, opening its file again if it was
+	closed. It returns NULL if the file cannot be opened any more.
+*/
+FT_Face
+FontStyle::FreeTypeFace()
+{
+	if (!fOpenOnDemand)
+		return fFreeTypeFace;
+
+	BAutolock locker(sFontLock);
+
+	if (fFreeTypeFace != NULL) {
+		// the most recently used face goes last
+		sOpenFaces.Remove(this);
+		sOpenFaces.Add(this);
+		return fFreeTypeFace;
+	}
+
+	fFreeTypeFace = _OpenFace();
+	if (fFreeTypeFace != NULL) {
+		sOpenFaces.Add(this);
+		sOpenFaceCount++;
+	}
+
+	return fFreeTypeFace;
 }
 
 
@@ -202,28 +280,6 @@ FontStyle::PreservedFace(uint16 face) const
 }
 
 
-status_t
-FontStyle::UpdateFace(FT_Face face)
-{
-	if (!sFontLock.IsLocked()) {
-		debugger("UpdateFace() called without having locked FontStyle!");
-		return B_ERROR;
-	}
-
-	// we only accept the face if it hasn't change its style
-
-	BString name = face->style_name;
-	name.Truncate(B_FONT_STYLE_LENGTH);
-
-	if (name != fName)
-		return B_BAD_VALUE;
-
-	FT_Done_Face(fFreeTypeFace);
-	fFreeTypeFace = face;
-	return B_OK;
-}
-
-
 void
 FontStyle::_SetFontFamily(FontFamily* family, uint16 id)
 {
@@ -232,6 +288,51 @@ FontStyle::_SetFontFamily(FontFamily* family, uint16 id)
 
 	fFamily.SetTo(family);
 	fID = id;
+}
+
+
+/*!	Opens the face of this style from its file. sFontLock must be held: it
+	protects the FreeType library the faces opened on demand share.
+*/
+FT_Face
+FontStyle::_OpenFace()
+{
+	if (sFaceLibrary == NULL && FT_Init_FreeType(&sFaceLibrary) != 0) {
+		sFaceLibrary = NULL;
+		return NULL;
+	}
+
+	FT_Face face;
+	if (FT_New_Face(sFaceLibrary, fPath.Path(), fFaceIndex, &face) != 0)
+		return NULL;
+
+	// the file may have been replaced by another font since it was indexed
+	BString name(face->style_name);
+	name.Truncate(B_FONT_STYLE_LENGTH);
+	if (name != fName) {
+		FT_Done_Face(face);
+		return NULL;
+	}
+
+	return face;
+}
+
+
+/*!	Closes the least recently used faces until no more than kMaxOpenFaces
+	are open. sFontLock must be held, and nobody may use a face.
+*/
+/*static*/ void
+FontStyle::_CloseUnusedFaces()
+{
+	while (sOpenFaceCount > kMaxOpenFaces) {
+		FontStyle* style = sOpenFaces.RemoveHead();
+		if (style == NULL)
+			break;
+
+		FT_Done_Face(style->fFreeTypeFace);
+		style->fFreeTypeFace = NULL;
+		sOpenFaceCount--;
+	}
 }
 
 

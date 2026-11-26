@@ -1165,12 +1165,19 @@ ServerFont::StringWidth(const char *string, int32 numBytes,
 BRect
 ServerFont::BoundingBox()
 {
-	FT_Face face = fStyle->FreeTypeFace();
-
 	if (fBounds.IsValid() &&
 		fBounds.IntegerWidth() > 0 &&
 		fBounds.IntegerHeight() > 0)
 		return fBounds;
+
+	if (!fStyle->Lock())
+		return fBounds;
+
+	FT_Face face = fStyle->FreeTypeFace();
+	if (face == NULL) {
+		fStyle->Unlock();
+		return fBounds;
+	}
 
 	// if font has vector outlines, get the bounding box
 	// from freetype and scale it by the font size
@@ -1208,6 +1215,7 @@ ServerFont::BoundingBox()
 		fBounds.bottom = height / 64.f;
 	}
 
+	fStyle->Unlock();
 	return fBounds;
 }
 

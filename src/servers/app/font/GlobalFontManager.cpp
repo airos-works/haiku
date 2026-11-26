@@ -737,8 +737,12 @@ GlobalFontManager::_AddFont(font_directory& directory, BEntry& entry)
 			if (error != 0)
 				return B_ERROR;
 
+			// The style only keeps what it needs from the face: an open
+			// face per installed style would map and keep part of every
+			// font file.
 			uint16 familyID, styleID;
-			status = FontManager::_AddFont(face, nodeRef, path.Path(), familyID, styleID);
+			status = FontManager::_AddFont(face, nodeRef, path.Path(),
+				familyID, styleID, true);
 			if (status == B_NAME_IN_USE) {
 				status = B_OK;
 				j++;

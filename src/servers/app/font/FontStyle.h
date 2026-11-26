@@ -19,6 +19,8 @@
 #include <Referenceable.h>
 #include <String.h>
 
+#include <util/DoublyLinkedList.h>
+
 #include <ft2build.h>
 #include FT_FREETYPE_H
 
@@ -39,7 +41,8 @@ class ServerFont;
 class FontStyle : public BReferenceable {
 	public:
 						FontStyle(node_ref& nodeRef, const char* path,
-							FT_Face face, FontManager* fontManager);
+							FT_Face face, FontManager* fontManager,
+							bool openOnDemand = false);
 		virtual			~FontStyle();
 
 		const node_ref& NodeRef() const { return fNodeRef; }
@@ -53,7 +56,7 @@ class FontStyle : public BReferenceable {
 	\return true if fixed, false if not
 */
 		bool			IsFixedWidth() const
-							{ return FT_IS_FIXED_WIDTH(fFreeTypeFace); }
+							{ return fIsFixedWidth; }
 
 
 /*	\fn bool FontStyle::IsFullAndHalfFixed()
@@ -69,42 +72,42 @@ class FontStyle : public BReferenceable {
 	\return true if scalable, false if not
 */
 		bool			IsScalable() const
-							{ return FT_IS_SCALABLE(fFreeTypeFace); }
+							{ return fIsScalable; }
 /*!
 	\fn bool FontStyle::HasKerning(void)
 	\brief Determines whether the font has kerning information
 	\return true if kerning info is available, false if not
 */
 		bool			HasKerning() const
-							{ return FT_HAS_KERNING(fFreeTypeFace); }
+							{ return fHasKerning; }
 /*!
 	\fn bool FontStyle::HasTuned(void)
 	\brief Determines whether the font contains strikes
 	\return true if it has strikes included, false if not
 */
 		bool			HasTuned() const
-							{ return FT_HAS_FIXED_SIZES(fFreeTypeFace); }
+							{ return fTunedCount > 0; }
 /*!
 	\fn bool FontStyle::TunedCount(void)
 	\brief Returns the number of strikes the style contains
 	\return The number of strikes the style contains
 */
 		int32			TunedCount() const
-							{ return fFreeTypeFace->num_fixed_sizes; }
+							{ return fTunedCount; }
 /*!
 	\fn bool FontStyle::GlyphCount(void)
 	\brief Returns the number of glyphs in the style
 	\return The number of glyphs the style contains
 */
 		uint16			GlyphCount() const
-							{ return fFreeTypeFace->num_glyphs; }
+							{ return fGlyphCount; }
 /*!
 	\fn bool FontStyle::CharMapCount(void)
 	\brief Returns the number of character maps the style contains
 	\return The number of character maps the style contains
 */
 		uint16			CharMapCount() const
-							{ return fFreeTypeFace->num_charmaps; }
+							{ return fCharMapCount; }
 
 		const char*		Name() const
 							{ return fName.String(); }
@@ -127,10 +130,12 @@ class FontStyle : public BReferenceable {
 		font_file_format FileFormat() const
 							{ return B_TRUETYPE_WINDOWS; }
 
-		FT_Face			FreeTypeFace() const
-							{ return fFreeTypeFace; }
-
-		status_t		UpdateFace(FT_Face face);
+		FT_Face			FreeTypeFace();
+							// The style must be locked while the face is
+							// used: an unused face may be closed when the
+							// last lock is released.
+		long			FaceIndex() const
+							{ return fFaceIndex; }
 
 		FontManager*	Manager() const
 							{ return fFontManager; }
@@ -147,8 +152,22 @@ class FontStyle : public BReferenceable {
 		friend class FontManager;
 		uint16			_TranslateStyleToFace(const char *name) const;
 		void			_SetFontFamily(FontFamily* family, uint16 id);
+		FT_Face			_OpenFace();
+		static void		_CloseUnusedFaces();
+
 	private:
 		FT_Face			fFreeTypeFace;
+		FT_Long			fFaceIndex;
+		bool			fOpenOnDemand;
+		DoublyLinkedListLink<FontStyle> fOpenFaceLink;
+
+		bool			fIsFixedWidth;
+		bool			fIsScalable;
+		bool			fHasKerning;
+		int32			fTunedCount;
+		uint16			fGlyphCount;
+		uint16			fCharMapCount;
+
 		BString			fName;
 		BPath			fPath;
 		node_ref		fNodeRef;
@@ -166,6 +185,13 @@ class FontStyle : public BReferenceable {
 		FT_Byte*		fFontData;
 		uint32			fFontDataSize;
 		FontManager*	fFontManager;
+
+		typedef DoublyLinkedList<FontStyle,
+			DoublyLinkedListMemberGetLink<FontStyle,
+				&FontStyle::fOpenFaceLink> > OpenFaceList;
+		static OpenFaceList	sOpenFaces;
+		static int32	sOpenFaceCount;
+		static FT_Library sFaceLibrary;
 };
 
 #endif	// FONT_STYLE_H_

@@ -305,7 +305,7 @@ FontManager::Revision()
 
 status_t
 FontManager::_AddFont(FT_Face face, node_ref nodeRef, const char* path,
-	uint16& familyID, uint16& styleID)
+	uint16& familyID, uint16& styleID, bool openOnDemand)
 {
 	ASSERT(IsLocked());
 
@@ -331,7 +331,8 @@ FontManager::_AddFont(FT_Face face, node_ref nodeRef, const char* path,
 	FTRACE(("\tadd style: %s, %s\n", face->family_name, face->style_name));
 
 	// the FontStyle takes over ownership of the FT_Face object
-	FontStyle* style = new (std::nothrow) FontStyle(nodeRef, path, face, this);
+	FontStyle* style = new (std::nothrow) FontStyle(nodeRef, path, face, this,
+		openOnDemand);
 
 	if (style == NULL || !family->AddStyle(style)) {
 		delete style;
