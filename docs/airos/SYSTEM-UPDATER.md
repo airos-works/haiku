@@ -45,8 +45,14 @@ does not start is replaced by the one before it without help.
   for a single start, *Go Back to This Version* makes it the current one.
   The boot loader's *Select boot volume/state* menu (hold Shift or Space
   while the computer starts) offers the same versions by name.
-- Each start the desktop runs a boot check (`SystemUpdater --boot-check`),
-  which also looks for a new release and says so in a notification.
+- Each start the desktop runs a boot check (`SystemUpdater --boot-check`):
+  it confirms an update on trial and reports a fallback, needs no network,
+  and quits when that is done.
+- Whenever a network comes up (at start, or later: Wi-Fi that joins late, a
+  cable plugged in) `SystemUpdater --release-check` looks for a new release
+  and says so in a notification, at most once a day: it does nothing if a
+  look succeeded earlier that day (`last-check`), and waits for an update on
+  trial to be confirmed first.
 - The command line does everything the window does: `SystemUpdater --status`,
   `--check`, `--plan`, `--update`, `--restart-into <state>`, `--go-back
   <state>`, `--retry`, `--remove-failed`, `--confirm`, `--prune`.
@@ -167,6 +173,7 @@ System Updater keeps its state on the system volume, in
 | `trial` | System Updater | boot loader | an installed update that has not started yet: its release, the state to fall back to and a token that is new for every trial |
 | `trial-attempts` | kernel | boot loader | one line per start of the release on trial |
 | `log` | System Updater | people | what was done |
+| `last-check` | System Updater | System Updater | when a look at the feed last succeeded (its modification time); the release check looks once a day |
 
 ### Installing an update
 

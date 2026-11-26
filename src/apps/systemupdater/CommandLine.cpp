@@ -9,6 +9,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
 
 #include <Application.h>
 #include <Notification.h>
@@ -43,6 +45,8 @@ static const char* const kUsage =
 	"  --boot-check [--no-wait]\n"
 	"                        what the desktop runs at each start: confirm a\n"
 	"                        new update, report a fallback\n"
+	"  --release-check       the daily look for a new release, run when a\n"
+	"                        network is there; nothing if one succeeded today\n"
 	"  --confirm             confirm the update on trial now\n"
 	"  --prune [<n>]         keep only <n> older versions (default 2)\n"
 	"  --versions-to-keep <n>\n"
@@ -370,39 +374,85 @@ command_boot_check(Updater& updater, bool wait)
 			"is the current version again.");
 	}
 
-	// the daily look for a new release
+	// The look for a new release is a job of its own (--release-check),
+	// started when a network is there: this one is done, offline or not.
+	return error == B_OK ? 0 : 1;
+}
+
+
+//! Whether no look for a new release has succeeded yet today.
+bool
+release_check_due()
+{
+	struct stat st;
+	if (stat(kCheckFile, &st) != 0)
+		return true;
+	time_t now = time(NULL);
+	if (st.st_mtime > now) {
+		// The clock is before the last look: a board without a
+		// battery-backed clock starts in 1970 and nothing has set it yet
+		// (the look itself does, from github.com). No telling: look.
+		return true;
+	}
+	struct tm last, today;
+	localtime_r(&st.st_mtime, &last);
+	localtime_r(&now, &today);
+	return last.tm_year != today.tm_year || last.tm_yday != today.tm_yday;
+}
+
+
+int
+command_release_check(Updater& updater)
+{
 	Settings settings;
 	settings.Load();
+	if (!settings.checkAutomatically)
+		return 0;
+	if (!release_check_due()) {
+		printf("Already looked for a new release today.\n");
+		return 0;
+	}
+
+	// An update on trial is confirmed (or not) by the boot check once the
+	// desktop has stayed up for a while; offer nothing on top of it before.
+	TrialInfo trial;
+	for (int i = 0; i < 36 && SystemState::ReadTrial(trial) == B_OK; i++)
+		snooze(5000000);
 	SystemState state;
-	if (error == B_OK && settings.checkAutomatically && state.Load() == B_OK
-		&& state.RunningLatest() && !state.RestartPending()) {
-		// Wi-Fi may join a while after the desktop is up: try for two minutes
-		Feed feed;
-		BString checkError;
-		status_t checkResult = B_ERROR;
-		for (int attempt = 0; attempt < 7; attempt++) {
-			if (attempt > 0)
-				snooze(20000000);
-			checkResult = updater.Check(feed, checkError);
-			if (checkResult == B_OK || checkResult == B_ENTRY_NOT_FOUND
-				|| checkResult == B_NOT_SUPPORTED
-				|| checkResult == B_MISMATCHED_VALUES) {
-				break;
-			}
-		}
-		if (checkResult != B_OK)
-			Updater::Log("could not check for a new release: %s",
-				checkError.String());
-		if (checkResult == B_OK && feed.Latest() != NULL
-			&& updater.IsNewer(*feed.Latest())) {
-			BString text;
-			text.SetToFormat("%s is available. Open System Updater to see what "
-				"changed and to install it.",
-				Release::TitleForVersion(feed.Latest()->version).String());
-			notify("air/OS update available", text);
+	if (trial.exists || state.Load() != B_OK || !state.RunningLatest()
+		|| state.RestartPending()) {
+		return 0;
+	}
+
+	// The network has just come up: an address or a name server may still
+	// be on its way.
+	Feed feed;
+	BString checkError;
+	status_t checkResult = B_ERROR;
+	for (int attempt = 0; attempt < 3; attempt++) {
+		if (attempt > 0)
+			snooze(15000000);
+		checkResult = updater.Check(feed, checkError);
+		if (checkResult == B_OK || checkResult == B_ENTRY_NOT_FOUND
+			|| checkResult == B_NOT_SUPPORTED
+			|| checkResult == B_MISMATCHED_VALUES) {
+			break;
 		}
 	}
-	return error == B_OK ? 0 : 1;
+	if (checkResult != B_OK) {
+		// the next time a network comes up, or the next start, tries again
+		Updater::Log("could not check for a new release: %s",
+			checkError.String());
+		return 1;
+	}
+	if (feed.Latest() != NULL && updater.IsNewer(*feed.Latest())) {
+		BString text;
+		text.SetToFormat("%s is available. Open System Updater to see what "
+			"changed and to install it.",
+			Release::TitleForVersion(feed.Latest()->version).String());
+		notify("air/OS update available", text);
+	}
+	return 0;
 }
 
 }	// namespace
@@ -499,6 +549,8 @@ run_command_line(int argc, char** argv)
 		bool wait = argument == NULL || strcmp(argument, "--no-wait") != 0;
 		return command_boot_check(updater, wait);
 	}
+	if (strcmp(command, "--release-check") == 0)
+		return command_release_check(updater);
 	if (strcmp(command, "--confirm") == 0) {
 		BString report;
 		status_t error = updater.Confirm(report);

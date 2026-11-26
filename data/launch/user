@@ -59,13 +59,22 @@ target desktop {
 		launch /bin/sh ~/config/settings/boot/UserBootscript
 	}
 
-	# air/OS: confirms an update once the desktop has run for a while, reports
-	# a start that fell back to an older version, and looks for a new release
-	# (System Updater, docs/airos/SYSTEM-UPDATER.md). It waits for Tracker and
-	# Deskbar itself.
+	# air/OS: confirms an update once the desktop has run for a while and
+	# reports a start that fell back to an older version (System Updater,
+	# docs/airos/SYSTEM-UPDATER.md). It waits for Tracker and Deskbar itself,
+	# only while an update is on trial, and needs no network.
 	job x-vnd.airos-SystemUpdater-boot-check {
 		launch /boot/system/apps/SystemUpdater --boot-check
 		no_safemode
+	}
+
+	# air/OS: the daily look for a new release, whenever a network comes up
+	# (Wi-Fi that joins late, a cable plugged in later). It quits at once if
+	# one succeeded earlier that day.
+	job x-vnd.airos-SystemUpdater-release-check {
+		launch /boot/system/apps/SystemUpdater --release-check
+		no_safemode
+		on network_available
 	}
 
 	job check-daylight-saving-time {
