@@ -40,6 +40,7 @@ All rights reserved.
 
 
 #include <ObjectList.h>
+#include <Region.h>
 #include <String.h>
 
 
@@ -73,15 +74,18 @@ public:
 		kTiled
 	};
 
+	struct Picture;
+
 	class BackgroundImageInfo {
 		// element of the per-workspace list
 	public:
-		BackgroundImageInfo(uint32 workspace, BBitmap* bitmap, Mode mode,
+		BackgroundImageInfo(uint32 workspace, Picture* picture, Mode mode,
 			BPoint offset, bool textWidgetOutline);
 		~BackgroundImageInfo();
 
 		uint32 fWorkspace;
-		BBitmap* fBitmap;
+		Picture* fPicture;
+			// the file; entries showing the same one share it
 		Mode fMode;
 		BPoint fOffset;
 		bool fTextWidgetOutline;
@@ -115,10 +119,16 @@ private:
 
 	void Add(BackgroundImageInfo*);
 
-	BRect Destination(const BackgroundImageInfo* info, BRect host,
-		BView* view, uint32& options, uint32& followFlags);
-		// where the bitmap goes to show on host, a monitor's frame on the
-		// desktop
+	status_t Place(BackgroundImageInfo* info, BView* view,
+		const BRect* hosts, int32 count, float pixelRatio, bool placements);
+	BBitmap* PictureBitmap(Picture* picture, clipping_rect crop,
+		int32 width, int32 height);
+	void ReleasePictures(const Picture* keep, const Picture* keepToo);
+
+	BRect Destination(const BackgroundImageInfo* info, BRect pictureBounds,
+		BRect host, BView* view, uint32& options, uint32& followFlags);
+		// where the whole picture goes to show on host, a monitor's frame
+		// on the desktop
 
 	float BRectRatio(BRect rect);
 	float BRectHorizontalOverlap(BRect hostRect, BRect resizedRect);
@@ -128,8 +138,13 @@ private:
 	BNode fDefinedByNode;
 	BView* fView;
 	BackgroundImageInfo* fShowingBitmap;
+	BBitmap* fViewBitmap;
+		// the bitmap set on the view
+	Picture* fShownPicture;
+	Picture* fPreviousPicture;
 
 	BObjectList<BackgroundImageInfo, true> fBitmapForWorkspaceList;
+	BObjectList<Picture, true> fPictures;
 };
 
 } // namespace BPrivate
