@@ -127,9 +127,19 @@ check_state_after_return()
 		return kExitWrongState;
 	}
 
+	// MXCSR may keep the bits this processor has: MXCSR_MASK, which FXSAVE
+	// stores (0 means the default 0xffbf). AMD processors with misaligned
+	// SSE mode have bit 17 (MM) as well, so the mask can reach past bit 15.
+	uint8 fxsaveArea[512] __attribute__((aligned(16)));
+	asm volatile("fxsave %0" : "=m" (fxsaveArea));
+	uint32 mxcsrMask;
+	memcpy(&mxcsrMask, fxsaveArea + 28, sizeof(mxcsrMask));
+	if (mxcsrMask == 0)
+		mxcsrMask = 0xffbf;
+
 	uint32 mxcsr;
 	asm volatile("stmxcsr %0" : "=m" (mxcsr));
-	if (strcmp(sCase, "mxcsr") == 0 && (mxcsr & 0xffff0000) != 0)
+	if (strcmp(sCase, "mxcsr") == 0 && (mxcsr & ~mxcsrMask) != 0)
 		return kExitWrongState;
 
 	// the FPU state may be anything the handler asked for (all exceptions
