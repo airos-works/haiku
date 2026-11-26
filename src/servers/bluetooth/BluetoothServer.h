@@ -85,6 +85,7 @@ public:
 private:
 
 	LocalDeviceImpl*	LocateDelegateFromMessage(BMessage* message);
+	void				_StartProtocols();
 	static status_t		_DiscoverServicesThread(void* data);
 	void				_ServicesDiscovered(BMessage* message);
 
@@ -99,6 +100,7 @@ private:
 
 	// Notification system
 	BluetoothPortListener*	fEventListener2;
+	bool					fProtocolsStarted;
 	
 	DeviceManager*			fDeviceManager;
 	

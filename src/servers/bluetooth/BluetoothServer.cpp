@@ -85,8 +85,10 @@ BluetoothServer::BluetoothServer()
 	fLocalDevicesList.MakeEmpty();
 	fWatchersList.MakeEmpty();
 
-	fEventListener2 = new BluetoothPortListener(BT_USERLAND_PORT_NAME,
-		(BluetoothPortListener::port_listener_func)&DispatchEvent);
+	// The event port, SDP and HID listeners and the pulse start with the
+	// first radio (_StartProtocols()); most machines never have one.
+	fEventListener2 = NULL;
+	fProtocolsStarted = false;
 	fSDPServer = new SDPServer();
 	fHIDHost = new HIDHost();
 }
@@ -143,7 +145,25 @@ void BluetoothServer::ReadyToRun(void)
 	fDeviceManager->StartMonitoringDevice("bluetooth/h4");
 	fDeviceManager->StartMonitoringDevice("bluetooth/h5");
 	LogStartup("watching for radios");
+}
 
+
+/*!	What only a radio needs: the port the kernel posts HCI events to, the SDP
+	server, the HID host's listeners (and its paired devices) and the pulse.
+	Started when the first radio has been opened, before it is brought up:
+	the kernel posts no events for a radio before then (BT_UP), and paired
+	devices can only connect through it.
+*/
+void
+BluetoothServer::_StartProtocols()
+{
+	if (fProtocolsStarted)
+		return;
+	fProtocolsStarted = true;
+	LogStartup("starting the protocols");
+
+	fEventListener2 = new BluetoothPortListener(BT_USERLAND_PORT_NAME,
+		(BluetoothPortListener::port_listener_func)&DispatchEvent);
 	if (fEventListener2->Launch() != B_OK)
 		TRACE_BT("General: Bluetooth event listener failed\n");
 	else
@@ -218,6 +238,7 @@ void BluetoothServer::MessageReceived(BMessage* message)
 			}
 
 			status = B_WOULD_BLOCK;
+			_StartProtocols();
 			/* TODO: This should be by user request only! */
 			if (lDeviceImpl->Launch() == B_OK)
 				lDeviceImpl->StartPairingSetup();
