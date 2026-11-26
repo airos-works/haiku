@@ -16,6 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <algorithm>
+
 #include <OS.h>
 
 #include <arch/int.h>
@@ -35,7 +37,9 @@
 #include <util/AutoLock.h>
 #include <util/DoublyLinkedList.h>
 #include <vfs.h>
+#include <vm/vm.h>
 #include <vm/vm_page.h>
+#include <vm/VMAddressSpace.h>
 #include <wait_for_objects.h>
 
 #include "kernel_debug_config.h"
@@ -64,10 +68,19 @@
 //   additional need sSemsSpinlock for write access.
 //   lock itself doesn't need protection -- sem_entry objects are never deleted.
 //
+// * sSemsGrowLock: Serializes growing the table (sAllocatedSems,
+//   sSemTableBackedSize). Taken without any other lock held.
+//
 // The locking order is sSemsSpinlock -> sem_entry::lock -> scheduler lock. All
 // semaphores are in the sSems array (sem_entry[]). Access by sem_id requires
-// computing the object index (id % sMaxSems), locking the respective
-// sem_entry::lock and verifying that sem_entry::id matches afterwards.
+// computing the object index (id % sMaxSems), checking that the slot is
+// allocated, locking the respective sem_entry::lock and verifying that
+// sem_entry::id matches afterwards.
+//
+// The address space for all sMaxSems slots is reserved at boot, but only the
+// first sAllocatedSems slots are backed by memory: the table grows in steps,
+// while fewer than kMinFreeSems slots are free. Slots beyond sAllocatedSems
+// are never touched, and an ID that maps to one is invalid.
 
 
 struct queued_thread : DoublyLinkedListLinkImpl<queued_thread> {
@@ -123,12 +136,36 @@ static int32 sMaxSems = 4096;
 	// Final value is computed based on the amount of available memory
 static int32 sUsedSems = 0;
 
+static const int32 kMinFreeSems = 1024;
+	// The table grows while fewer slots are free. A deleted semaphore's slot
+	// is queued at the end of the free list, so this is also about the least
+	// number of creations before a slot is used again.
+static const size_t kSemTableMinGrowSize = 128 * 1024;
+static const size_t kSemTableMaxGrowSize = 1024 * 1024;
+
+static int32 sAllocatedSems = 0;
+	// Slots [0, sAllocatedSems) are backed and initialized. Only grows; set
+	// after the new slots are ready.
+static size_t sSemTableBackedSize = 0;
+static mutex sSemsGrowLock = MUTEX_INITIALIZER("sem table grow");
+
 static struct sem_entry *sSems = NULL;
 static bool sSemsActive = false;
 static struct sem_entry	*sFreeSemsHead = NULL;
 static struct sem_entry	*sFreeSemsTail = NULL;
 
 static spinlock sSemsSpinlock = B_SPINLOCK_INITIALIZER;
+
+
+/*!	Returns whether \a slot is backed by memory. An ID that comes from outside
+	can point anywhere in the table, and the rest of it is only reserved
+	address space.
+*/
+static inline bool
+is_sem_slot_allocated(int32 slot)
+{
+	return slot >= 0 && slot < atomic_get(&sAllocatedSems);
+}
 
 
 static int
@@ -152,7 +189,7 @@ dump_sem_list(int argc, char** argv)
 	kprintf("%-*s       id count   team   last  name\n", B_PRINTF_POINTER_WIDTH,
 		"sem");
 
-	for (i = 0; i < sMaxSems; i++) {
+	for (i = 0; i < sAllocatedSems; i++) {
 		struct sem_entry* sem = &sSems[i];
 		if (sem->id < 0
 			|| (last != -1 && sem->u.used.last_acquirer != last)
@@ -240,7 +277,7 @@ dump_sem_info(int argc, char **argv)
 			return 0;
 		} else {
 			uint32 slot = num % sMaxSems;
-			if (sSems[slot].id != (int)num) {
+			if (!is_sem_slot_allocated(slot) || sSems[slot].id != (int)num) {
 				kprintf("sem %ld (%#lx) doesn't exist!\n", num, num);
 				return 0;
 			}
@@ -251,7 +288,7 @@ dump_sem_info(int argc, char **argv)
 	}
 
 	// walk through the sem list, trying to match name
-	for (i = 0; i < sMaxSems; i++) {
+	for (i = 0; i < sAllocatedSems; i++) {
 		if (sSems[i].u.used.name != NULL
 			&& strcmp(argv[1], sSems[i].u.used.name) == 0) {
 			dump_sem(&sSems[i]);
@@ -290,6 +327,67 @@ free_sem_slot(int slot, sem_id nextID)
 		sFreeSemsHead = sem;
 	sFreeSemsTail = sem;
 	sem->u.unused.next = NULL;
+}
+
+
+/*!	Backs more of the semaphore table with memory and adds the new slots to
+	the free list, if fewer than kMinFreeSems slots are free. Must be called
+	without any lock held: it creates an area.
+*/
+static void
+grow_sem_table()
+{
+	MutexLocker growLocker(sSemsGrowLock);
+
+	int32 allocated = sAllocatedSems;
+	if (allocated == sMaxSems
+		|| allocated - atomic_get(&sUsedSems) >= kMinFreeSems) {
+		return;
+	}
+
+	size_t tableSize = PAGE_ALIGN(sizeof(sem_entry) * sMaxSems);
+	size_t growSize = std::max(sSemTableBackedSize, kSemTableMinGrowSize);
+	growSize = std::min(growSize, kSemTableMaxGrowSize);
+	growSize = std::min(growSize, tableSize - sSemTableBackedSize);
+
+	// The new area goes right behind the backed part, into the range
+	// reserved for the table.
+	virtual_address_restrictions virtualRestrictions = {};
+	virtualRestrictions.address = (uint8*)sSems + sSemTableBackedSize;
+	virtualRestrictions.address_specification = B_EXACT_ADDRESS;
+	physical_address_restrictions physicalRestrictions = {};
+	void* address;
+	area_id area = create_area_etc(B_SYSTEM_TEAM, "sem_table", growSize,
+		B_FULL_LOCK, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA,
+		CREATE_AREA_DONT_WAIT, 0, &virtualRestrictions, &physicalRestrictions,
+		&address);
+	if (area < 0) {
+		dprintf("sem: could not grow the semaphore table: %s\n",
+			strerror(area));
+		return;
+	}
+
+	sSemTableBackedSize += growSize;
+	int32 newAllocated = std::min((size_t)sMaxSems,
+		sSemTableBackedSize / sizeof(sem_entry));
+
+	// The memory is cleared, which is a valid unlocked spinlock and an empty
+	// queue. Chain the new slots up first, so they join the free list in one
+	// step.
+	for (int32 i = allocated; i < newAllocated; i++) {
+		sSems[i].id = -1;
+		sSems[i].u.unused.next_id = i;
+		sSems[i].u.unused.next = i + 1 < newAllocated ? &sSems[i + 1] : NULL;
+	}
+
+	InterruptsSpinLocker listLocker(sSemsSpinlock);
+	if (sFreeSemsTail != NULL)
+		sFreeSemsTail->u.unused.next = &sSems[allocated];
+	else
+		sFreeSemsHead = &sSems[allocated];
+	sFreeSemsTail = &sSems[newAllocated - 1];
+
+	atomic_set(&sAllocatedSems, newAllocated);
 }
 
 
@@ -357,6 +455,8 @@ delete_sem_internal(sem_id id, bool checkPermission)
 		return B_BAD_SEM_ID;
 
 	int32 slot = id % sMaxSems;
+	if (!is_sem_slot_allocated(slot))
+		return B_BAD_SEM_ID;
 
 	InterruptsLocker interruptsLocker;
 	SpinLocker listLocker(sSemsSpinlock);
@@ -403,35 +503,31 @@ delete_sem_internal(sem_id id, bool checkPermission)
 status_t
 haiku_sem_init(kernel_args *args)
 {
-	area_id area;
 	int32 i;
 
 	TRACE(("sem_init: entry\n"));
 
 	// compute maximal number of semaphores depending on the available memory
-	// 128 MB -> 16384 semaphores, 448 kB fixed array size
-	// 256 MB -> 32768, 896 kB
-	// 512 MB and more-> 65536, 1.75 MB
+	// 128 MB -> 16384 semaphores
+	// 256 MB -> 32768
+	// 512 MB and more-> 65536
 	i = vm_page_num_pages() / 2;
 	while (sMaxSems < i && sMaxSems < kMaxSemaphores)
 		sMaxSems <<= 1;
 
-	// create and initialize semaphore table
-	virtual_address_restrictions virtualRestrictions = {};
-	virtualRestrictions.address_specification = B_ANY_KERNEL_ADDRESS;
-	physical_address_restrictions physicalRestrictions = {};
-	area = create_area_etc(B_SYSTEM_TEAM, "sem_table",
-		sizeof(struct sem_entry) * sMaxSems, B_FULL_LOCK,
-		B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, CREATE_AREA_DONT_WAIT, 0,
-		&virtualRestrictions, &physicalRestrictions, (void**)&sSems);
-	if (area < 0)
-		panic("unable to allocate semaphore table!\n");
-
-	memset((void*)sSems, 0, sizeof(struct sem_entry) * sMaxSems);
-	for (i = 0; i < sMaxSems; i++) {
-		sSems[i].id = -1;
-		free_sem_slot(i, i);
+	// Reserve the address space for the whole table, but back only what is
+	// needed: a desktop uses about a thousand semaphores of the 65536.
+	void* address = NULL;
+	if (vm_reserve_address_range(VMAddressSpace::KernelID(), &address,
+			B_ANY_KERNEL_ADDRESS, PAGE_ALIGN(sizeof(sem_entry) * sMaxSems),
+			0) != B_OK) {
+		panic("unable to reserve the semaphore table!\n");
 	}
+	sSems = (sem_entry*)address;
+
+	grow_sem_table();
+	if (sAllocatedSems == 0)
+		panic("unable to allocate semaphore table!\n");
 
 	// add debugger commands
 	add_debugger_command_etc("sems", &dump_sem_list,
@@ -472,6 +568,9 @@ create_sem_etc(int32 count, const char* name, team_id owner)
 		return B_BAD_VALUE;
 	if (!sSemsActive || sUsedSems == sMaxSems)
 		return B_NO_MORE_SEMS;
+
+	if (sAllocatedSems - sUsedSems < kMinFreeSems && sAllocatedSems < sMaxSems)
+		grow_sem_table();
 
 	if (name == NULL)
 		name = "unnamed semaphore";
@@ -550,6 +649,8 @@ select_sem(int32 id, struct select_info* info, bool kernel)
 		return B_BAD_SEM_ID;
 
 	int32 slot = id % sMaxSems;
+	if (!is_sem_slot_allocated(slot))
+		return B_BAD_SEM_ID;
 
 	InterruptsSpinLocker _(&sSems[slot].lock);
 
@@ -586,6 +687,8 @@ deselect_sem(int32 id, struct select_info* info, bool kernel)
 		return B_OK;
 
 	int32 slot = id % sMaxSems;
+	if (!is_sem_slot_allocated(slot))
+		return B_OK;
 
 	InterruptsSpinLocker _(&sSems[slot].lock);
 
@@ -747,7 +850,7 @@ switch_sem_etc(sem_id semToBeReleased, sem_id id, int32 count,
 	}
 #endif
 
-	if (id < 0)
+	if (id < 0 || !is_sem_slot_allocated(slot))
 		return B_BAD_SEM_ID;
 	if (count <= 0
 		|| (flags & (B_RELATIVE_TIMEOUT | B_ABSOLUTE_TIMEOUT)) == (B_RELATIVE_TIMEOUT | B_ABSOLUTE_TIMEOUT)) {
@@ -884,7 +987,7 @@ release_sem_etc(sem_id id, int32 count, uint32 flags)
 		return B_OK;
 	if (sSemsActive == false)
 		return B_NO_MORE_SEMS;
-	if (id < 0)
+	if (id < 0 || !is_sem_slot_allocated(slot))
 		return B_BAD_SEM_ID;
 	if (count <= 0 && (flags & B_RELEASE_ALL) == 0)
 		return B_BAD_VALUE;
@@ -1002,6 +1105,8 @@ get_sem_count(sem_id id, int32 *_count)
 		return B_BAD_VALUE;
 
 	int slot = id % sMaxSems;
+	if (!is_sem_slot_allocated(slot))
+		return B_BAD_SEM_ID;
 
 	InterruptsSpinLocker _(sSems[slot].lock);
 
@@ -1028,6 +1133,8 @@ _get_sem_info(sem_id id, struct sem_info *info, size_t size)
 		return B_BAD_VALUE;
 
 	int slot = id % sMaxSems;
+	if (!is_sem_slot_allocated(slot))
+		return B_BAD_SEM_ID;
 
 	InterruptsSpinLocker _(sSems[slot].lock);
 
@@ -1106,6 +1213,8 @@ set_sem_owner(sem_id id, team_id newTeamID)
 		return B_BAD_TEAM_ID;
 
 	int32 slot = id % sMaxSems;
+	if (!is_sem_slot_allocated(slot))
+		return B_BAD_SEM_ID;
 
 	// get the new team
 	Team* newTeam = Team::Get(newTeamID);
@@ -1137,8 +1246,10 @@ sem_get_name_unsafe(sem_id id)
 {
 	int slot = id % sMaxSems;
 
-	if (sSemsActive == false || id < 0 || sSems[slot].id != id)
+	if (sSemsActive == false || id < 0 || !is_sem_slot_allocated(slot)
+		|| sSems[slot].id != id) {
 		return NULL;
+	}
 
 	return sSems[slot].u.used.name;
 }

@@ -73,6 +73,12 @@ SimpleTest page_writer_stall_test : page_writer_stall_test.cpp ;
 # before (airos-works/haiku#153)
 SimpleTest sem_slot_reuse_test : sem_slot_reuse_test.cpp ;
 
+# the semaphore table is backed in steps as it fills (airos-works/haiku#215):
+# filling it to max_sems from several threads, stale and never-used IDs,
+# concurrent create/delete. Leaves the system without free semaphores for a
+# moment, so not in tools/airos/ci/guest-tests.
+SimpleTest sem_table_test : sem_table_test.cpp ;
+
 # a signal handler that changes the saved state the kernel restores with its
 # own privileges: segment selectors, instruction pointer, XSAVE area, SPSR
 # (airos-works/haiku#158). A kernel without the fix does not survive it.
