@@ -757,6 +757,14 @@ VMSAv8TranslationMap::Map(addr_t va, phys_addr_t pa, uint32 attributes, uint32 m
 	ASSERT(ValidateVa(va));
 	uint64_t attr = GetMemoryAttr(attributes, memoryType, fIsKernel);
 
+	// A page is mapped because it is about to be used (or is one of the
+	// neighbours fault-around maps with it). Where the CPU leaves the access
+	// flag to software (Cortex-A72), an entry without it costs an access
+	// flag fault on the first use: start with it set, as MapLarge() and the
+	// kernel stacks do (#237). The page counts as accessed once.
+	if ((fHwFeature & HW_ACCESS) == 0)
+		attr |= kAttrAF;
+
 	// During first mapping we need to allocate root table
 	if (fPageTable == 0) {
 		vm_page* page = vm_page_allocate_page(reservation, PAGE_STATE_WIRED | VM_PAGE_ALLOC_CLEAR);

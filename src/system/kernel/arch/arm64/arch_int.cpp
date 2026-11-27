@@ -157,8 +157,40 @@ TableFromPa(phys_addr_t pa)
 }
 
 
+// PSTATE.PAN as saved in SPSR_EL1
+static const uint64 kSpsrPAN = 1UL << 22;
+
+
+/*!	Drops this CPU's TLB entry of \a va, after its page table entry \a pte
+	was made less restrictive (access flag set, write permission given). A
+	stale entry on another CPU only makes that CPU fault once more, which ends
+	in fixup_entry() as well: no broadcast to every CPU is needed (#237).
+*/
+static void
+invalidate_local_entry(uint64_t pte, addr_t va)
+{
+	uint64_t page = (va >> 12) & kTLBIMask;
+	asm volatile("dsb ishst" ::: "memory");
+	if ((pte & kAttrNG) == 0)
+		asm volatile("tlbi vaae1, %0" :: "r"(page) : "memory");
+	else {
+		uint64_t asid = READ_SPECIALREG(TTBR0_EL1) >> 48;
+		asm volatile("tlbi vae1, %0" :: "r"(page | (asid << 48)) : "memory");
+	}
+	asm volatile("dsb nsh" ::: "memory");
+	asm volatile("isb" ::: "memory");
+}
+
+
+/*!	Handles an access flag fault, or a permission fault of a write, in
+	software where the CPU does not manage the access flag and the dirty state
+	itself (Cortex-A72). Returns whether the access can be retried.
+	\a user and \a pan tell how the access was made, so that a write the entry
+	does not allow is left to vm_page_fault().
+*/
 static bool
-fixup_entry(phys_addr_t ptPa, int level, addr_t va, bool wr)
+fixup_entry(phys_addr_t ptPa, int level, addr_t va, bool wr, bool user,
+	bool pan)
 {
 	int tableBits = page_bits - 3;
 	uint64_t tableMask = (1UL << tableBits) - 1;
@@ -176,7 +208,12 @@ fixup_entry(phys_addr_t ptPa, int level, addr_t va, bool wr)
 	uint64_t addr = oldPte & kPteAddrMask;
 
 	if ((level == 3 && type == kPteTypeL3Page) || (level < 3 && type == kPteTypeL12Block)) {
-		if (!wr && (oldPte & kAttrAF) == 0) {
+		if (!wr) {
+			if ((oldPte & kAttrAF) != 0) {
+				// Another CPU set it meanwhile. An entry without the access
+				// flag is never held in a TLB: just try again.
+				return true;
+			}
 			uint64_t newPte = oldPte | kAttrAF;
             if ((uint64_t)atomic_test_and_set64((int64*)pte, newPte, oldPte) != oldPte)
 				return true; // If something changed, handle it by taking another fault
@@ -184,18 +221,30 @@ fixup_entry(phys_addr_t ptPa, int level, addr_t va, bool wr)
 			asm("isb");
 			return true;
 		}
-		if (wr && (oldPte & kAttrSWDBM) != 0 && (oldPte & kAttrAPReadOnly) != 0) {
-			uint64_t newPte = oldPte & ~kAttrAPReadOnly;
+
+		bool allowed = user ? (oldPte & kAttrAPUserAccess) != 0
+			: !pan || (oldPte & kAttrAPUserAccess) == 0;
+		if (!allowed || (oldPte & kAttrSWDBM) == 0)
+			return false;
+
+		if ((oldPte & kAttrAPReadOnly) != 0) {
+			// the first write: the entry becomes writable, and dirty
+			uint64_t newPte = (oldPte & ~kAttrAPReadOnly) | kAttrAF;
             if ((uint64_t)atomic_test_and_set64((int64*)pte, newPte, oldPte) != oldPte)
 				return true;
 
-			uint64_t asid = READ_SPECIALREG(TTBR0_EL1) >> 48;
-			flush_va_if_accessed(oldPte, va, asid);
+			invalidate_local_entry(oldPte, va);
+			return true;
+		}
 
+		if ((oldPte & kAttrAF) != 0) {
+			// Writable already: this CPU used an entry it held from before
+			// another one gave the write permission.
+			invalidate_local_entry(oldPte, va);
 			return true;
 		}
 	} else if (level < 3 && type == kPteTypeL012Table) {
-		return fixup_entry(addr, level + 1, va, wr);
+		return fixup_entry(addr, level + 1, va, wr, user, pan);
 	}
 
 	return false;
@@ -368,16 +417,20 @@ do_sync_handler(iframe * frame)
 				case ISS_DATA_DFSC_AFF_L2:
 				case ISS_DATA_DFSC_AFF_L3:
 					known = true;
-					if (fixup_entry(ptPa, initialLevel, frame->far, false))
+					if (fixup_entry(ptPa, initialLevel, frame->far, false,
+							isUser, (frame->spsr & kSpsrPAN) != 0)) {
 						return;
+					}
 				break;
 
 				case ISS_DATA_DFSC_PF_L1:
 				case ISS_DATA_DFSC_PF_L2:
 				case ISS_DATA_DFSC_PF_L3:
 					known = true;
-					if (write && fixup_entry(ptPa, initialLevel, frame->far, true))
+					if (write && fixup_entry(ptPa, initialLevel, frame->far,
+							true, isUser, (frame->spsr & kSpsrPAN) != 0)) {
 						return;
+					}
 				break;
 			}
 
@@ -420,8 +473,22 @@ do_sync_handler(iframe * frame)
 				enable_interrupts();
 				addr_t ret = 0;
 				vm_page_fault(frame->far, frame->elr, write, isExec, isUser, &ret);
-				if (ret != 0)
+				if (ret != 0) {
 					frame->elr = ret;
+					return;
+				}
+
+				if (write && (VMSAv8TranslationMap::fHwFeature
+						& VMSAv8TranslationMap::HW_DIRTY) == 0) {
+					// The page was mapped for a write that is about to be
+					// retried: give it the write permission now, instead of in
+					// a permission fault right after this one (#237). The
+					// table root may have been created by this fault.
+					phys_addr_t root = (addrType ? READ_SPECIALREG(TTBR1_EL1)
+						: READ_SPECIALREG(TTBR0_EL1)) & kTtbrBasePhysAddrMask;
+					fixup_entry(root, initialLevel, frame->far, true, isUser,
+						(frame->spsr & kSpsrPAN) != 0);
+				}
 				return;
 			}
 

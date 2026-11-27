@@ -27,7 +27,7 @@ KernelMergeObject kernel_lib_posix_arch_$(TARGET_ARCH).o :
 	kernel_longjmp_return.c
 	kernel_setjmp_save_sigs.c
 
-	generic_memset.c
+	arm64_kernel_memset.c
 	arm64_memcpy.c
 
 	: $(TARGET_KERNEL_PIC_CCFLAGS) -fno-builtin -mgeneral-regs-only
