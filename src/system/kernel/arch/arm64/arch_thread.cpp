@@ -191,6 +191,12 @@ arch_setup_signal_frame(Thread *thread, struct sigaction *sa,
 
 	uint8* userStack = get_signal_stack(thread, frame, sa,
 		sizeof(*signalFrameData));
+	// The stack pointer is only a register the program can set to anything,
+	// and user_memcpy() writes to kernel addresses as well: the frame must
+	// lie in user space, or the program gets SIGSEGV instead (#224).
+	if (!is_user_address_range(userStack, sizeof(*signalFrameData)))
+		return B_BAD_ADDRESS;
+
 	status_t res = user_memcpy(userStack, signalFrameData,
 		sizeof(*signalFrameData));
 	if (res < B_OK)

@@ -35,3 +35,8 @@ profiler_detach_test
 # report, behind a bounced write that waited for that report, and every
 # write to the disk stopped for good (a desktop's mouse went first, #141)
 fragmented_write_test
+# signal delivery with the stack pointer (or an alternate signal stack) at a
+# kernel address or at unmapped memory: the kernel wrote the frame there, or
+# returned to the faulting instruction for ever, where the team must die of
+# SIGSEGV (#224); a kernel with the bug writes only to the test's own buffer
+signal_stack_bounds_test

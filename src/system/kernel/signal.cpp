@@ -1271,7 +1271,28 @@ handle_signals(Thread* thread)
 
 		locker.Unlock();
 
-		setup_signal_frame(thread, &handler, signal, oldBlockMask);
+		if (setup_signal_frame(thread, &handler, signal, oldBlockMask)
+				!= B_OK) {
+			// The frame could not be written: the stack pointer (or the
+			// alternate signal stack) points outside of user space or at
+			// memory that is not writable. Returning to the program as it
+			// was would run into the same fault again (or lose the signal);
+			// like Linux, give it a SIGSEGV with the default action, which
+			// cannot be blocked or caught now (#224).
+			teamLocker.Lock();
+			team->SignalActionFor(SIGSEGV).sa_handler = SIG_DFL;
+			locker.Lock();
+
+			thread->sig_block_mask = oldBlockMask & ~SIGNAL_TO_MASK(SIGSEGV);
+			thread->sigsuspend_original_unblocked_mask = 0;
+			nonBlockedMask |= SIGNAL_TO_MASK(SIGSEGV);
+			thread->AddPendingSignal(SIGSEGV);
+			update_thread_signals_flag(thread);
+
+			locker.Unlock();
+			teamLocker.Unlock();
+			continue;
+		}
 
 		// Reset sigsuspend_original_unblocked_mask. It would have been set by
 		// sigsuspend_internal(). In that case, above we set oldBlockMask
@@ -2526,7 +2547,9 @@ _user_set_signal_stack(const stack_t* newUserStack, stack_t* oldUserStack)
 				return B_NO_MEMORY;
 			if (onStack)
 				return B_NOT_ALLOWED;
-			if (!IS_USER_ADDRESS(newStack.ss_sp))
+			// The whole stack must be user memory, not only its start: the
+			// signal frame is written at its end (#224).
+			if (!is_user_address_range(newStack.ss_sp, newStack.ss_size))
 				return B_BAD_VALUE;
 
 			thread->signal_stack_base = (addr_t)newStack.ss_sp;
