@@ -630,15 +630,29 @@ eqos_interrupt(void* data)
 		return B_UNHANDLED_INTERRUPT;
 	}
 
-	write32(info, DMA_CH0_STATUS, status);
-
-	if ((status & DMA_INT_FBE) != 0)
-		ERROR("fatal bus error, DMA status %#" B_PRIx32 "\n", status);
-
 	// The reader drains RX with the interrupt off. TX completion
 	// interrupts are only needed when a writer runs out of descriptors.
-	uint32 handled = status & enabled & (DMA_INT_RI | DMA_INT_TI);
-	write32(info, DMA_CH0_INTERRUPT_ENABLE, enabled & ~handled);
+	// The acknowledge also clears the sticky summary bit (NIS) that drives
+	// the interrupt line. An event that came after the status was read
+	// keeps its own bit, but no summary and so no interrupt. Look again
+	// after every acknowledge: a TI lost that way while receive interrupts
+	// came all the time left the waiting sender to its timeout
+	// (airos-works/haiku#218). Handled bits are disabled, so this ends.
+	uint32 handled = 0;
+	for (int32 round = 0; round < 4; round++) {
+		write32(info, DMA_CH0_STATUS, status);
+		if ((status & DMA_INT_FBE) != 0)
+			ERROR("fatal bus error, DMA status %#" B_PRIx32 "\n", status);
+
+		uint32 events = status & enabled & (DMA_INT_RI | DMA_INT_TI);
+		handled |= events;
+		enabled &= ~events;
+		write32(info, DMA_CH0_INTERRUPT_ENABLE, enabled);
+
+		status = read32(info, DMA_CH0_STATUS);
+		if ((status & enabled & (DMA_INT_RI | DMA_INT_TI)) == 0)
+			break;
+	}
 	locker.Unlock();
 	if ((handled & DMA_INT_RI) != 0)
 		release_sem_etc(info->rxSemaphore, 1, B_DO_NOT_RESCHEDULE);
@@ -923,8 +937,11 @@ eqos_send(eqos_info* info, net_buffer* buffer)
 		}
 		locker.Unlock();
 
+		// The timeout is a safety net, as Linux' stmmac has its transmit
+		// timer (5 ms): a lost wake-up costs that, not a whole ring's
+		// worth of time (100 ms were about 35 Mbit/s, #218).
 		status_t status = acquire_sem_etc(info->txSemaphore, 1,
-			B_CAN_INTERRUPT | B_RELATIVE_TIMEOUT, 100000);
+			B_CAN_INTERRUPT | B_RELATIVE_TIMEOUT, 5000);
 		if (status != B_OK && status != B_TIMED_OUT)
 			return status;
 		locker.Lock();

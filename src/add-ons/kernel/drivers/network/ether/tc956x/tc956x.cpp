@@ -1073,17 +1073,31 @@ tc956x_interrupt(void* data)
 
 	int32 result = B_UNHANDLED_INTERRUPT;
 	if (status != 0) {
-		write32(device, DMA_CH0_STATUS, status);
-
-		if ((status & DMA_INT_FBE) != 0) {
-			ERROR("%s: fatal bus error, DMA status %#" B_PRIx32 "\n",
-				device->name, status);
-		}
-
 		// The reader drains RX with the interrupt off. TX completion
 		// interrupts are only needed when a writer runs out of descriptors.
-		uint32 handled = status & enabled & (DMA_INT_RI | DMA_INT_TI);
-		write32(device, DMA_CH0_INT_EN, enabled & ~handled);
+		// An event that came after the status was read is not seen in it:
+		// look again after every acknowledge, rather than count on the
+		// summary bit (cleared with the acknowledge) or the MSI re-arm to
+		// signal it again. A TI lost that way while receive interrupts came
+		// all the time left the waiting sender to its timeout
+		// (airos-works/haiku#218). Handled bits are disabled, so this ends.
+		uint32 handled = 0;
+		for (int32 round = 0; round < 4; round++) {
+			write32(device, DMA_CH0_STATUS, status);
+			if ((status & DMA_INT_FBE) != 0) {
+				ERROR("%s: fatal bus error, DMA status %#" B_PRIx32 "\n",
+					device->name, status);
+			}
+
+			uint32 events = status & enabled & (DMA_INT_RI | DMA_INT_TI);
+			handled |= events;
+			enabled &= ~events;
+			write32(device, DMA_CH0_INT_EN, enabled);
+
+			status = read32(device, DMA_CH0_STATUS);
+			if ((status & enabled & (DMA_INT_RI | DMA_INT_TI)) == 0)
+				break;
+		}
 		locker.Unlock();
 		if ((handled & DMA_INT_RI) != 0)
 			release_sem_etc(device->rxSemaphore, 1, B_DO_NOT_RESCHEDULE);
@@ -1378,8 +1392,11 @@ tc956x_send(tc956x_device* device, net_buffer* buffer)
 		}
 		locker.Unlock();
 
+		// The timeout is a safety net, as Linux' stmmac has its transmit
+		// timer (5 ms): a lost wake-up costs that, not a whole ring's
+		// worth of time (100 ms were about 35 Mbit/s, #218).
 		status_t status = acquire_sem_etc(device->txSemaphore, 1,
-			B_CAN_INTERRUPT | B_RELATIVE_TIMEOUT, 100000);
+			B_CAN_INTERRUPT | B_RELATIVE_TIMEOUT, 5000);
 		if (status != B_OK && status != B_TIMED_OUT)
 			return status;
 		locker.Lock();
