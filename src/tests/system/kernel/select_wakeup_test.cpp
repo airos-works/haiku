@@ -16,6 +16,10 @@
 	  inline), and many times with the close at any point of the call;
 	  select() is not woken (it does not select B_EVENT_INVALID) and times
 	  out as usual;
+	- a wait_for_objects() with a short timeout on a port or a semaphore that
+	  another thread deletes, or on a thread that exits, many rounds: the
+	  call returns (B_EVENT_INVALID or a timeout) and leaves nothing behind
+	  that the deletion could notify later;
 	- a signal wakes a blocked poll() with EINTR; relative timeouts of 0 give
 	  B_WOULD_BLOCK, passed absolute ones B_TIMED_OUT, a short one waits;
 	- a stress run: threads poll pipes with short timeouts while others
@@ -35,6 +39,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <OS.h>
@@ -396,6 +401,170 @@ test_close_while_polled()
 }
 
 
+// #pragma mark - objects deleted while waited for
+
+
+static sem_id sDeleterGo;
+static sem_id sDeleterDone;
+static volatile int32 sDeleterObject;
+static volatile int sDeleterWhat;
+static volatile bool sDeleterQuit = false;
+
+
+static void
+busy_wait(bigtime_t duration)
+{
+	bigtime_t end = system_time() + duration;
+	while (system_time() < end)
+		;
+}
+
+
+static status_t
+deleter_thread(void*)
+{
+	int round = 0;
+	while (acquire_sem(sDeleterGo) == B_OK && !sDeleterQuit) {
+		busy_wait((round++ * 7) % 60);
+		if (sDeleterWhat == 0)
+			delete_port(sDeleterObject);
+		else
+			delete_sem(sDeleterObject);
+		release_sem(sDeleterDone);
+	}
+	return B_OK;
+}
+
+
+static status_t
+exit_at_once(void*)
+{
+	return B_OK;
+}
+
+
+/*!	A wait_for_objects() that times out while its port or semaphore is being
+	deleted, or while its thread exits, must not leave its select_info with
+	the object: the info lives on the waiter's stack (#227). Ports used to
+	notify their select infos only after the port had been marked deleted,
+	when deselect_port() could no longer find it, and a thread that had
+	already handed its infos on could still be selected.
+*/
+static void
+test_deleted_while_waiting()
+{
+	sDeleterGo = create_sem(0, "deleter go");
+	sDeleterDone = create_sem(0, "deleter done");
+	thread_id deleter = spawn_thread(deleter_thread, "deleter",
+		B_NORMAL_PRIORITY, NULL);
+	resume_thread(deleter);
+
+	const int kRounds = 5000;
+	for (int what = 0; what < 2; what++) {
+		int invalid = 0;
+		int timedOut = 0;
+		int other = 0;
+		for (int i = 0; i < kRounds; i++) {
+			object_wait_info info;
+			if (what == 0) {
+				info.object = create_port(1, "deleted port");
+				info.type = B_OBJECT_TYPE_PORT;
+				info.events = B_EVENT_READ;
+			} else {
+				info.object = create_sem(0, "deleted sem");
+				info.type = B_OBJECT_TYPE_SEMAPHORE;
+				info.events = B_EVENT_ACQUIRE_SEMAPHORE;
+			}
+			sDeleterObject = info.object;
+			sDeleterWhat = what;
+			release_sem(sDeleterGo);
+
+			ssize_t result = wait_for_objects_etc(&info, 1,
+				B_RELATIVE_TIMEOUT, (i * 13) % 50);
+			if (result == 1 && info.events == B_EVENT_INVALID)
+				invalid++;
+			else if (result == B_TIMED_OUT || result == B_WOULD_BLOCK)
+				timedOut++;
+			else
+				other++;
+
+			// the stack where the info was is used again at once
+			char scribble[1024];
+			memset(scribble, 0x5a, sizeof(scribble));
+			__asm__ __volatile__("" : : "r"(scribble) : "memory");
+
+			acquire_sem_etc(sDeleterDone, 1, B_RELATIVE_TIMEOUT, 10000000);
+		}
+		CHECK(other == 0, "%d wait_for_objects() on a %s deleted meanwhile: "
+			"%d invalid, %d timed out, %d other", kRounds,
+			what == 0 ? "port" : "semaphore", invalid, timedOut, other);
+	}
+
+	sDeleterQuit = true;
+	release_sem(sDeleterGo);
+	join(deleter);
+	delete_sem(sDeleterGo);
+	delete_sem(sDeleterDone);
+
+	// a thread that exits while it is waited for with a short timeout
+	int invalid = 0;
+	int other = 0;
+	for (int i = 0; i < kRounds; i++) {
+		thread_id thread = spawn_thread(exit_at_once, "exit at once",
+			B_NORMAL_PRIORITY, NULL);
+		resume_thread(thread);
+		busy_wait((i * 7) % 30);
+		object_wait_info info = { thread, B_OBJECT_TYPE_THREAD,
+			B_EVENT_INVALID };
+		ssize_t result = wait_for_objects_etc(&info, 1, B_RELATIVE_TIMEOUT,
+			(i * 13) % 50);
+		if (result == 1 && info.events == B_EVENT_INVALID)
+			invalid++;
+		else if (result != B_TIMED_OUT && result != B_WOULD_BLOCK)
+			other++;
+		char scribble[1024];
+		memset(scribble, 0x5a, sizeof(scribble));
+		__asm__ __volatile__("" : : "r"(scribble) : "memory");
+		join(thread);
+	}
+	CHECK(other == 0, "%d wait_for_objects() on a thread exiting meanwhile: "
+		"%d invalid, %d other", kRounds, invalid, other);
+
+	// The same with the main thread of a child team: nobody of ours keeps
+	// that thread, it is gone soon after it has exited.
+	const int kChildRounds = 500;
+	invalid = 0;
+	other = 0;
+	for (int i = 0; i < kChildRounds; i++) {
+		pid_t child = fork();
+		if (child == 0)
+			_exit(0);
+		if (child < 0) {
+			other++;
+			continue;
+		}
+		// the child needs a while to exit: spread the waits over it
+		busy_wait((i * 37) % 2000);
+		object_wait_info info = { child, B_OBJECT_TYPE_THREAD,
+			B_EVENT_INVALID };
+		ssize_t result = wait_for_objects_etc(&info, 1, B_RELATIVE_TIMEOUT,
+			(i * 13) % 50);
+		if (result == 1 && info.events == B_EVENT_INVALID)
+			invalid++;
+		else if (result != B_TIMED_OUT && result != B_WOULD_BLOCK)
+			other++;
+		char scribble[1024];
+		memset(scribble, 0x5a, sizeof(scribble));
+		__asm__ __volatile__("" : : "r"(scribble) : "memory");
+		int status;
+		waitpid(child, &status, 0);
+	}
+	CHECK(other == 0, "%d wait_for_objects() on a child's main thread "
+		"exiting meanwhile: %d invalid, %d other", kChildRounds, invalid,
+		other);
+}
+
+
 // #pragma mark - stress
 
 
@@ -570,6 +739,7 @@ main()
 
 	test_wakeups();
 	test_close_while_polled();
+	test_deleted_while_waiting();
 	test_stress();
 
 	if (sFailures != 0) {

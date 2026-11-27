@@ -2795,6 +2795,15 @@ select_thread(int32 id, struct select_info* info, bool kernel)
 	BReference<Thread> threadReference(thread, true);
 	ThreadLocker threadLocker(thread, true);
 
+	// A thread that is exiting has handed its select infos on already
+	// (thread_exit() clears the list when it makes the thread invisible), but
+	// stays in the hash table a while longer. An info added now would never
+	// be notified, and when deselect_thread() no longer found the thread, its
+	// sync reference would never be put: the selecting thread waits for that
+	// reference (wait_for_objects.cpp, #227).
+	if (!thread->visible)
+		return B_BAD_THREAD_ID;
+
 	// We support only B_EVENT_INVALID at the moment.
 	info->selected_events &= B_EVENT_INVALID;
 

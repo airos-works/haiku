@@ -624,6 +624,24 @@ notify_port_select_events(Port* port, uint16 events)
 }
 
 
+/*!	Tells the port's selectors that it is gone and forgets them, under the
+	port's lock. To be called after the port has been marked deleted (so
+	select_port() cannot add any more) and before it is removed from the hash
+	tables (so deselect_port() can still find and lock it). A select_info lives on the
+	selecting thread's stack (wait_for_objects.cpp): one left on the list
+	when deselect_port() could not find the port any more would be notified
+	in a dead stack frame by uninit_port() (#227).
+*/
+static void
+detach_port_select_infos(Port* port)
+{
+	MutexLocker locker(port->lock);
+
+	notify_port_select_events(port, B_EVENT_INVALID);
+	port->select_infos = NULL;
+}
+
+
 static BReference<Port>
 get_locked_port(port_id id) GCC_2_NRV(portRef)
 {
@@ -809,8 +827,8 @@ uninit_port(Port* port)
 {
 	MutexLocker locker(port->lock);
 
-	notify_port_select_events(port, B_EVENT_INVALID);
-	port->select_infos = NULL;
+	// detach_port_select_infos() has done that already
+	ASSERT(port->select_infos == NULL);
 
 	// Release the threads that were blocking on this port.
 	// read_port() will see the B_BAD_PORT_ID return value, and act accordingly
@@ -890,6 +908,12 @@ delete_owned_ports(Team* team)
 	}
 
 	teamPortsListLocker.Unlock();
+
+	for (Port* port = (Port*)list_get_first_item(&deletionList);
+		 port != NULL;
+		 port = (Port*)list_get_next_item(&deletionList, port)) {
+		detach_port_select_infos(port);
+	}
 
 	// Remove all ports in deletionList from hashes
 	{
@@ -1120,6 +1144,8 @@ delete_port(port_id id)
 	if (status != B_OK)
 		return status;
 
+	detach_port_select_infos(portRef);
+
 	// Now remove port physically:
 	// (1/2) Remove from hash tables
 	{
@@ -1205,11 +1231,14 @@ deselect_port(int32 id, struct select_info* info, bool kernel)
 	if (info->selected_events == 0)
 		return B_OK;
 
-	// get the port
-	BReference<Port> portRef = get_locked_port(id);
+	// Get the port even when it has been deleted already: as long as it is in
+	// the hash table, detach_port_select_infos() may not have run yet, and
+	// the info must not stay on its list. Once it is out of the table, that
+	// has happened.
+	BReference<Port> portRef = get_port(id);
 	if (portRef == NULL)
 		return B_BAD_PORT_ID;
-	MutexLocker locker(portRef->lock, true);
+	MutexLocker locker(portRef->lock);
 
 	// find and remove the infos
 	select_info** infoLocation = &portRef->select_infos;
