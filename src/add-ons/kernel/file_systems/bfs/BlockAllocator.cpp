@@ -909,11 +909,15 @@ BlockAllocator::IsCompletelyOutsideAllowedRange(block_run run) const
 	ends at the first free run of \a needed blocks (or more, up to \a maximum),
 	instead of looking through all groups for one of \a maximum. Like the
 	allocation, \a needed counts in multiples of \a minimum.
+
+	With \a discard, the block cache drops what it holds of the new blocks
+	(see below); a caller that gets all of them through the block cache in
+	\a transaction right away does not need that.
 */
 status_t
 BlockAllocator::AllocateBlocks(Transaction& transaction, int32 groupIndex,
 	uint16 start, uint16 maximum, uint16 minimum, block_run& run,
-	uint16 needed)
+	uint16 needed, bool discard)
 {
 	if (maximum == 0)
 		return B_BAD_VALUE;
@@ -1165,8 +1169,10 @@ BlockAllocator::AllocateBlocks(Transaction& transaction, int32 groupIndex,
 
 	// We need to flush any remaining blocks in the new allocation to make sure
 	// they won't interfere with the file cache.
-	block_cache_discard(fVolume->BlockCache(), fVolume->ToBlock(run),
-		run.Length());
+	if (discard) {
+		block_cache_discard(fVolume->BlockCache(), fVolume->ToBlock(run),
+			run.Length());
+	}
 
 	T(Allocate(run));
 	return B_OK;
@@ -1188,7 +1194,13 @@ BlockAllocator::AllocateForInode(Transaction& transaction,
 	if ((type & (S_DIRECTORY | S_INDEX_DIR | S_ATTR_DIR)) == S_DIRECTORY)
 		group += 8;
 
-	return AllocateBlocks(transaction, group, 0, 1, 1, run);
+	// The inode block is never file data: the new inode gets it from the
+	// block cache in this transaction (empty). Discarding it would only
+	// write back the change a previous transaction still has to it, the
+	// freed inode's, synchronously while the journal is locked; on a busy
+	// disk that is one write behind all the others queued for it at every
+	// file creation after a log flush (airos-works/haiku#221).
+	return AllocateBlocks(transaction, group, 0, 1, 1, run, 0, false);
 }
 
 
