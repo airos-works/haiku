@@ -284,6 +284,11 @@ checks shared rendering and cleanup without injecting a reset. The host
 `test-reset-status.py --source PATCHED_MESA --baseline PREVIOUS_MESA` checks the
 actual reset functions and verifies that their non-Haiku implementation is
 unchanged. Robustness conformance remains open.
+`test-cleanup-context.py --source MESA` runs the actual `csf_cleanup_context()`
+against a lost context (its last job ended in an error, the kernel refuses or
+has already done the destroys): the teardown must not abort, as its asserts
+made Summit's WebProcess do (airos-works/haiku#209), and must release
+everything.
 
 The +241 native trial reached the deliberate command fault and verified GPU
 reset and cleanup, then failed the first application's reset-status assertion.
