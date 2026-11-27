@@ -1,0 +1,15 @@
+SubDir HAIKU_TOP src tests servers input pointer_steps ;
+
+# pointer_steps_test with its input_server device add-on (#230): two relative
+# moves that input_server handles in one round both count. For a machine with
+# app_server running (the test VM will do); see the source.
+
+SimpleTest pointer_steps_test :
+	pointer_steps_test.cpp
+	: be game [ TargetLibsupc++ ]
+;
+
+Addon PointerStepsDevice :
+	PointerStepsDevice.cpp
+	: be input_server [ TargetLibsupc++ ]
+;

@@ -3,6 +3,7 @@ SubDir HAIKU_TOP src tests servers input ;
 SubInclude HAIKU_TOP src tests servers input comm ;
 SubInclude HAIKU_TOP src tests servers input inputdevice ;
 SubInclude HAIKU_TOP src tests servers input msgspy ;
+SubInclude HAIKU_TOP src tests servers input pointer_steps ;
 SubInclude HAIKU_TOP src tests servers input portspy ;
 SubInclude HAIKU_TOP src tests servers input prefs ;
 SubInclude HAIKU_TOP src tests servers input replicant ;

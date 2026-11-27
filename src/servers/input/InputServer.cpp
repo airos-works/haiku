@@ -1674,7 +1674,10 @@ InputServer::_EventLoop()
 
 		// This is where the message should be processed.
 
-		if (_SanitizeEvents(events)
+		// Each relative step of this round starts where the one before it
+		// ended, not all of them from where the last round left the pointer.
+		BPoint position = fMousePos;
+		if (_SanitizeEvents(events, position)
 			&& _MethodizeEvents(events)
 			&& _FilterEvents(events)) {
 			_UpdateMouseAndKeys(events);
@@ -1750,7 +1753,7 @@ InputServer::_UpdateMouseAndKeys(EventList& events)
 	unwanted events altogether.
 */
 bool
-InputServer::_SanitizeEvents(EventList& events)
+InputServer::_SanitizeEvents(EventList& events, BPoint& position)
 {
 	CALLED();
 
@@ -1768,14 +1771,17 @@ InputServer::_SanitizeEvents(EventList& events)
 	   		}
 	   		case B_MOUSE_UP:
 	   		{
-	   			BPoint where;
+				// An event that says nothing about the position happens
+				// where the pointer is.
+				BPoint where = position;
+				BPoint absolute;
 				int32 x, y;
 				float absX, absY;
 
 				if (event->FindInt32("x", &x) == B_OK
 					&& event->FindInt32("y", &y) == B_OK) {
-					where.x = fMousePos.x + x;
-					where.y = fMousePos.y - y;
+					where.x = position.x + x;
+					where.y = position.y - y;
 
 					event->RemoveName("x");
 					event->RemoveName("y");
@@ -1808,7 +1814,8 @@ InputServer::_SanitizeEvents(EventList& events)
 					event->RemoveName("x");
 					event->RemoveName("y");
 					PRINT(("new position : %f, %f\n", where.x, where.y));
-				} else if (event->FindPoint("where", &where) == B_OK) {
+				} else if (event->FindPoint("where", &absolute) == B_OK) {
+					where = absolute;
 					PRINT(("new position : %f, %f\n", where.x, where.y));
 				}
 
@@ -1820,6 +1827,7 @@ InputServer::_SanitizeEvents(EventList& events)
 				_ConstrainToDisplays(where);
 				if (event->ReplacePoint("where", where) != B_OK)
 					event->AddPoint("where", where);
+				position = where;
 
 				if (!event->HasInt64("when"))
 					event->AddInt64("when", system_time());
@@ -2007,7 +2015,21 @@ InputServer::_FilterEvent(BInputServerFilter* filter, EventList& events,
 		if (result == B_DISPATCH_MESSAGE) {
 			EventList addedEvents;
 			EventList::Private(&addedEvents).AsBList()->AddList(&newEvents);
-			_SanitizeEvents(addedEvents);
+			// The events replace this one: they start from where the pointer
+			// was before it.
+			BPoint position = fMousePos;
+			for (int32 i = index - 1; i >= 0; i--) {
+				BMessage* previous = events.ItemAt(i);
+				BPoint where;
+				if ((previous->what == B_MOUSE_MOVED
+						|| previous->what == B_MOUSE_DOWN
+						|| previous->what == B_MOUSE_UP)
+					&& previous->FindPoint("where", &where) == B_OK) {
+					position = where;
+					break;
+				}
+			}
+			_SanitizeEvents(addedEvents, position);
 			// add the new events - but don't methodize them again
 			events.AddList(&addedEvents, index);
 			index += newEvents.CountItems();

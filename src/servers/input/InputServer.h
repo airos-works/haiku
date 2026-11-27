@@ -202,7 +202,7 @@ class InputServer : public BApplication {
 		static status_t _EventLooper(void *arg);
 
 		void _UpdateMouseAndKeys(EventList& events);
-		bool _SanitizeEvents(EventList& events);
+		bool _SanitizeEvents(EventList& events, BPoint& position);
 		bool _MethodizeEvents(EventList& events);
 		bool _FilterEvents(EventList& events);
 		void _DispatchEvents(EventList& events);

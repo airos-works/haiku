@@ -272,28 +272,10 @@ MouseInputDevice::DeviceWatcher(void* arg)
 			last_click_time = movements.timestamp;
   		}
 
-		if (buttons != 0) {
-			message = new BMessage(B_MOUSE_UP);
-
-			message->AddInt64("when", movements.timestamp);
-			message->AddInt32("be:device_subtype", B_MOUSE_POINTING_DEVICE);
-			message->AddInt32("buttons", movements.buttons);
-
-			if ((buttons & movements.buttons) > 0) {
-				message->what = B_MOUSE_DOWN;
-				message->AddInt32("clicks", clicks_count);
-				LOG("B_MOUSE_DOWN\n");
-			} else {
-				LOG("B_MOUSE_UP\n");
-			}
-
-			message->AddInt32("x", movements.xdelta);
-			message->AddInt32("y", movements.ydelta);
-
-			sSingletonMouseDevice->EnqueueMessage(message);
-			buttons_state = movements.buttons;
-		}
-
+		// input_server adds up the steps of all messages, so the step goes
+		// into one of them only: the move, which goes first with the buttons
+		// as they were, so that a press or release happens where the
+		// pointer has got to.
 		if (movements.xdelta != 0 || movements.ydelta != 0) {
 			int32 xdelta = movements.xdelta;
 			int32 ydelta = movements.ydelta;
@@ -335,12 +317,35 @@ MouseInputDevice::DeviceWatcher(void* arg)
 			if (message) {
 				message->AddInt64("when", movements.timestamp);
 				message->AddInt32("be:device_subtype", B_MOUSE_POINTING_DEVICE);
-				message->AddInt32("buttons", movements.buttons);
+				message->AddInt32("buttons", buttons_state);
 				message->AddInt32("x", xdelta);
 				message->AddInt32("y", ydelta);
 
 				sSingletonMouseDevice->EnqueueMessage(message);
 			}
+		}
+
+		if (buttons != 0) {
+			message = new BMessage(B_MOUSE_UP);
+
+			message->AddInt64("when", movements.timestamp);
+			message->AddInt32("be:device_subtype", B_MOUSE_POINTING_DEVICE);
+			message->AddInt32("buttons", movements.buttons);
+
+			if ((buttons & movements.buttons) > 0) {
+				message->what = B_MOUSE_DOWN;
+				message->AddInt32("clicks", clicks_count);
+				LOG("B_MOUSE_DOWN\n");
+			} else {
+				LOG("B_MOUSE_UP\n");
+			}
+
+			// the step went with the move above
+			message->AddInt32("x", 0);
+			message->AddInt32("y", 0);
+
+			sSingletonMouseDevice->EnqueueMessage(message);
+			buttons_state = movements.buttons;
 		}
 
 		if ((movements.wheel_ydelta != 0) || (movements.wheel_xdelta != 0)) {

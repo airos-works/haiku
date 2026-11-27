@@ -652,6 +652,20 @@ private:
 		_Accelerate(report.x, -report.y, x, y);
 		uint32 buttons = _RemapButtons(report.buttons);
 
+		// input_server adds up the steps of all messages, so the step goes
+		// into one of them only: the move, which goes first with the buttons
+		// as they were. A press or release then happens where the pointer
+		// has got to, which is also where app_server puts it (it takes that
+		// from the last move).
+		if (x != 0 || y != 0) {
+			BMessage* message = new BMessage(B_MOUSE_MOVED);
+			message->AddInt64("when", now);
+			message->AddInt32("be:device_subtype", B_MOUSE_POINTING_DEVICE);
+			message->AddInt32("buttons", _RemapButtons(fButtons));
+			message->AddInt32("x", x);
+			message->AddInt32("y", y);
+			EnqueueMessage(message);
+		}
 		if (report.buttons != fButtons) {
 			uint32 added = report.buttons & ~fButtons;
 			BMessage* message = new BMessage(added != 0
@@ -659,8 +673,8 @@ private:
 			message->AddInt64("when", now);
 			message->AddInt32("be:device_subtype", B_MOUSE_POINTING_DEVICE);
 			message->AddInt32("buttons", buttons);
-			message->AddInt32("x", x);
-			message->AddInt32("y", y);
+			message->AddInt32("x", 0);
+			message->AddInt32("y", 0);
 			if (added != 0) {
 				fClicks = now - fLastClick <= fSettings.click_speed
 					? fClicks + 1 : 1;
@@ -669,16 +683,6 @@ private:
 			}
 			EnqueueMessage(message);
 			fButtons = report.buttons;
-			x = y = 0;
-		}
-		if (x != 0 || y != 0) {
-			BMessage* message = new BMessage(B_MOUSE_MOVED);
-			message->AddInt64("when", now);
-			message->AddInt32("be:device_subtype", B_MOUSE_POINTING_DEVICE);
-			message->AddInt32("buttons", buttons);
-			message->AddInt32("x", x);
-			message->AddInt32("y", y);
-			EnqueueMessage(message);
 		}
 		if (report.wheelX != 0 || report.wheelY != 0) {
 			BMessage* message = new BMessage(B_MOUSE_WHEEL_CHANGED);

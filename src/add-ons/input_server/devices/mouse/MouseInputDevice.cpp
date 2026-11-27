@@ -461,13 +461,26 @@ MouseDevice::_ControlThread()
 		LOG_EVENT("%s: x: %" B_PRId32 ", y: %" B_PRId32 " (%.4f, %.4f)\n", fDeviceRef.name,
 			deltaX, deltaY, historyDeltaX, historyDeltaY);
 
-		// Send single messages for each event
+		// Send single messages for each event. input_server adds up the
+		// steps of all messages, so a report's step goes into one of them
+		// only. The move goes first, with the buttons as they were: a press
+		// or a release then happens where the pointer has got to, which is
+		// also where app_server puts it (it takes that from the last move).
+
+		if (movements.xdelta != 0 || movements.ydelta != 0) {
+			BMessage* message = _BuildMouseMessage(B_MOUSE_MOVED,
+				movements.timestamp,
+				buttons != 0 ? _RemapButtons(lastButtons) : remappedButtons,
+				deltaX, deltaY);
+			if (message != NULL)
+				fTarget.EnqueueMessage(message);
+		}
 
 		if (buttons != 0) {
 			bool pressedButton = (buttons & movements.buttons) > 0;
 			BMessage* message = _BuildMouseMessage(
 				pressedButton ? B_MOUSE_DOWN : B_MOUSE_UP,
-				movements.timestamp, remappedButtons, deltaX, deltaY);
+				movements.timestamp, remappedButtons, 0, 0);
 			if (message != NULL) {
 				if (pressedButton) {
 					message->AddInt32("clicks", movements.clicks);
@@ -478,13 +491,6 @@ MouseDevice::_ControlThread()
 				fTarget.EnqueueMessage(message);
 				lastButtons = movements.buttons;
 			}
-		}
-
-		if (movements.xdelta != 0 || movements.ydelta != 0) {
-			BMessage* message = _BuildMouseMessage(B_MOUSE_MOVED,
-				movements.timestamp, remappedButtons, deltaX, deltaY);
-			if (message != NULL)
-				fTarget.EnqueueMessage(message);
 		}
 
 		// A touchpad also reports the scrolling between whole wheel steps
