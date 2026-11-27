@@ -503,8 +503,18 @@ common_select(int numFDs, fd_set *readSet, fd_set *writeSet, fd_set *errorSet,
 
 	// deselect file descriptors
 
-	for (fd = 0; fd < numFDs; fd++)
-		deselect_fd(fd, sync->set + fd, kernel);
+	// Only what was given to select_fd() can be on a descriptor's list. The
+	// sets are still as the caller passed them; selected_events is not a
+	// guide, select_fd() zeroes it when no hook took an event but keeps the
+	// info on the list all the same. Each deselect_fd() write-locks the
+	// descriptor table, so a high nfds used to cost a lock per index (#227).
+	for (fd = 0; fd < numFDs; fd++) {
+		if ((readSet != NULL && FD_ISSET(fd, readSet))
+			|| (writeSet != NULL && FD_ISSET(fd, writeSet))
+			|| (errorSet != NULL && FD_ISSET(fd, errorSet))) {
+			deselect_fd(fd, sync->set + fd, kernel);
+		}
+	}
 
 	PRINT(("common_select(): events deselected\n"));
 

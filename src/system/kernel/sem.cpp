@@ -914,6 +914,19 @@ switch_sem_etc(sem_id semToBeReleased, sem_id id, int32 count,
 
 		schedulerLocker.Unlock();
 
+		// An absolute timeout that has passed already (poll() and select()
+		// turn a zero timeout into "now") times out here: blocking would arm
+		// a timer that fires at once, and the thread would leave the CPU and
+		// come back for nothing, several microseconds (#227).
+		if ((flags & B_ABSOLUTE_TIMEOUT) != 0
+			&& timeout <= ((flags & B_TIMEOUT_REAL_TIME_BASE) != 0
+				? real_time_clock_usecs() : system_time())) {
+			sSems[slot].u.used.count += count;
+			if (semToBeReleased >= B_OK)
+				release_sem_etc(semToBeReleased, 1, B_DO_NOT_RESCHEDULE);
+			return B_TIMED_OUT;
+		}
+
 		if ((flags & (B_RELATIVE_TIMEOUT | B_ABSOLUTE_TIMEOUT)) == 0)
 			timeout = B_INFINITE_TIMEOUT;
 

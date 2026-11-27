@@ -156,6 +156,10 @@ SimpleTest null_poll_test : null_poll_test.cpp ;
 SimpleTest select_check : select_check.cpp ;
 SimpleTest select_close_test : select_close_test.cpp ;
 
+# poll(), select() and acquire_sem_etc() with a zero or passed timeout return
+# at once, with the same results as before (airos-works/haiku#227)
+SimpleTest poll_timeout_test : poll_timeout_test.cpp ;
+
 SimpleTest sem_acquire_test1 : sem_acquire_test1.cpp : be ;
 
 SimpleTest spinlock_contention : spinlock_contention.cpp ;
