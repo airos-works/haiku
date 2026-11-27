@@ -29,3 +29,4 @@ UsePrivateHeaders drivers ;
 SimpleTest device_area_fork_test : device_area_fork_test.cpp ;
 
 SimpleTest clear_caches_test : clear_caches_test.cpp ;
+SimpleTest tlb_shootdown_test : tlb_shootdown_test.cpp ;

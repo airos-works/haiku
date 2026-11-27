@@ -288,6 +288,10 @@ void
 VMSAv8TranslationMap::Unlock()
 {
 	TRACE("VMSAv8TranslationMap::Unlock()\n");
+	if (recursive_lock_get_recursion(&fLock) == 1) {
+		// released for good: what UnmapPage() left to Flush()
+		Flush();
+	}
 	recursive_lock_unlock(&fLock);
 }
 
@@ -451,11 +455,119 @@ flush_va_if_accessed(uint64_t pte, addr_t va, int asid)
 	return false;
 }
 
+/*!	The map's ASID, read without sAsidLock: an invalidation for an ASID
+	the map has just lost only removes entries of the map that took it, which
+	flushed the whole ASID when it did. A map that has none (-1) has no
+	entries in any TLB, and gets a flushed one before it runs again.
+*/
+int
+VMSAv8TranslationMap::CurrentASID() const
+{
+	return atomic_get((int32*)&fASID);
+}
+
+
 bool
 VMSAv8TranslationMap::FlushVAIfAccessed(uint64_t pte, addr_t va)
 {
-	InterruptsSpinLocker locker(sAsidLock);
-	return flush_va_if_accessed(pte, va, fASID);
+	// No sAsidLock (#236): see CurrentASID(). Interrupts are still off: the
+	// DSB has to run on the CPU that issued the invalidation.
+	InterruptsLocker locker;
+	return flush_va_if_accessed(pte, va, CurrentASID());
+}
+
+
+//	#pragma mark - VMSAv8TLBBatch
+
+
+VMSAv8TLBBatch::VMSAv8TLBBatch()
+	:
+	fCount(0),
+	fTotal(0),
+	fAllUser(false),
+	fAllGlobal(false)
+{
+}
+
+
+/*!	Records the invalidation of \a va if \a pte, the entry it had, may be
+	in a TLB. The new entry must have been written already.
+*/
+void
+VMSAv8TLBBatch::Add(uint64_t pte, addr_t va, int asid)
+{
+	if (!is_pte_accessed(pte)
+		&& ((pte & kPteValidMask) == 0 || (pte & kAttrSWMAYBECACHED) == 0)) {
+		return;
+	}
+
+	bool global = (pte & kAttrNG) == 0;
+	if (!global && asid == -1)
+		return;
+
+	if (++fTotal > kMaxPages) {
+		if (global)
+			fAllGlobal = true;
+		else
+			fAllUser = true;
+		return;
+	}
+
+	fPages[fCount++] = (va & ~(addr_t)(B_PAGE_SIZE - 1)) | (global ? 1 : 0);
+	if (fCount == kBatchSize)
+		_FlushPages(asid);
+}
+
+
+/*!	Invalidates what was recorded, and waits until every CPU has done it. */
+void
+VMSAv8TLBBatch::Complete(int asid)
+{
+	_FlushPages(asid);
+
+	if (!fAllUser && !fAllGlobal) {
+		fTotal = 0;
+		return;
+	}
+
+	arm64_dsb(ishst);
+	if (fAllGlobal)
+		asm volatile("tlbi vmalle1is" ::: "memory");
+	else if (asid != -1)
+		asm volatile("tlbi aside1is, %0" :: "r"(uint64_t(asid) << 48) : "memory");
+	arm64_dsb(ish);
+	arm64_isb();
+
+	fTotal = 0;
+	fAllUser = false;
+	fAllGlobal = false;
+}
+
+
+void
+VMSAv8TLBBatch::_FlushPages(int asid)
+{
+	if (fCount == 0)
+		return;
+
+	// A DSB only waits for the invalidations its own CPU issued.
+	cpu_status state = disable_interrupts();
+
+	arm64_dsb(ishst); // the entries' writes are complete
+	for (int32 i = 0; i < fCount; i++) {
+		uint64_t page = (fPages[i] >> 12) & kTLBIMask;
+		if ((fPages[i] & 1) != 0)
+			asm volatile("tlbi vaae1is, %0" :: "r"(page) : "memory");
+		else if (asid != -1) {
+			asm volatile("tlbi vae1is, %0"
+				:: "r"(page | (uint64_t(asid) << 48)) : "memory");
+		}
+	}
+	arm64_dsb(ish); // done by all CPUs
+	arm64_isb();
+
+	restore_interrupts(state);
+	fCount = 0;
 }
 
 
@@ -636,6 +748,12 @@ VMSAv8TranslationMap::Map(addr_t va, phys_addr_t pa, uint32 attributes, uint32 m
 
 	ThreadCPUPinner pinner(thread_get_current_thread());
 
+	// An entry UnmapPage() left in a TLB must be gone before a new one can
+	// take its place (break-before-make). Only a holder of the lock can
+	// have left one for this address.
+	if (recursive_lock_get_recursion(&fLock) > 0)
+		Flush();
+
 	ASSERT(ValidateVa(va));
 	uint64_t attr = GetMemoryAttr(attributes, memoryType, fIsKernel);
 
@@ -697,12 +815,15 @@ VMSAv8TranslationMap::Unmap(addr_t start, addr_t end)
 	if (fPageTable == 0)
 		return B_OK;
 
+	const int asid = CurrentASID();
+	VMSAv8TLBBatch batch;
 	ProcessRange(fPageTable, fInitialLevel, start, size, nullptr,
-		[=](uint64_t* ptePtr, uint64_t effectiveVa) {
+		[=, &batch](uint64_t* ptePtr, uint64_t effectiveVa) {
 			ASSERT(effectiveVa <= end);
 			uint64_t oldPte = atomic_get_and_set64((int64_t*)ptePtr, 0);
-			FlushVAIfAccessed(oldPte, effectiveVa);
+			batch.Add(oldPte, effectiveVa, asid);
 		});
+	batch.Complete(asid);
 
 	return B_OK;
 }
@@ -728,9 +849,18 @@ VMSAv8TranslationMap::UnmapPage(VMArea* area, addr_t address,
 	ProcessRange(fPageTable, fInitialLevel, address, B_PAGE_SIZE, nullptr,
 		[=, &oldPte](uint64_t* ptePtr, uint64_t effectiveVa) {
 			oldPte = atomic_get_and_set64((int64_t*)ptePtr, 0);
-			if (!deletingAddressSpace)
+			if (deletingAddressSpace)
+				return;
+			if (_flags != NULL) {
+				// UnmapArea(): its Unlock() invalidates them all (#236)
+				fPendingInvalidations.Add(oldPte, effectiveVa, CurrentASID());
+			} else
 				FlushVAIfAccessed(oldPte, effectiveVa);
 		});
+	if (_flags != NULL && recursive_lock_get_recursion(&fLock) == 1) {
+		// the caller does not hold the lock: nobody else would flush them
+		Flush();
+	}
 
 	if ((oldPte & kPteValidMask) == 0)
 		return B_ENTRY_NOT_FOUND;
@@ -768,10 +898,18 @@ VMSAv8TranslationMap::UnmapPages(VMArea* area, addr_t address, size_t size,
 	ThreadCPUPinner pinner(thread_get_current_thread());
 	RecursiveLocker locker(fLock);
 
+	// The invalidations are done together at the end (#236). The pages
+	// cannot be reused before: the caller holds their caches' locks (see
+	// unmap_pages()). While the address space is being deleted, there is
+	// nothing to invalidate, as in UnmapPage(): no CPU runs it any more, and
+	// its ASID is flushed when it is handed out again.
+	const int asid = CurrentASID();
+	VMSAv8TLBBatch batch;
 	ProcessRange(fPageTable, fInitialLevel, address, size, nullptr,
-		[=, &queue](uint64_t* ptePtr, uint64_t effectiveVa) {
+		[=, &queue, &batch](uint64_t* ptePtr, uint64_t effectiveVa) {
 			uint64_t oldPte = atomic_get_and_set64((int64_t*)ptePtr, 0);
-			FlushVAIfAccessed(oldPte, effectiveVa);
+			if (!deletingAddressSpace)
+				batch.Add(oldPte, effectiveVa, asid);
 			if ((oldPte & kPteValidMask) == 0)
 				return;
 
@@ -783,6 +921,8 @@ VMSAv8TranslationMap::UnmapPages(VMArea* area, addr_t address, size_t size,
 				is_pte_accessed(oldPte), is_pte_dirty(oldPte),
 				updatePageQueue, &queue);
 		});
+
+	batch.Complete(asid);
 
 	// TODO: As in UnmapPage() we can lose page dirty flags here. ATM it's not
 	// really critical here, as in all cases this method is used, the unmapped
@@ -894,8 +1034,10 @@ VMSAv8TranslationMap::Protect(addr_t start, addr_t end, uint32 attributes, uint3
 
 	ThreadCPUPinner pinner(thread_get_current_thread());
 
+	const int asid = CurrentASID();
+	VMSAv8TLBBatch batch;
 	ProcessRange(fPageTable, fInitialLevel, start, size, nullptr,
-		[=](uint64_t* ptePtr, uint64_t effectiveVa) {
+		[=, &batch](uint64_t* ptePtr, uint64_t effectiveVa) {
 			ASSERT(effectiveVa <= end);
 			uint64_t currentPte = atomic_get64((int64_t*)ptePtr);
 			phys_addr_t pa = currentPte & kPteAddrMask;
@@ -947,12 +1089,13 @@ VMSAv8TranslationMap::Protect(addr_t start, addr_t end, uint32 attributes, uint3
 					break;
 				} else {
 					if ((uint64_t)atomic_test_and_set64((int64_t*)ptePtr, newPte, oldPte) == oldPte) {
-						FlushVAIfAccessed(oldPte, effectiveVa);
+						batch.Add(oldPte, effectiveVa, asid);
 						break;
 					}
 				}
 			}
 		});
+	batch.Complete(asid);
 
 	return B_OK;
 }
@@ -1279,11 +1422,8 @@ VMSAv8TranslationMap::SplitLargePage(addr_t va, uint64_t* entry)
 		oldPte = previous;
 	}
 	arm64_dsb(ishst);
-	{
-		// whatever AF says: the block may be in a TLB
-		InterruptsSpinLocker locker(sAsidLock);
-		flush_va_if_accessed(oldPte | kAttrAF, va, fASID);
-	}
+	// whatever AF says: the block may be in a TLB
+	flush_va_if_accessed(oldPte | kAttrAF, va, CurrentASID());
 
 	vm_page* page = vm_page_allocate_page(&fSplitReservation,
 		PAGE_STATE_WIRED | VM_PAGE_ALLOC_CLEAR);
@@ -1310,6 +1450,8 @@ VMSAv8TranslationMap::SplitLargePage(addr_t va, uint64_t* entry)
 void
 VMSAv8TranslationMap::Flush()
 {
-	// Necessary invalidation is performed during mapping,
-	// no need to do anything more here.
+	// Everything but the UnmapPage() calls of UnmapArea() invalidates before
+	// it returns.
+	if (!fPendingInvalidations.IsEmpty())
+		fPendingInvalidations.Complete(CurrentASID());
 }

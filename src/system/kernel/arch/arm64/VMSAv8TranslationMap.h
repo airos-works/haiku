@@ -41,6 +41,40 @@ static constexpr uint64_t kTLBIMask = ((1UL << 44) - 1);
 static constexpr uint64_t kASIDMask = 0xFF00000000000000UL;
 
 
+/*!	The TLB invalidations of an operation on a translation map, collected
+	(#236): after the page table entries have been changed, one DSB ISHST,
+	the TLBIs of up to kBatchSize pages, and one DSB ISH that waits for all
+	CPUs to have done them, instead of both barriers for every page. Above
+	kMaxPages pages the whole ASID (or, for global entries, all of EL1&0's
+	entries) is invalidated once instead.
+*/
+class VMSAv8TLBBatch {
+public:
+								VMSAv8TLBBatch();
+
+			bool				IsEmpty() const
+									{ return fCount == 0 && !fAllUser
+										&& !fAllGlobal; }
+
+			void				Add(uint64_t pte, addr_t va, int asid);
+			void				Complete(int asid);
+
+private:
+			void				_FlushPages(int asid);
+
+	static	const int32			kBatchSize = 32;
+	static	const int32			kMaxPages = 512;
+
+			addr_t				fPages[kBatchSize];
+									// page address, bit 0 set for a global
+									// entry
+			int32				fCount;
+			int32				fTotal;
+			bool				fAllUser;
+			bool				fAllGlobal;
+};
+
+
 struct VMSAv8TranslationMap : public VMTranslationMap {
 public:
 	VMSAv8TranslationMap(
@@ -128,6 +162,9 @@ private:
 	int32 fLargePageCount;
 	vm_page_reservation fSplitReservation;
 		// a page for every large page (level 2 block), to split it
+	VMSAv8TLBBatch fPendingInvalidations;
+		// of UnmapPage() calls that leave them to Flush() (UnmapArea()), under
+		// fLock
 
 private:
 	static uint8_t MairIndex(uint8_t type);
@@ -140,6 +177,7 @@ private:
 		vm_page_reservation* reservation, UpdatePte &&updatePte);
 	bool AttemptPteBreakBeforeMake(uint64_t* ptePtr, uint64_t oldPte, addr_t va);
 	bool FlushVAIfAccessed(uint64_t pte, addr_t va);
+	int CurrentASID() const;
 	uint64_t* LargePageEntry(addr_t va, vm_page_reservation* reservation);
 	uint64_t* BlockEntry(addr_t va);
 	void SplitLargePages(addr_t start, addr_t end);
