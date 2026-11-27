@@ -1995,10 +1995,11 @@ Window::_SendUpdateMessage()
 		return;
 
 	BMessage message(_UPDATE_);
-	if (ServerWindow()->SendMessageToClient(&message) != B_OK) {
-		// If sending the message failed, we'll just keep adding to the dirty
-		// region until sending was successful.
-		// TODO: we might want to automatically resend this message in this case
+	if (ServerWindow()->SendMessageToClient(&message, B_NULL_TOKEN, true)
+			!= B_OK) {
+		// The client is gone (a busy one gets the message once it reads its
+		// port again: it waits in the ClientMessageQueue). Should it not be,
+		// the next dirty region tries again.
 		return;
 	}
 

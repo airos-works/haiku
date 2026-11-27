@@ -77,7 +77,10 @@ public:
 
 			void				ScreenChanged(const BMessage* message);
 			status_t			SendMessageToClient(const BMessage* message,
-									int32 target = B_NULL_TOKEN) const;
+									int32 target = B_NULL_TOKEN,
+									bool keep = false) const;
+									// keep: never dropped, even for a
+									// client that reads nothing for long
 
 	virtual	::Window*			MakeWindow(BRect frame, const char* name,
 									window_look look, window_feel feel,

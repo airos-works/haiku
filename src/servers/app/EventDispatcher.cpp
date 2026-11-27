@@ -10,6 +10,7 @@
 #include "EventDispatcher.h"
 
 #include "BitmapManager.h"
+#include "ClientMessageQueue.h"
 #include "Desktop.h"
 #include "EventStream.h"
 #include "HWInterface.h"
@@ -633,23 +634,23 @@ EventDispatcher::SetDesktop(Desktop* desktop)
 /*!
 	\brief Sends \a message to the provided \a messenger.
 
-	TODO: the following feature is not yet implemented:
-	If the message could not be delivered immediately, it is included
-	in a waiting message queue with a fixed length - the least important
-	messages are removed first when that gets full.
+	The message never waits for the target: when its port is full, it waits
+	in the ClientMessageQueue, in order with what follows it. Pointer moves
+	(the least important messages) are the ones that may be dropped there.
 
 	Returns "false" if the target port does not exist anymore, "true"
-	if it doesn't.
+	if it does.
 */
 bool
 EventDispatcher::_SendMessage(BMessenger& messenger, BMessage* message,
 	float importance)
 {
-	// TODO: add failed messages to a queue, and start dropping them by importance
-	//	(and use the same mechanism in ServerWindow::SendMessageToClient())
-
-	status_t status = messenger.SendMessage(message, (BHandler*)NULL, 0);
-	if (status != B_OK) {
+	BMessenger::Private target(messenger);
+	status_t status = ClientMessageQueue::Default().Send(target.Port(),
+		target.Team(), target.Token(), message,
+		importance <= kMouseMovedImportance
+			? ClientMessageQueue::kDroppable : ClientMessageQueue::kNormal);
+	if (status != B_OK && status != B_BAD_PORT_ID) {
 		printf("EventDispatcher: failed to send message '%.4s' to target: %s\n",
 			(char*)&message->what, strerror(status));
 	}

@@ -60,6 +60,7 @@
 #include "AutoDeleter.h"
 #include "BBitmapBuffer.h"
 #include "BitmapManager.h"
+#include "ClientMessageQueue.h"
 #include "Desktop.h"
 #include "DirectWindowInfo.h"
 #include "DrawingEngine.h"
@@ -4704,15 +4705,17 @@ ServerWindow::ScreenChanged(const BMessage* message)
 
 
 status_t
-ServerWindow::SendMessageToClient(const BMessage* msg, int32 target) const
+ServerWindow::SendMessageToClient(const BMessage* msg, int32 target,
+	bool keep) const
 {
 	if (target == B_NULL_TOKEN)
 		target = fClientToken;
 
-	BMessenger reply;
-	BMessage::Private messagePrivate((BMessage*)msg);
-	return messagePrivate.SendMessage(fClientLooperPort, fClientTeam, target,
-		0, false, reply);
+	// Never waits for the client: a busy window gets it once it reads its
+	// port again, in order with the events sent to it meanwhile.
+	return ClientMessageQueue::Default().Send(fClientLooperPort, fClientTeam,
+		target, msg,
+		keep ? ClientMessageQueue::kKeep : ClientMessageQueue::kNormal);
 }
 
 

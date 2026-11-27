@@ -1,0 +1,12 @@
+SubDir HAIKU_TOP src tests servers app window_port_full ;
+
+UsePrivateHeaders app ;
+
+# window_port_full_test (#229): keys, clicks and the _UPDATE_ app_server sends
+# a window whose port is full arrive once it reads again. Needs app_server and
+# input_server (the test VM will do); see the source.
+
+SimpleTest window_port_full_test :
+	window_port_full_test.cpp
+	: be game [ TargetLibsupc++ ]
+;
