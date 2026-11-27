@@ -20,6 +20,10 @@ status_t add_select_sync_pool_entry(select_sync_pool **pool, selectsync *sync,
 			uint8 event);
 status_t remove_select_sync_pool_entry(select_sync_pool **pool,
 			selectsync *sync, uint8 event);
+status_t add_select_sync_pool_events(select_sync_pool **pool,
+			selectsync *sync, uint16 events);
+status_t remove_select_sync_pool_events(select_sync_pool **pool,
+			selectsync *sync, uint16 events);
 void delete_select_sync_pool(select_sync_pool *pool);
 void notify_select_event_pool(select_sync_pool *pool, uint8 event);
 

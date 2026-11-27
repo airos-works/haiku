@@ -33,6 +33,12 @@ extern net_datalink_module_info gNetDatalinkModule;
 extern net_datalink_protocol_module_info gDatalinkInterfaceProtocolModule;
 extern net_stack_interface_module_info gNetStackInterfaceModule;
 
+// net_socket.cpp
+status_t socket_request_notifications(net_socket* socket, uint16 events,
+	selectsync* sync, uint16* _selected);
+status_t socket_cancel_notifications(net_socket* socket, uint16 events,
+	selectsync* sync);
+
 // stack.cpp
 status_t register_domain_datalink_protocols(int family, int type, ...);
 status_t register_domain_protocols(int family, int type, int protocol, ...);

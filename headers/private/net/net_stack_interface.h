@@ -75,6 +75,13 @@ struct net_stack_interface_module_info {
 
 	status_t (*get_next_socket_stat)(int family, uint32 *cookie,
 					struct net_stat *stat);
+
+	// select() and deselect() of several events (SELECT_FLAG()s) at once,
+	// see fd_ops::fd_select_events
+	status_t (*select_events)(net_socket* socket, uint16 events,
+					struct selectsync *sync, uint16 *_selected);
+	status_t (*deselect_events)(net_socket* socket, uint16 events,
+					struct selectsync *sync);
 };
 
 

@@ -52,6 +52,21 @@ struct fd_ops {
 	status_t	(*fd_read_stat)(struct file_descriptor *, struct stat *);
 	status_t	(*fd_write_stat)(struct file_descriptor *, const struct stat *,
 		int statMask);
+
+	// Optional: select or deselect several events (SELECT_FLAG()s) in one
+	// call, where fd_select and fd_deselect take one event at a time. poll()
+	// and select() always add POLLERR and POLLHUP, so a descriptor costs at
+	// least three fd_select and three fd_deselect calls otherwise (#227).
+	// fd_select_events returns in *_selected the events that fd_select would
+	// have returned B_OK for, and notifies those that are ready, like
+	// fd_select. Either hook may return B_UNSUPPORTED to decline, for a
+	// descriptor whose events it cannot take at once; the caller then calls
+	// fd_select or fd_deselect per event. A hook must decline (or not) the
+	// same way for the same descriptor every time.
+	status_t	(*fd_select_events)(struct file_descriptor *, uint16 events,
+						struct selectsync *sync, uint16 *_selected);
+	status_t	(*fd_deselect_events)(struct file_descriptor *, uint16 events,
+						struct selectsync *sync);
 };
 
 struct file_descriptor {

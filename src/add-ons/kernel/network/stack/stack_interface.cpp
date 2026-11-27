@@ -236,6 +236,22 @@ stack_interface_deselect(net_socket* socket, uint8 event,
 }
 
 
+static status_t
+stack_interface_select_events(net_socket* socket, uint16 events,
+	struct selectsync* sync, uint16* _selected)
+{
+	return socket_request_notifications(socket, events, sync, _selected);
+}
+
+
+static status_t
+stack_interface_deselect_events(net_socket* socket, uint16 events,
+	struct selectsync* sync)
+{
+	return socket_cancel_notifications(socket, events, sync);
+}
+
+
 status_t
 stack_interface_get_next_socket_stat(int family, uint32* cookie,
 	struct net_stat* stat)
@@ -298,5 +314,8 @@ net_stack_interface_module_info gNetStackInterfaceModule = {
 	&stack_interface_select,
 	&stack_interface_deselect,
 
-	&stack_interface_get_next_socket_stat
+	&stack_interface_get_next_socket_stat,
+
+	&stack_interface_select_events,
+	&stack_interface_deselect_events
 };

@@ -11,5 +11,10 @@
 status_t	create_fifo_vnode(fs_volume* superVolume, fs_vnode* vnode);
 void		fifo_init();
 
+status_t	fifo_select_events(fs_vnode* vnode, void* cookie, uint16 events,
+				selectsync* sync, uint16* _selected);
+status_t	fifo_deselect_events(fs_vnode* vnode, void* cookie,
+				uint16 events, selectsync* sync);
+
 
 #endif	// _VFS_FIFO_H

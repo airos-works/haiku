@@ -378,6 +378,10 @@ static status_t file_select(struct file_descriptor* descriptor, uint8 event,
 	struct selectsync* sync);
 static status_t file_deselect(struct file_descriptor* descriptor, uint8 event,
 	struct selectsync* sync);
+static status_t file_select_events(struct file_descriptor* descriptor,
+	uint16 events, struct selectsync* sync, uint16* _selected);
+static status_t file_deselect_events(struct file_descriptor* descriptor,
+	uint16 events, struct selectsync* sync);
 static status_t dir_read(struct io_context* context,
 	struct file_descriptor* descriptor, struct dirent* buffer,
 	size_t bufferSize, uint32* _count);
@@ -459,6 +463,8 @@ static struct fd_ops sFileOps = {
 	NULL,		// rewind_dir()
 	common_read_stat,
 	common_write_stat,
+	file_select_events,
+	file_deselect_events,
 };
 
 static struct fd_ops sDirectoryOps = {
@@ -6057,6 +6063,43 @@ file_deselect(struct file_descriptor* descriptor, uint8 event,
 		return B_OK;
 
 	return FS_CALL(vnode, deselect, descriptor->cookie, event, sync);
+}
+
+
+/*!	All of \a events at once where that is possible: for FIFOs and pipes,
+	and for a file system without a select() hook, which file_select() would
+	report ready event by event. Other nodes are selected per event through
+	the file system's hook (#227).
+*/
+static status_t
+file_select_events(struct file_descriptor* descriptor, uint16 events,
+	struct selectsync* sync, uint16* _selected)
+{
+	struct vnode* vnode = descriptor->u.vnode;
+
+	if (!HAS_FS_CALL(vnode, select)) {
+		events &= ~SELECT_OUTPUT_ONLY_FLAGS;
+		if (events != 0)
+			notify_select_events((select_info*)sync, events);
+		*_selected = 0;
+		return B_OK;
+	}
+
+	return fifo_select_events(vnode, descriptor->cookie, events, sync,
+		_selected);
+}
+
+
+static status_t
+file_deselect_events(struct file_descriptor* descriptor, uint16 events,
+	struct selectsync* sync)
+{
+	struct vnode* vnode = descriptor->u.vnode;
+
+	if (!HAS_FS_CALL(vnode, deselect))
+		return B_OK;
+
+	return fifo_deselect_events(vnode, descriptor->cookie, events, sync);
 }
 
 

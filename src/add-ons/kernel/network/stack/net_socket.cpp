@@ -29,6 +29,7 @@
 
 #include <fs/select_sync_pool.h>
 #include <kernel.h>
+#include <wait_for_objects.h>
 
 #include <net_protocol.h>
 #include <net_stack.h>
@@ -953,6 +954,76 @@ socket_cancel_notification(net_socket* _socket, uint8 event, selectsync* sync)
 
 	MutexLocker _(socket->lock);
 	return remove_select_sync_pool_entry(&socket->select_pool, sync, event);
+}
+
+
+/*!	socket_request_notification() of all of \a events (SELECT_FLAG()s) at
+	once: one lock round trip and one pool entry look-up per call, where poll()
+	and select() made at least three socket_request_notification() calls per
+	socket (#227). That one takes any event, and so does this: all of
+	\a events are selected, or none if the pool entry cannot be allocated.
+*/
+status_t
+socket_request_notifications(net_socket* _socket, uint16 events,
+	selectsync* sync, uint16* _selected)
+{
+	net_socket_private* socket = (net_socket_private*)_socket;
+
+	*_selected = 0;
+
+	mutex_lock(&socket->lock);
+
+	status_t status = add_select_sync_pool_events(&socket->select_pool, sync,
+		events);
+
+	mutex_unlock(&socket->lock);
+
+	if (status != B_OK)
+		return status;
+
+	*_selected = events;
+
+	// check if the events are already present, as
+	// socket_request_notification() does
+
+	if ((events & (SELECT_FLAG(B_SELECT_READ)
+			| SELECT_FLAG(B_SELECT_DISCONNECTED))) != 0) {
+		ssize_t available = socket_read_avail(socket);
+		if ((events & SELECT_FLAG(B_SELECT_READ)) != 0
+			&& ((ssize_t)socket->receive.low_water_mark <= available
+				|| available < B_OK)) {
+			notify_select_event(sync, B_SELECT_READ);
+		}
+		if ((events & SELECT_FLAG(B_SELECT_DISCONNECTED)) != 0
+			&& available < 0) {
+			notify_select_event(sync, B_SELECT_DISCONNECTED);
+		}
+	}
+
+	if ((events & SELECT_FLAG(B_SELECT_WRITE)) != 0
+		&& (socket->options & SO_ACCEPTCONN) == 0) {
+		ssize_t available = socket_send_avail(socket);
+		if ((ssize_t)socket->send.low_water_mark <= available
+			|| available < B_OK) {
+			notify_select_event(sync, B_SELECT_WRITE);
+		}
+	}
+
+	if ((events & SELECT_FLAG(B_SELECT_ERROR)) != 0 && socket->error != B_OK)
+		notify_select_event(sync, B_SELECT_ERROR);
+
+	return B_OK;
+}
+
+
+status_t
+socket_cancel_notifications(net_socket* _socket, uint16 events,
+	selectsync* sync)
+{
+	net_socket_private* socket = (net_socket_private*)_socket;
+
+	MutexLocker _(socket->lock);
+	return remove_select_sync_pool_events(&socket->select_pool, sync, events);
 }
 
 

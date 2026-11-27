@@ -304,6 +304,24 @@ socket_deselect(struct file_descriptor *descriptor, uint8 event,
 
 
 static status_t
+socket_select_events(struct file_descriptor *descriptor, uint16 events,
+	struct selectsync *sync, uint16 *_selected)
+{
+	return sStackInterface->select_events(FD_SOCKET(descriptor), events, sync,
+		_selected);
+}
+
+
+static status_t
+socket_deselect_events(struct file_descriptor *descriptor, uint16 events,
+	struct selectsync *sync)
+{
+	return sStackInterface->deselect_events(FD_SOCKET(descriptor), events,
+		sync);
+}
+
+
+static status_t
 socket_read_stat(struct file_descriptor *descriptor, struct stat *st)
 {
 	st->st_dev = 0;
@@ -361,6 +379,8 @@ static struct fd_ops sSocketFDOps = {
 	NULL,	// fd_rewind_dir
 	&socket_read_stat,
 	NULL,	// fd_write_stat
+	&socket_select_events,
+	&socket_deselect_events,
 };
 
 

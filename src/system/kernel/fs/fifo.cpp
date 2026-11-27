@@ -35,6 +35,7 @@
 #include <vfs.h>
 #include <vfs_defs.h>
 #include <vm/vm.h>
+#include <wait_for_objects.h>
 
 
 //#define TRACE_FIFO
@@ -210,6 +211,10 @@ public:
 									int openMode);
 			status_t			Deselect(uint8 event, selectsync* sync,
 									int openMode);
+			uint16				SelectEvents(uint16 events,
+									selectsync* sync, int openMode);
+			void				DeselectEvents(uint16 events,
+									selectsync* sync, int openMode);
 
 			void				Dump(bool dumpData) const;
 	static	int					Dump(int argc, char** argv);
@@ -963,6 +968,93 @@ Inode::Deselect(uint8 event, selectsync* sync, int openMode)
 }
 
 
+/*!	Splits \a events (SELECT_FLAG()s) into those that go into the read
+	pool and those that go into the write pool, as Select() and Deselect()
+	choose the pool per event. Events that Select() refuses are dropped.
+*/
+static void
+split_fifo_select_events(uint16 events, int openMode, uint16& _readEvents,
+	uint16& _writeEvents)
+{
+	// the events Select() takes
+	events &= SELECT_FLAG(B_SELECT_READ) | SELECT_FLAG(B_SELECT_WRITE)
+		| SELECT_FLAG(B_SELECT_ERROR) | SELECT_FLAG(B_SELECT_DISCONNECTED);
+
+	_readEvents = 0;
+	_writeEvents = 0;
+	switch (openMode & O_RWMASK) {
+		case O_RDONLY:
+			_readEvents = events;
+			break;
+		case O_RDWR:
+			// B_SELECT_READ can happen on write-only opened fds, so restrain
+			// B_SELECT_READ to O_RDWR
+			_readEvents = events & SELECT_FLAG(B_SELECT_READ);
+			_writeEvents = events & ~SELECT_FLAG(B_SELECT_READ);
+			break;
+		case O_WRONLY:
+			_writeEvents = events;
+			break;
+	}
+}
+
+
+/*!	Select() of all of \a events at once, under one lock (#227). Returns the
+	events that Select() would have returned B_OK for.
+*/
+uint16
+Inode::SelectEvents(uint16 events, selectsync* sync, int openMode)
+{
+	uint16 readEvents;
+	uint16 writeEvents;
+	split_fifo_select_events(events, openMode, readEvents, writeEvents);
+
+	WriteLocker locker(ChangeLock());
+
+	if (readEvents != 0 && add_select_sync_pool_events(&fReadSelectSyncPool,
+			sync, readEvents) != B_OK) {
+		readEvents = 0;
+	}
+	if (writeEvents != 0 && add_select_sync_pool_events(&fWriteSelectSyncPool,
+			sync, writeEvents) != B_OK) {
+		writeEvents = 0;
+	}
+
+	// signal right away, if the condition holds already
+	uint16 ready = 0;
+	if (fBuffer.Readable() > 0)
+		ready |= readEvents & SELECT_FLAG(B_SELECT_READ);
+	if (fWriterCount == 0)
+		ready |= readEvents & SELECT_FLAG(B_SELECT_DISCONNECTED);
+	if (fBuffer.Writable() > 0)
+		ready |= writeEvents & SELECT_FLAG(B_SELECT_WRITE);
+	if (fReaderCount == 0)
+		ready |= writeEvents & SELECT_FLAG(B_SELECT_ERROR);
+	if (ready != 0)
+		notify_select_events((select_info*)sync, ready);
+
+	return readEvents | writeEvents;
+}
+
+
+void
+Inode::DeselectEvents(uint16 events, selectsync* sync, int openMode)
+{
+	uint16 readEvents;
+	uint16 writeEvents;
+	split_fifo_select_events(events, openMode, readEvents, writeEvents);
+
+	WriteLocker locker(ChangeLock());
+
+	if (readEvents != 0)
+		remove_select_sync_pool_events(&fReadSelectSyncPool, sync, readEvents);
+	if (writeEvents != 0) {
+		remove_select_sync_pool_events(&fWriteSelectSyncPool, sync,
+			writeEvents);
+	}
+}
+
+
 void
 Inode::Dump(bool dumpData) const
 {
@@ -1467,6 +1559,41 @@ using namespace fifo;
 
 
 // #pragma mark -
+
+
+/*!	The fd_ops::fd_select_events of a FIFO or pipe: vfs.cpp's
+	file_select_events() hands the FIFOs to it, since the file system
+	interface has no hook for several events. Returns B_UNSUPPORTED if
+	\a vnode is not a FIFO.
+*/
+status_t
+fifo_select_events(fs_vnode* vnode, void* _cookie, uint16 events,
+	selectsync* sync, uint16* _selected)
+{
+	if (vnode->ops != &sFIFOVnodeOps)
+		return B_UNSUPPORTED;
+
+	file_cookie* cookie = (file_cookie*)_cookie;
+	Inode* inode = (Inode*)vnode->private_node;
+	*_selected = inode != NULL
+		? inode->SelectEvents(events, sync, cookie->open_mode) : 0;
+	return B_OK;
+}
+
+
+status_t
+fifo_deselect_events(fs_vnode* vnode, void* _cookie, uint16 events,
+	selectsync* sync)
+{
+	if (vnode->ops != &sFIFOVnodeOps)
+		return B_UNSUPPORTED;
+
+	file_cookie* cookie = (file_cookie*)_cookie;
+	Inode* inode = (Inode*)vnode->private_node;
+	if (inode != NULL)
+		inode->DeselectEvents(events, sync, cookie->open_mode);
+	return B_OK;
+}
 
 
 status_t

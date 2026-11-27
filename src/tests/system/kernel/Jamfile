@@ -176,6 +176,11 @@ SimpleTest select_wakeup_test : select_wakeup_test.cpp ;
 # at once, with the same results as before (airos-works/haiku#227)
 SimpleTest poll_timeout_test : poll_timeout_test.cpp ;
 
+# poll() and select() report the same events for pipes, FIFOs, sockets, files
+# and devices, ready at once or woken, since pipes and sockets take all of a
+# descriptor's events in one select hook call (airos-works/haiku#227)
+SimpleTest poll_events_test : poll_events_test.cpp : network ;
+
 SimpleTest sem_acquire_test1 : sem_acquire_test1.cpp : be ;
 
 SimpleTest spinlock_contention : spinlock_contention.cpp ;

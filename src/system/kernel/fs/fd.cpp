@@ -591,6 +591,63 @@ fd_ioctl(bool kernelFD, int fd, uint32 op, void* buffer, size_t length)
 }
 
 
+/*!	Selects \a events (SELECT_FLAG()s, B_EVENT_INVALID excluded) of the
+	descriptor for \a info, and returns the ones the descriptor's hooks took.
+	The fd_ops::fd_select_events hook takes them all at once where it is
+	implemented and does not decline; otherwise fd_select is called per event.
+*/
+static uint16
+select_fd_events(file_descriptor* descriptor, uint16 events,
+	select_info* info)
+{
+	// Events 1 to 15, as the per-event loop below has always taken them.
+	events &= SELECT_FLAG(16) - 1;
+
+	uint16 selected = 0;
+	if (descriptor->ops->fd_select_events != NULL
+		&& descriptor->ops->fd_select_events(descriptor, events,
+			(selectsync*)info, &selected) != B_UNSUPPORTED) {
+		return selected & events;
+	}
+
+	for (uint16 event = 1; event < 16; event++) {
+		if ((events & SELECT_FLAG(event)) != 0
+			&& descriptor->ops->fd_select(descriptor, event,
+				(selectsync*)info) == B_OK) {
+			selected |= SELECT_FLAG(event);
+		}
+	}
+
+	return selected;
+}
+
+
+/*!	Deselects \a events that select_fd_events() selected for \a info. */
+static void
+deselect_fd_events(file_descriptor* descriptor, uint16 events,
+	select_info* info)
+{
+	if (events == 0)
+		return;
+
+	if (descriptor->ops->fd_deselect_events != NULL
+		&& descriptor->ops->fd_deselect_events(descriptor, events,
+			(selectsync*)info) != B_UNSUPPORTED) {
+		return;
+	}
+
+	if (descriptor->ops->fd_deselect == NULL)
+		return;
+
+	for (uint16 event = 1; event < 16; event++) {
+		if ((events & SELECT_FLAG(event)) != 0) {
+			descriptor->ops->fd_deselect(descriptor, event,
+				(selectsync*)info);
+		}
+	}
+}
+
+
 static void
 deselect_select_infos(file_descriptor* descriptor, select_info* infos,
 	bool putSyncObjects)
@@ -602,15 +659,8 @@ deselect_select_infos(file_descriptor* descriptor, select_info* infos,
 		select_sync* sync = info->sync;
 
 		// deselect the selected events
-		uint16 eventsToDeselect = info->selected_events & ~B_EVENT_INVALID;
-		if (descriptor->ops->fd_deselect != NULL && eventsToDeselect != 0) {
-			for (uint16 event = 1; event < 16; event++) {
-				if ((eventsToDeselect & SELECT_FLAG(event)) != 0) {
-					descriptor->ops->fd_deselect(descriptor, event,
-						(selectsync*)info);
-				}
-			}
-		}
+		deselect_fd_events(descriptor,
+			info->selected_events & ~B_EVENT_INVALID, info);
 
 		select_info* next = info->next;
 		notify_select_events(info, B_EVENT_INVALID);
@@ -658,15 +708,8 @@ select_fd(int32 fd, struct select_info* info, bool kernel)
 	readLocker.Unlock();
 
 	// select any events asked for
-	uint32 selectedEvents = 0;
-
-	for (uint16 event = 1; event < 16; event++) {
-		if ((eventsToSelect & SELECT_FLAG(event)) != 0
-			&& descriptor->ops->fd_select(descriptor.Get(), event,
-				(selectsync*)info) == B_OK) {
-			selectedEvents |= SELECT_FLAG(event);
-		}
-	}
+	uint16 selectedEvents = select_fd_events(descriptor.Get(),
+		eventsToSelect, info);
 	info->selected_events = selectedEvents
 		| (info->selected_events & B_EVENT_INVALID);
 
@@ -745,15 +788,8 @@ deselect_fd(int32 fd, struct select_info* info, bool kernel)
 	locker.Unlock();
 
 	// deselect the selected events
-	uint16 eventsToDeselect = info->selected_events & ~B_EVENT_INVALID;
-	if (descriptor->ops->fd_deselect != NULL && eventsToDeselect != 0) {
-		for (uint16 event = 1; event < 16; event++) {
-			if ((eventsToDeselect & SELECT_FLAG(event)) != 0) {
-				descriptor->ops->fd_deselect(descriptor.Get(), event,
-					(selectsync*)info);
-			}
-		}
-	}
+	deselect_fd_events(descriptor.Get(),
+		info->selected_events & ~B_EVENT_INVALID, info);
 
 	put_select_sync(info->sync);
 

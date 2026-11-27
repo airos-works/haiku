@@ -909,7 +909,7 @@ find_select_sync_pool_entry(select_sync_pool *pool, selectsync *sync)
 
 static status_t
 add_select_sync_pool_entry(select_sync_pool *pool, selectsync *sync,
-	uint8 event)
+	uint16 events)
 {
 	// check, whether the entry does already exist
 	select_sync_pool_entry *entry = find_select_sync_pool_entry(pool, sync);
@@ -924,15 +924,21 @@ add_select_sync_pool_entry(select_sync_pool *pool, selectsync *sync,
 		pool->entries.Add(entry);
 	}
 
-	entry->events |= SELECT_FLAG(event);
+	entry->events |= events;
 
 	return B_OK;
 }
 
 
+/*!	Adds all of \a events (SELECT_FLAG()s) for \a sync at once. A select()
+	hook that takes several events in one call (fd_ops::fd_select_events)
+	looks the entry up once, where the per-event hooks did so (and took
+	their lock) once per event: at least three times per descriptor and
+	poll() (#227).
+*/
 status_t
-add_select_sync_pool_entry(select_sync_pool **_pool, selectsync *sync,
-	uint8 event)
+add_select_sync_pool_events(select_sync_pool **_pool, selectsync *sync,
+	uint16 events)
 {
 	// create the pool, if necessary
 	select_sync_pool *pool = *_pool;
@@ -945,7 +951,7 @@ add_select_sync_pool_entry(select_sync_pool **_pool, selectsync *sync,
 	}
 
 	// add the entry
-	status_t error = add_select_sync_pool_entry(pool, sync, event);
+	status_t error = add_select_sync_pool_entry(pool, sync, events);
 
 	// cleanup
 	if (pool->entries.IsEmpty()) {
@@ -958,21 +964,32 @@ add_select_sync_pool_entry(select_sync_pool **_pool, selectsync *sync,
 
 
 status_t
-remove_select_sync_pool_entry(select_sync_pool **_pool, selectsync *sync,
+add_select_sync_pool_entry(select_sync_pool **_pool, selectsync *sync,
 	uint8 event)
+{
+	return add_select_sync_pool_events(_pool, sync, SELECT_FLAG(event));
+}
+
+
+/*!	Removes all of \a events (SELECT_FLAG()s) of \a sync at once, see
+	add_select_sync_pool_events().
+*/
+status_t
+remove_select_sync_pool_events(select_sync_pool **_pool, selectsync *sync,
+	uint16 events)
 {
 	select_sync_pool *pool = *_pool;
 	if (!pool)
 		return B_ENTRY_NOT_FOUND;
 
-	// clear the event flag of the concerned entries
+	// clear the event flags of the concerned entries
 	bool found = false;
 	for (SelectSyncPoolEntryList::Iterator it = pool->entries.GetIterator();
 		 it.HasNext();) {
 		select_sync_pool_entry *entry = it.Next();
 		if (entry->sync == sync) {
 			found = true;
-			entry->events &= ~SELECT_FLAG(event);
+			entry->events &= ~events;
 
 			// remove the entry, if no longer needed
 			if (entry->events == 0) {
@@ -992,6 +1009,14 @@ remove_select_sync_pool_entry(select_sync_pool **_pool, selectsync *sync,
 	}
 
 	return B_OK;
+}
+
+
+status_t
+remove_select_sync_pool_entry(select_sync_pool **_pool, selectsync *sync,
+	uint8 event)
+{
+	return remove_select_sync_pool_events(_pool, sync, SELECT_FLAG(event));
 }
 
 
