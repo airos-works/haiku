@@ -1839,8 +1839,14 @@ vm_create_anonymous_area(team_id team, const char *name, addr_t size,
 	if (wiring == B_CONTIGUOUS) {
 		// we try to allocate the page run here upfront as this may easily
 		// fail for obvious reasons
-		page = vm_page_allocate_page_run(PAGE_STATE_WIRED | pageAllocFlags,
-			size / B_PAGE_SIZE, physicalAddressRestrictions, priority);
+		// With CREATE_AREA_DONT_WAIT the run must not wait for pages either
+		// (nor take cached pages, which can wait for their caches): the
+		// caller may be on the I/O path that would free them (#211).
+		uint32 runFlags = PAGE_STATE_WIRED | pageAllocFlags;
+		if ((flags & CREATE_AREA_DONT_WAIT) != 0)
+			runFlags |= VM_PAGE_ALLOC_DONT_WAIT;
+		page = vm_page_allocate_page_run(runFlags, size / B_PAGE_SIZE,
+			physicalAddressRestrictions, priority);
 		if (page == NULL) {
 			status = B_NO_MEMORY;
 			goto err0;
