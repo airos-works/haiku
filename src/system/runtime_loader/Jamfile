@@ -101,6 +101,12 @@ for architectureObject in [ MultiArchSubDirSetup ] {
 			<src!system!libroot!posix!string!$(architecture)>strrchr.o
 			: $(archStringObjects) ]
 		;
+		# The members depend on the lists above: archive again when they
+		# change, or an incremental build keeps the left-out objects next to
+		# the architecture's versions (multiple definitions at the link).
+		local jamfile = [ FGristFiles Jamfile ] ;
+		SEARCH on $(jamfile) = $(SUBDIR) ;
+		Depends <$(architecture)>libruntime_loader.a : $(jamfile) ;
 
 		SEARCH on [ FGristFiles kernel_cpp.cpp ]
 			= [ FDirName $(HAIKU_TOP) src system kernel util ] ;
