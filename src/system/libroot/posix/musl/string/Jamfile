@@ -9,20 +9,26 @@ local architectureObject ;
 for architectureObject in [ MultiArchSubDirSetup ] {
 	on $(architectureObject) {
 		local architecture = $(TARGET_PACKAGING_ARCH) ;
-		local memmoveSource = memmove.c ;
-		local strlenSource = strlen.c ;
-		# ARM64 supplies these in the architecture string object.
+
+		# The architecture string object (posix/string/arch/*/Jamfile)
+		# supplies these; keep the list in sync with the runtime_loader's
+		# Jamfile. On x86_64 strchr(), strcpy() and strnlen() stay the C
+		# wrappers around strchrnul(), stpcpy() and memchr().
+		local archSources ;
 		if $(architecture) = arm64 {
-			memmoveSource = ;
-			strlenSource = ;
+			archSources = memchr.c memmove.c memrchr.c stpcpy.c strchr.c
+				strchrnul.c strcpy.c strlen.c strnlen.c ;
+		} else if $(architecture) = x86_64 {
+			archSources = memchr.c memmove.c memrchr.c stpcpy.c strchrnul.c
+				strlen.c ;
 		}
 
-		MergeObject <$(architecture)>posix_musl_string.o :
+		MergeObject <$(architecture)>posix_musl_string.o : [ FFilter
 			index.c
 			memccpy.c
 			memchr.c
 			memmem.c
-			$(memmoveSource)
+			memmove.c
 			memrchr.c
 			stpcpy.c
 			stpncpy.c
@@ -33,7 +39,7 @@ for architectureObject in [ MultiArchSubDirSetup ] {
 			strcspn.c
 			strlcat.c
 			strlcpy.c
-			$(strlenSource)
+			strlen.c
 			strncat.c
 			strnlen.c
 			strpbrk.c
@@ -41,6 +47,11 @@ for architectureObject in [ MultiArchSubDirSetup ] {
 			strstr.c
 			strtok_r.c
 			swab.c
-			;
+			: $(archSources) ] ;
+		# The members depend on the list above: merge again when it changes,
+		# or an incremental build keeps the ones left out.
+		local jamfile = [ FGristFiles Jamfile ] ;
+		SEARCH on $(jamfile) = $(SUBDIR) ;
+		Depends <$(architecture)>posix_musl_string.o : $(jamfile) ;
 	}
 }

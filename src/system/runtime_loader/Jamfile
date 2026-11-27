@@ -10,17 +10,28 @@ local architectureObject ;
 for architectureObject in [ MultiArchSubDirSetup ] {
 	on $(architectureObject) {
 		local architecture = $(TARGET_PACKAGING_ARCH) ;
-		local memmoveObject
-			= <src!system!libroot!posix!musl!string!$(architecture)>memmove.o ;
-		local strcmpObject
-			= <src!system!libroot!posix!string!$(architecture)>strcmp.o ;
-		local strlenObject
-			= <src!system!libroot!posix!musl!string!$(architecture)>strlen.o ;
-		# ARM64 supplies these in the architecture string object.
+		local muslString
+			= src!system!libroot!posix!musl!string!$(architecture) ;
+		local posixString = src!system!libroot!posix!string!$(architecture) ;
+
+		# The string functions the architecture string object supplies, as in
+		# libroot's posix/string and posix/musl/string Jamfiles.
+		local archStringObjects ;
 		if $(architecture) = arm64 {
-			memmoveObject = ;
-			strcmpObject = ;
-			strlenObject = ;
+			archStringObjects = <$(muslString)>memchr.o
+				<$(muslString)>memmove.o <$(muslString)>stpcpy.o
+				<$(muslString)>strchr.o <$(muslString)>strchrnul.o
+				<$(muslString)>strcpy.o <$(muslString)>strlen.o
+				<$(muslString)>strnlen.o ;
+		} else if $(architecture) = x86_64 {
+			archStringObjects = <$(muslString)>memchr.o
+				<$(muslString)>memmove.o <$(muslString)>stpcpy.o
+				<$(muslString)>strchrnul.o <$(muslString)>strlen.o ;
+		}
+		if $(architecture) = arm64 || $(architecture) = x86_64 {
+			archStringObjects += <$(posixString)>memcmp.o
+				<$(posixString)>strcmp.o <$(posixString)>strncmp.o
+				<$(posixString)>strrchr.o ;
 		}
 
 		UsePrivateHeaders libroot runtime_loader shared ;
@@ -64,8 +75,9 @@ for architectureObject in [ MultiArchSubDirSetup ] {
 			<src!system!libroot!posix!locale!$(architecture)>ctype_loc_global.o
 			<src!system!libroot!posix!locale!$(architecture)>LocaleData.o
 
+			[ FFilter
 			<src!system!libroot!posix!musl!string!$(architecture)>memchr.o
-			$(memmoveObject)
+			<src!system!libroot!posix!musl!string!$(architecture)>memmove.o
 			<src!system!libroot!posix!musl!string!$(architecture)>stpcpy.o
 			<src!system!libroot!posix!musl!string!$(architecture)>strcat.o
 			<src!system!libroot!posix!musl!string!$(architecture)>strchr.o
@@ -74,7 +86,7 @@ for architectureObject in [ MultiArchSubDirSetup ] {
 			<src!system!libroot!posix!musl!string!$(architecture)>strcspn.o
 			<src!system!libroot!posix!musl!string!$(architecture)>strlcat.o
 			<src!system!libroot!posix!musl!string!$(architecture)>strlcpy.o
-			$(strlenObject)
+			<src!system!libroot!posix!musl!string!$(architecture)>strlen.o
 			<src!system!libroot!posix!musl!string!$(architecture)>strnlen.o
 			<src!system!libroot!posix!musl!string!$(architecture)>strpbrk.o
 			<src!system!libroot!posix!musl!string!$(architecture)>strspn.o
@@ -82,11 +94,12 @@ for architectureObject in [ MultiArchSubDirSetup ] {
 
 			<src!system!libroot!posix!string!$(architecture)>memcmp.o
 			<src!system!libroot!posix!string!$(architecture)>strcasecmp.o
-			$(strcmpObject)
+			<src!system!libroot!posix!string!$(architecture)>strcmp.o
 			<src!system!libroot!posix!string!$(architecture)>strdup.o
 			<src!system!libroot!posix!string!$(architecture)>strerror.o
 			<src!system!libroot!posix!string!$(architecture)>strncmp.o
 			<src!system!libroot!posix!string!$(architecture)>strrchr.o
+			: $(archStringObjects) ]
 		;
 
 		SEARCH on [ FGristFiles kernel_cpp.cpp ]

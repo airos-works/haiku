@@ -15,19 +15,22 @@ local architectureObject ;
 for architectureObject in [ MultiArchSubDirSetup ] {
 	on $(architectureObject) {
 		local architecture = $(TARGET_PACKAGING_ARCH) ;
-		local strcmpSource = strcmp.c ;
-		if $(architecture) = arm64 {
-			strcmpSource = ;
+
+		# The architecture string object (arch/*/Jamfile) supplies these;
+		# keep the list in sync with the runtime_loader's Jamfile.
+		local archSources ;
+		if $(architecture) = arm64 || $(architecture) = x86_64 {
+			archSources = memcmp.c strcmp.c strncmp.c strrchr.c ;
 		}
 
-		MergeObject <$(architecture)>posix_string.o :
+		MergeObject <$(architecture)>posix_string.o : [ FFilter
 			bcmp.c
 			bcopy.c
 			bzero.c
 			memcmp.c
 			strcasecmp.c
 			strcasestr.c
-			$(strcmpSource)
+			strcmp.c
 			strcoll.cpp
 			strdup.cpp
 			strerror.c
@@ -39,7 +42,12 @@ for architectureObject in [ MultiArchSubDirSetup ] {
 			strtok.c
 			strupr.c
 			strxfrm.cpp
-			;
+			: $(archSources) ] ;
+		# The members depend on the list above: merge again when it changes,
+		# or an incremental build keeps the ones left out.
+		local jamfile = [ FGristFiles Jamfile ] ;
+		SEARCH on $(jamfile) = $(SUBDIR) ;
+		Depends <$(architecture)>posix_string.o : $(jamfile) ;
 	}
 }
 

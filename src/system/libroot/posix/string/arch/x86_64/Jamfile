@@ -10,9 +10,22 @@ for architectureObject in [ MultiArchSubDirSetup x86_64 ] {
 
 		UsePrivateSystemHeaders ;
 
+		# The generic C versions of these are left out in
+		# posix/string/Jamfile, posix/musl/string/Jamfile and the
+		# runtime_loader's Jamfile.
 		MergeObject <$(architecture)>posix_string_arch_$(TARGET_ARCH).o :
+			memchr.S
+			memcmp.S
 			memcpy.cpp
+			memmove.cpp
+			memrchr.S
 			memset.cpp
+			stpcpy.S
+			strchrnul.S
+			strcmp.S
+			strlen.S
+			strncmp.S
+			strrchr.S
 			;
 	}
 }

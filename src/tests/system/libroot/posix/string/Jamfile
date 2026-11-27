@@ -7,3 +7,10 @@ SimpleTest compare_test
 SimpleTest memcpy_test
 	: memcpy_test.cpp
 ;
+
+# -fno-builtin: the calls must reach libroot's functions
+ObjectCcFlags string_guard_test.c : -fno-builtin -DTEST_LIBROOT
+	-Werror=implicit-function-declaration ;
+SimpleTest string_guard_test
+	: string_guard_test.c
+;

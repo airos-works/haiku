@@ -12,11 +12,24 @@ for architectureObject in [ MultiArchSubDirSetup arm64 ] {
 
 		SEARCH_SOURCE += [ FDirName $(SUBDIR) $(DOTDOT) generic ] ;
 
+		# The generic C versions of these are left out in
+		# posix/string/Jamfile, posix/musl/string/Jamfile and the
+		# runtime_loader's Jamfile.
 		MergeObject <$(architecture)>posix_string_arch_$(TARGET_ARCH).o :
+			arm64_memchr.S
+			arm64_memcmp.S
 			arm64_memcpy.S
+			arm64_memrchr.S
 			arm64_memset.S
+			arm64_stpcpy.S
+			arm64_strchr.S
+			arm64_strchrnul.S
 			arm64_strcmp.S
+			arm64_strcpy.S
 			arm64_strlen.S
+			arm64_strncmp.S
+			arm64_strnlen.S
+			arm64_strrchr.S
 			;
 	}
 }
