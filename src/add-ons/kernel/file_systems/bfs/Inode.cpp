@@ -1790,17 +1790,33 @@ Inode::WriteAt(Transaction& transaction, off_t pos, const uint8* buffer,
 		rw_lock_read_lock(&fGapLock);
 
 	// the transaction doesn't have to be started already
+	bool locked = false;
+		// whether fLock was write locked along with the journal
 	if (changeSize && !transaction.IsStarted()) {
 		// The page writer's requests for this file hold fLock until they are
-		// on the disk. Wait for them before the journal is locked, not with
-		// it: no other transaction on the volume could start meanwhile.
-		rw_lock_write_lock(&fLock);
-		rw_lock_write_unlock(&fLock);
+		// on the disk, and it starts the next one as soon as fLock is free.
+		// Wait for them before the journal is locked, not with it: no other
+		// transaction on the volume could start meanwhile. Keeping fLock,
+		// the journal can only be tried (whoever has it may wait for fLock);
+		// if it is busy, wait for it without fLock and try again.
+		for (int32 tries = 0; tries < 4; tries++) {
+			rw_lock_write_lock(&fLock);
+			if (transaction.Start(fVolume, BlockNumber(), false) == B_OK) {
+				locked = true;
+				break;
+			}
+			rw_lock_write_unlock(&fLock);
 
-		transaction.Start(fVolume, BlockNumber());
+			Journal* journal = fVolume->GetJournal(BlockNumber());
+			if (journal == NULL)
+				break;
+			journal->WaitForLock();
+		}
+		if (!locked)
+			transaction.Start(fVolume, BlockNumber());
 	}
 
-	WriteLocker writeLocker(fLock);
+	WriteLocker writeLocker(fLock, locked);
 
 	// Work around possible race condition: Someone might have shrunken the file
 	// while we had no lock.

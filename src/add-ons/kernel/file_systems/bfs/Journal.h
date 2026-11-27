@@ -26,8 +26,10 @@ public:
 			status_t		InitCheck();
 
 			status_t		Lock(Transaction* owner,
-								bool separateSubTransactions);
+								bool separateSubTransactions,
+								bool canWait = true);
 			status_t		Unlock(Transaction* owner, bool success);
+			void			WaitForLock();
 			void			AssertLocked() { ASSERT_LOCKED_RECURSIVE(&fLock); }
 
 			status_t		ReplayLog();
@@ -145,7 +147,7 @@ public:
 			fJournal->Unlock(this, false);
 	}
 
-	status_t Start(Volume* volume, off_t refBlock);
+	status_t Start(Volume* volume, off_t refBlock, bool canWait = true);
 	bool IsStarted() const { return fJournal != NULL; }
 
 	status_t Done()

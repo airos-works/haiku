@@ -1077,9 +1077,10 @@ Journal::FlushLogAndLockJournal()
 
 
 status_t
-Journal::Lock(Transaction* owner, bool separateSubTransactions)
+Journal::Lock(Transaction* owner, bool separateSubTransactions, bool canWait)
 {
-	status_t status = recursive_lock_lock(&fLock);
+	status_t status = canWait ? recursive_lock_lock(&fLock)
+		: recursive_lock_trylock(&fLock);
 	if (status != B_OK)
 		return status;
 
@@ -1157,6 +1158,15 @@ Journal::Unlock(Transaction* owner, bool success)
 
 	recursive_lock_unlock(&fLock);
 	return B_OK;
+}
+
+
+/*!	Waits until no other thread holds the journal, without keeping it. */
+void
+Journal::WaitForLock()
+{
+	recursive_lock_lock(&fLock);
+	recursive_lock_unlock(&fLock);
 }
 
 
@@ -1387,14 +1397,14 @@ TransactionListener::~TransactionListener()
 
 
 status_t
-Transaction::Start(Volume* volume, off_t refBlock)
+Transaction::Start(Volume* volume, off_t refBlock, bool canWait)
 {
 	// has it already been started?
 	if (fJournal != NULL)
 		return B_OK;
 
 	fJournal = volume->GetJournal(refBlock);
-	if (fJournal != NULL && fJournal->Lock(this, false) == B_OK)
+	if (fJournal != NULL && fJournal->Lock(this, false, canWait) == B_OK)
 		return B_OK;
 
 	fJournal = NULL;
