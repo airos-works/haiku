@@ -696,10 +696,17 @@ ModifiedPageQueue::_PageWriter()
 				continue;
 			}
 
-			// wait the full amount when no one triggers us
-			if (!fPageWriterCondition.Wait(PAGES_FLUSH_DURATION_LOCAL_QUOTA, true))
-				continue;
+			// Wait the full amount when no one triggers us, then write what
+			// there is: nobody else would, a disk that gets less than
+			// kNumPages would keep it in memory for as long as we run
+			// (airos-works/haiku#219). (The flag is cleared only once we are
+			// collecting: a wake-up that came while we were writing a run is
+			// not lost.)
+			fPageWriterCondition.Wait(PAGES_FLUSH_DURATION_LOCAL_QUOTA, false);
+			if (fWriterThread < 0)
+				break;
 		}
+		fPageWriterCondition.ClearActivated();
 
 		page_num_t modifiedPages = queue.Count();
 		if (modifiedPages == 0) {

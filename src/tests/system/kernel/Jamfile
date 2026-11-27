@@ -69,6 +69,12 @@ SimpleTest fragmented_read_test : fragmented_read_test.cpp ;
 # device (it skips itself on a fast one), so not in tools/airos/ci/guest-tests.
 SimpleTest page_writer_stall_test : page_writer_stall_test.cpp ;
 
+# file data written without sync() reaches the disk within seconds, also
+# when it is less than the page writer's run of 256 pages
+# (airos-works/haiku#219). Reads the raw device of the volume it writes to,
+# so not in tools/airos/ci/guest-tests.
+SimpleTest idle_writeback_test : idle_writeback_test.cpp ;
+
 # a new semaphore reported the latest holder of the one that had its slot
 # before (airos-works/haiku#153)
 SimpleTest sem_slot_reuse_test : sem_slot_reuse_test.cpp ;
