@@ -75,6 +75,11 @@ SimpleTest page_writer_stall_test : page_writer_stall_test.cpp ;
 # so not in tools/airos/ci/guest-tests.
 SimpleTest idle_writeback_test : idle_writeback_test.cpp ;
 
+# fsync() writes the pages a reader has busy at that moment, and returns
+# only once they are on the device (airos-works/haiku#223). Reads the raw
+# device of the volume it writes to, so not in tools/airos/ci/guest-tests.
+SimpleTest fsync_busy_pages_test : fsync_busy_pages_test.cpp ;
+
 # a new semaphore reported the latest holder of the one that had its slot
 # before (airos-works/haiku#153)
 SimpleTest sem_slot_reuse_test : sem_slot_reuse_test.cpp ;

@@ -915,12 +915,31 @@ ModifiedPageQueue::_WriterThreadEntry(void* _this)
 //	#pragma mark - private kernel API
 
 
+static const bigtime_t kBusyPageWaitLimit = 10 * 1000 * 1000;
+	// how long a write-back that waits for busy pages waits for them in all,
+	// before it leaves the rest behind (see below)
+
+
+/*!	Whether a page someone has busy may hold changes that are not on disk.
+	A page that is being read in, or one that is clean and not mapped (a
+	read() copies it), does not.
+*/
+static inline bool
+busy_page_may_be_modified(vm_page* page)
+{
+	return page->State() == PAGE_STATE_MODIFIED || page->modified
+		|| page->IsMapped();
+}
+
+
 /*!	vm_page_write_modified_page_range() one transfer at a time, waited for:
 	what it does when it cannot get the memory for more.
+	\return The first error a transfer returned, \c B_OK when all pages could
+		be written.
 */
 static status_t
 write_modified_page_range_synchronously(struct VMCache* cache,
-	uint32 firstPage, uint32 endPage)
+	uint32 firstPage, uint32 endPage, bool waitForBusyPages)
 {
 	static const int32 kMaxPages = 256;
 	int32 maxPages = cache->MaxPagesPerWrite();
@@ -950,6 +969,12 @@ write_modified_page_range_synchronously(struct VMCache* cache,
 
 	PageWriteTransfer transfer;
 	bool transferEmpty = true;
+	status_t result = B_OK;
+
+	// waiting for busy pages: when we stop, and how long we sleep next
+	bigtime_t waitDeadline = -1;
+	bigtime_t waitStep = 0;
+	uint32 lastWaitOffset = 0;
 
 	VMCachePagesTree::Iterator it
 		= cache->pages.GetIterator(firstPage, true, true);
@@ -963,10 +988,33 @@ write_modified_page_range_synchronously(struct VMCache* cache,
 			page = NULL;
 		}
 
+		// A busy page is written by someone else right now (the page
+		// writer), or a read() or write() copies it: its changes may not be
+		// on disk when they are done. Who asks for the pages to be on disk
+		// (fsync(), sync()) has to wait for it (airos-works/haiku#223).
+		// Not for ever: this can be called with file system locks held that
+		// the page's owner may need to get to the end.
+		bool waitForPage = false;
+		uint32 waitOffset = 0;
 		if (page != NULL) {
-			if (page->busy
-				|| (page->State() != PAGE_STATE_MODIFIED
-					&& !vm_test_map_modification(page))) {
+			if (page->busy) {
+				if (waitForBusyPages && busy_page_may_be_modified(page)) {
+					bigtime_t now = system_time();
+					if (waitDeadline < 0)
+						waitDeadline = now + kBusyPageWaitLimit;
+					if (now < waitDeadline) {
+						waitForPage = true;
+						waitOffset = page->cache_offset;
+					} else if (waitStep >= 0) {
+						dprintf("vm_page_write_modified_page_range(): cache "
+							"%p: busy pages for %" B_PRId64 " s, left "
+							"behind\n", cache, kBusyPageWaitLimit / 1000000);
+						waitStep = -1;
+					}
+				}
+				page = NULL;
+			} else if (page->State() != PAGE_STATE_MODIFIED
+				&& !vm_test_map_modification(page)) {
 				page = NULL;
 			}
 		}
@@ -996,23 +1044,41 @@ write_modified_page_range_synchronously(struct VMCache* cache,
 			DEBUG_PAGE_ACCESS_END(page);
 		}
 
-		if (transferEmpty)
-			continue;
+		if (!transferEmpty) {
+			cache->Unlock();
+			status_t status = transfer.Schedule(0);
+			cache->Lock();
 
-		cache->Unlock();
-		status_t status = transfer.Schedule(0);
-		cache->Lock();
+			for (int32 i = 0; i < usedWrappers; i++)
+				wrappers[i]->Done(status);
 
-		for (int32 i = 0; i < usedWrappers; i++)
-			wrappers[i]->Done(status);
+			if (status != B_OK && result == B_OK)
+				result = status;
 
-		usedWrappers = 0;
+			usedWrappers = 0;
 
-		if (page != NULL) {
-			transfer.SetTo(NULL, page, maxPages);
-			wrappers[usedWrappers++] = wrapper;
-		} else
-			transferEmpty = true;
+			if (page != NULL) {
+				transfer.SetTo(NULL, page, maxPages);
+				wrappers[usedWrappers++] = wrapper;
+			} else
+				transferEmpty = true;
+		}
+
+		if (waitForPage) {
+			// (polled: a page event wait cannot time out)
+			if (waitOffset != lastWaitOffset || waitStep <= 0)
+				waitStep = 50;
+			else
+				waitStep = min_c(waitStep * 2, 20000);
+			lastWaitOffset = waitOffset;
+
+			cache->Unlock();
+			snooze(waitStep);
+			cache->Lock();
+
+			// the page may be gone, clean or modified again: look again
+			it = cache->pages.GetIterator(waitOffset, true, true);
+		}
 	}
 
 	if (wrapperPool != stackWrappersPool) {
@@ -1020,7 +1086,7 @@ write_modified_page_range_synchronously(struct VMCache* cache,
 		delete[] wrappers;
 	}
 
-	return B_OK;
+	return result;
 }
 
 
@@ -1031,10 +1097,15 @@ write_modified_page_range_synchronously(struct VMCache* cache,
 	\param firstPage Offset (in page size units) of the first page in the range.
 	\param endPage End offset (in page size units) of the page range. The page
 		at this offset is not included.
+	\param waitForBusyPages Whether pages that someone else has busy are
+		waited for (for a while), rather than left behind: for those who need
+		the pages to be on disk. Not when the caller has pages of the cache
+		busy itself.
+	\return The first write error, \c B_OK when all pages could be written.
 */
 status_t
 vm_page_write_modified_page_range(struct VMCache* cache, uint32 firstPage,
-	uint32 endPage)
+	uint32 endPage, bool waitForBusyPages)
 {
 	// Off for now: on a 16-core Xeon with an NVMe disk the asynchronous runs
 	// below still panicked under concurrent fsync() and sync() (a transfer of
@@ -1042,9 +1113,12 @@ vm_page_write_modified_page_range(struct VMCache* cache, uint32 firstPage,
 	// PageWriterRun was fixed): some completion still reaches a run that is
 	// already finished or reused. Until that is found, fsync() and sync()
 	// write one transfer at a time as before efe75687b7.
+	// (They also neither wait for busy pages nor report errors.)
 	static const bool kAsynchronousRuns = false;
-	if (!kAsynchronousRuns)
-		return write_modified_page_range_synchronously(cache, firstPage, endPage);
+	if (!kAsynchronousRuns || waitForBusyPages) {
+		return write_modified_page_range_synchronously(cache, firstPage,
+			endPage, waitForBusyPages);
+	}
 
 	// Asynchronous writes, in runs: one is written while the next is
 	// collected and scheduled. (The caller's reference to the cache keeps
@@ -1062,7 +1136,7 @@ vm_page_write_modified_page_range(struct VMCache* cache, uint32 firstPage,
 			!= B_OK) {
 		delete[] runs;
 		return write_modified_page_range_synchronously(cache, firstPage,
-			endPage);
+			endPage, false);
 	}
 
 	PageWriterRun* pendingRun = NULL;
@@ -1120,12 +1194,13 @@ vm_page_write_modified_page_range(struct VMCache* cache, uint32 firstPage,
 
 /*!	You need to hold the VMCache lock when calling this function.
 	Note that the cache lock is released in this function.
+	\param waitForBusyPages See vm_page_write_modified_page_range().
 */
 status_t
-vm_page_write_modified_pages(VMCache *cache)
+vm_page_write_modified_pages(VMCache *cache, bool waitForBusyPages)
 {
 	return vm_page_write_modified_page_range(cache, 0,
-		(cache->virtual_end + B_PAGE_SIZE - 1) >> PAGE_SHIFT);
+		(cache->virtual_end + B_PAGE_SIZE - 1) >> PAGE_SHIFT, waitForBusyPages);
 }
 
 

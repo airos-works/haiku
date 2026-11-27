@@ -359,9 +359,10 @@ reserve_pages(file_cache_ref* ref, vm_page_reservation* reservation,
 				if (previous < 0)
 					previous = LAST_ACCESSES - 1;
 
+				// (not waiting for busy pages: our caller has some)
 				vm_page_write_modified_page_range(cache,
 					ref->LastAccessPageOffset(previous, true),
-					ref->LastAccessPageOffset(index, true));
+					ref->LastAccessPageOffset(index, true), false);
 			} else {
 				// free some pages from our cache
 				// TODO: start with oldest

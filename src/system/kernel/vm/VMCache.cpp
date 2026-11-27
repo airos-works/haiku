@@ -1073,8 +1073,14 @@ VMCache::CountWritableAreas(VMArea* ignoreArea) const
 }
 
 
+/*!	Writes the cache's modified pages back.
+	\param waitForBusyPages Whether pages someone else has busy right now
+		are waited for: for those who need the pages to be on disk (fsync(),
+		sync()). See vm_page_write_modified_page_range().
+	\return The first write error, \c B_OK when all pages could be written.
+*/
 status_t
-VMCache::WriteModified()
+VMCache::WriteModified(bool waitForBusyPages)
 {
 	TRACE(("VMCache::WriteModified(cache = %p)\n", this));
 
@@ -1082,7 +1088,7 @@ VMCache::WriteModified()
 		return B_OK;
 
 	Lock();
-	status_t status = vm_page_write_modified_pages(this);
+	status_t status = vm_page_write_modified_pages(this, waitForBusyPages);
 	Unlock();
 
 	return status;
@@ -1308,8 +1314,9 @@ VMCache::FlushAndRemoveAllPages()
 	ASSERT_LOCKED_MUTEX(&fLock);
 
 	while (page_count > 0) {
-		// write back modified pages
-		status_t status = vm_page_write_modified_pages(this);
+		// write back modified pages (a page that cannot be written ends
+		// this: it would stay modified, and we would go round for ever)
+		status_t status = vm_page_write_modified_pages(this, true);
 		if (status != B_OK)
 			return status;
 

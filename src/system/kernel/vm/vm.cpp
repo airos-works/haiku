@@ -2955,8 +2955,11 @@ delete_area(VMAddressSpace* addressSpace, VMArea* area,
 			deletingAddressSpace, ignoreTopCachePageFlags);
 	}
 
-	if (!area->cache->temporary)
-		area->cache->WriteModified();
+	if (!area->cache->temporary) {
+		// (the pages someone has busy go to the page writer: we may hold
+		// the lock of the address space they are being copied to)
+		area->cache->WriteModified(false);
+	}
 
 	uint32 allocationFlags = addressSpace == VMAddressSpace::Kernel()
 		? HEAP_DONT_WAIT_FOR_MEMORY | HEAP_DONT_LOCK_KERNEL_SPACE : 0;
@@ -7064,7 +7067,7 @@ _user_sync_memory(void* _address, size_t size, uint32 flags)
 			if (writeSync) {
 				// synchronous
 				error = vm_page_write_modified_page_range(cache, firstPage,
-					endPage);
+					endPage, true);
 				if (error != B_OK)
 					return error;
 			} else {

@@ -168,7 +168,8 @@ public:
 									AsyncIOCallback* callback);
 	virtual	bool				CanWritePage(off_t offset);
 	virtual	ModifiedPageQueue*	ModifiedQueue();
-			status_t			WriteModified();
+			status_t			WriteModified(
+									bool waitForBusyPages = true);
 
 	virtual	int32				MaxPagesPerWrite() const
 									{ return -1; } // no restriction
