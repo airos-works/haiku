@@ -8,12 +8,15 @@
 	stub on the loopback interface; resolv.conf is not used.
 	- A name server that does not answer costs its timeout once, not on
 	  every query (airos-works/haiku#232).
+	- Queries work in a team that has more than 1024 descriptors open
+	  (airos-works/haiku#233).
 */
 
 
 #include <arpa/inet.h>
 #include <arpa/nameser.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <resolv.h>
@@ -21,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -168,6 +172,34 @@ main()
 	printf("dead first server, second query: %d, %.2f s\n", result, second);
 	if (result < 0 || second > 1.0) {
 		printf("FAIL: the dead server cost its timeout again\n");
+		sFailures++;
+	}
+
+	// Descriptors 0 to 1099 in use: the resolver's socket gets a higher one.
+	struct rlimit limit;
+	getrlimit(RLIMIT_NOFILE, &limit);
+	limit.rlim_cur = 4096;
+	if (setrlimit(RLIMIT_NOFILE, &limit) != 0)
+		printf("setrlimit(): %s\n", strerror(errno));
+	int highest = -1;
+	while (true) {
+		int fd = open("/dev/null", O_RDONLY);
+		if (fd < 0 || fd >= 1100) {
+			highest = fd;
+			break;
+		}
+	}
+	printf("descriptors open up to %d\n", highest);
+	if (highest < 1024) {
+		printf("FAIL: could not open enough descriptors\n");
+		sFailures++;
+	}
+	res_nclose(&state);
+	set_servers(&state, 1, &livePort);
+	double high = query(&state, "high.test", result);
+	printf("with descriptors above 1023: %d, %.2f s\n", result, high);
+	if (result < 0) {
+		printf("FAIL: no answer with descriptors above 1023\n");
 		sFailures++;
 	}
 

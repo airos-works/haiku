@@ -79,6 +79,15 @@ __RCSID("$NetBSD: res_send.c,v 1.29 2013/02/16 13:45:45 para Exp $");
  * Send query to name server and wait for reply.
  */
 
+#ifdef __HAIKU__
+/*
+ * poll() rather than select(): an fd_set holds descriptors up to
+ * FD_SETSIZE - 1 (1023), a team may have many more open, and a resolver
+ * socket above that made every lookup fail with ENOTSOCK.
+ */
+#define USE_POLL
+#endif
+
 #include "port_before.h"
 #ifndef USE_KQUEUE
 #include "fd_setsize.h"

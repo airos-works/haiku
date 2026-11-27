@@ -48,7 +48,8 @@ SimpleTest test4 : test4.c
 SimpleTest alias_route_test : alias_route_test.cpp
 	: $(TARGET_NETWORK_LIBS) libbnetapi.so be [ TargetLibsupc++ ] ;
 
-# a dead name server cost its timeout on every query (airos-works/haiku#232)
+# a dead name server cost its timeout on every query (airos-works/haiku#232);
+# no lookups with 1024 descriptors open (airos-works/haiku#233)
 SimpleTest resolver_test : resolver_test.cpp
 	: $(TARGET_NETWORK_LIBS) ;
 
