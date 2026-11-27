@@ -168,6 +168,8 @@ static socklen_t	get_salen(const struct sockaddr *);
 static struct sockaddr * get_nsaddr(res_state, size_t);
 static int		send_vc(res_state, const void *, size_t,
 				u_char *, int, int *, int);
+static int		dg_socket(res_state, int, int *);
+static int		dg_seconds(res_state, int, int, int *);
 static int		send_dg(res_state, 
 #ifdef USE_KQUEUE
 				int kq,
@@ -418,41 +420,15 @@ res_queriesmatch(const u_char *buf1, const u_char *eom1,
 	return (1);
 }
 
-int
-res_nsend(res_state statp,
-	  const u_char *buf, int buflen, u_char *ans, int anssiz)
+/*%
+ * Notices a changed server list and rotates it if asked to; shared by
+ * res_nsend() and res_nsend_pair(). Returns the number of servers that are
+ * not known to be dead.
+ */
+static int
+res_nsend_prepare(res_state statp)
 {
-	int gotsomewhere, terrno, tries, v_circuit, resplen, ns, n;
-#ifdef __HAIKU__
-	int live;
-#endif
-#ifdef USE_KQUEUE
-	int kq;
-#endif
-#ifdef DEBUG
-	char abuf[NI_MAXHOST];
-#endif
-
-	/* No name servers or res_init() failure */
-	if (statp->nscount == 0 || EXT(statp).ext == NULL) {
-		errno = ESRCH;
-		return (-1);
-	}
-	if (anssiz < HFIXEDSZ) {
-		errno = EINVAL;
-		return (-1);
-	}
-	DprintQ((statp->options & RES_DEBUG) || (statp->pfcode & RES_PRF_QUERY),
-		(stdout, ";; res_send()\n"), buf, buflen);
-	v_circuit = (statp->options & RES_USEVC) || buflen > PACKETSZ;
-	gotsomewhere = 0;
-	terrno = ETIMEDOUT;
-
-#ifdef USE_KQUEUE
-	if ((kq = kqueue1(O_CLOEXEC)) == -1) {
-		return (-1);
-	}
-#endif
+	int ns, live;
 
 	/*
 	 * If the ns_addr_list in the resolver context has changed, then
@@ -541,13 +517,59 @@ res_nsend(res_state statp,
 		EXT(statp).nstimes[lastns] = nstime;
 	}
 
-#ifdef __HAIKU__
 	/* the servers that are not known to be dead */
+#ifdef __HAIKU__
 	live = 0;
 	for (ns = 0; ns < statp->nscount; ns++) {
 		if (!res_server_dead(get_nsaddr(statp, (size_t)ns)))
 			live++;
 	}
+#else
+	live = statp->nscount;
+#endif
+	return live;
+}
+
+int
+res_nsend(res_state statp,
+	  const u_char *buf, int buflen, u_char *ans, int anssiz)
+{
+	int gotsomewhere, terrno, tries, v_circuit, resplen, ns, n;
+#ifdef __HAIKU__
+	int live;
+#endif
+#ifdef USE_KQUEUE
+	int kq;
+#endif
+#ifdef DEBUG
+	char abuf[NI_MAXHOST];
+#endif
+
+	/* No name servers or res_init() failure */
+	if (statp->nscount == 0 || EXT(statp).ext == NULL) {
+		errno = ESRCH;
+		return (-1);
+	}
+	if (anssiz < HFIXEDSZ) {
+		errno = EINVAL;
+		return (-1);
+	}
+	DprintQ((statp->options & RES_DEBUG) || (statp->pfcode & RES_PRF_QUERY),
+		(stdout, ";; res_send()\n"), buf, buflen);
+	v_circuit = (statp->options & RES_USEVC) || buflen > PACKETSZ;
+	gotsomewhere = 0;
+	terrno = ETIMEDOUT;
+
+#ifdef USE_KQUEUE
+	if ((kq = kqueue1(O_CLOEXEC)) == -1) {
+		return (-1);
+	}
+#endif
+
+#ifdef __HAIKU__
+	live = res_nsend_prepare(statp);
+#else
+	res_nsend_prepare(statp);
 #endif
 
 	/*
@@ -709,6 +731,310 @@ res_nsend(res_state statp,
 #endif
 	return (-1);
 }
+
+#ifdef __HAIKU__
+/*
+ * Two questions sent to a server at once, getaddrinfo()'s AAAA and A for the
+ * same name: one round trip instead of two, as glibc does. The rounds and
+ * timeouts per server are those of res_nsend(); a question that has its
+ * answer is not sent again.
+ */
+#define RES_PAIR_WAIT	0	/* sent in this round, no answer yet */
+#define RES_PAIR_NEXT	1	/* this server failed it, ask the next one */
+#define RES_PAIR_TCP	2	/* truncated, ask this server over TCP */
+#define RES_PAIR_DONE	3	/* answered */
+
+struct res_pair_query {
+	const u_char	*buf;
+	int		buflen;
+	u_char		*ans;
+	int		anssiz;
+	int		resplen;	/* > 0 answered, 0 open, < 0 failed */
+	int		state;		/* RES_PAIR_*, for this round */
+};
+
+/*%
+ * One round with server ns: sends the open questions together and waits for
+ * their answers. "answered" says that this server answered a question of the
+ * pair before. Returns the number of answers it gave in this round, -1 on an
+ * error that ends the lookup, -2 when it refused EDNS0 (the caller then asks
+ * one question after the other, without it).
+ */
+static int
+send_dg_pair(res_state statp, struct res_pair_query *q, u_char *rbuf,
+	int rbufsiz, int ns, int tries, int answered, int *terrno,
+	int *gotsomewhere)
+{
+	const struct sockaddr *nsap = get_nsaddr(statp, (size_t)ns);
+	socklen_t nsaplen = get_salen(nsap);
+	struct timespec now, timeout, finish;
+	struct sockaddr_storage from;
+	ISC_SOCKLEN_T fromlen;
+	struct pollfd pollfd;
+	const HEADER *anhp = (const HEADER *)(void *)rbuf;
+	ssize_t resplen;
+	int seconds, shortened, sent, waiting, replies, i, n, s;
+
+	s = dg_socket(statp, ns, terrno);
+	if (s < 0)
+		return (s == -1 ? 0 : -1);
+
+	sent = 0;
+	for (i = 0; i < 2; i++) {
+		if (q[i].resplen != 0)
+			continue;
+		q[i].state = RES_PAIR_WAIT;
+		if (statp->options & RES_INSECURE1)
+			n = (int)sendto(s, q[i].buf, (size_t)q[i].buflen, 0, nsap,
+			    nsaplen);
+		else
+			n = (int)send(s, q[i].buf, (size_t)q[i].buflen, 0);
+		if (n != q[i].buflen) {
+			Aerror(statp, stderr, "send", errno, nsap, nsaplen);
+			res_nclose(statp);
+			return (0);
+		}
+		sent++;
+	}
+
+	seconds = dg_seconds(statp, ns, tries, &shortened);
+	/*
+	 * This server is there: it answered the other question. The one it
+	 * left open was lost or dropped (some servers and middleboxes drop
+	 * AAAA questions), it is not merely slow.
+	 */
+	if (answered && seconds > RES_DEAD_TIMEOUT) {
+		seconds = RES_DEAD_TIMEOUT;
+		shortened = 1;
+	}
+	finish = evAddTime(evNowTime(), evConsTime((time_t)seconds, 0L));
+
+	waiting = sent;
+	replies = 0;
+	while (waiting > 0) {
+		now = evNowTime();
+		timeout = evSubTime(finish, now);
+		if (timeout.tv_sec < 0)
+			timeout = evConsTime((time_t)0, 0L);
+		pollfd.fd = s;
+		pollfd.events = POLLRDNORM;
+		n = poll(&pollfd, 1, 1000 * (int)timeout.tv_sec
+		    + (int)timeout.tv_nsec / 1000000);
+		if (n == 0)
+			break;
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			Perror(statp, stderr, "poll", errno);
+			res_nclose(statp);
+			return (replies);
+		}
+
+		fromlen = sizeof(from);
+		resplen = recvfrom(s, (char *)rbuf, (size_t)rbufsiz, 0,
+		    (struct sockaddr *)(void *)&from, &fromlen);
+		if (resplen <= 0) {
+			Perror(statp, stderr, "recvfrom", errno);
+			res_nclose(statp);
+			return (replies);
+		}
+		*gotsomewhere = 1;
+		if (resplen < HFIXEDSZ) {
+			*terrno = EMSGSIZE;
+			res_nclose(statp);
+			return (replies);
+		}
+		for (i = 0; i < 2; i++) {
+			if (q[i].resplen == 0 && q[i].state == RES_PAIR_WAIT
+			    && ((const HEADER *)(const void *)q[i].buf)->id
+				== anhp->id)
+				break;
+		}
+		if (i == 2) {
+			/* an old answer, or one to a question that has its own */
+			continue;
+		}
+		if (!(statp->options & RES_INSECURE1) &&
+		    !res_ourserver_p(statp, (struct sockaddr *)(void *)&from))
+			continue;
+#ifdef RES_USE_EDNS0
+		if (anhp->rcode == FORMERR
+		    && (statp->options & RES_USE_EDNS0) != 0U) {
+			statp->_flags |= RES_F_EDNS0ERR;
+			res_nclose(statp);
+			return (-2);
+		}
+#endif
+		if (!(statp->options & RES_INSECURE2) &&
+		    !res_queriesmatch(q[i].buf, q[i].buf + q[i].buflen, rbuf,
+			rbuf + resplen))
+			continue;
+
+		/* it answers */
+		res_server_mark(nsap, 0);
+		replies++;
+		waiting--;
+		if (resplen > q[i].anssiz)
+			resplen = q[i].anssiz;
+		memcpy(q[i].ans, rbuf, (size_t)resplen);
+		if ((anhp->rcode == SERVFAIL || anhp->rcode == NOTIMP
+			|| anhp->rcode == REFUSED) && !statp->pfcode) {
+			q[i].state = RES_PAIR_NEXT;
+			continue;
+		}
+		if (!(statp->options & RES_IGNTC) && anhp->tc) {
+			q[i].state = RES_PAIR_TCP;
+			continue;
+		}
+		q[i].state = RES_PAIR_DONE;
+		q[i].resplen = (int)resplen;
+	}
+
+	if (waiting > 0) {
+		Dprint(statp->options & RES_DEBUG, (stdout, ";; timeout\n"));
+		*gotsomewhere = 1;
+		if (replies == 0 && !answered) {
+			if (!shortened)
+				res_server_mark(nsap, 1);
+		} else {
+			/*
+			 * It answers, but not this question. It is asked again
+			 * from a new port, which gets past middleboxes that
+			 * drop the second of two questions from one port.
+			 * When that happened to two lookups in a row, this
+			 * resolver state sends one question after the other
+			 * from now on, as glibc does after the first (and as
+			 * the "single-request" option asks). A packet that
+			 * is lost now and then does not do that.
+			 */
+			close(EXT(statp).nssocks[ns]);
+			EXT(statp).nssocks[ns] = -1;
+			if (sent == 2 && replies > 0) {
+				if ((statp->_flags & RES_F_PAIRLOST) != 0U)
+					statp->options |= RES_SNGLKUP;
+				statp->_flags |= RES_F_PAIRLOST;
+			}
+		}
+	} else if (sent == 2)
+		statp->_flags &= ~RES_F_PAIRLOST;
+	return (replies);
+}
+
+/*%
+ * Sends the questions buf1 and buf2 together and waits for both answers.
+ * Returns -1 when they have to be sent one after the other (res_nsend()):
+ * when asked to by the "single-request" option or by an earlier lookup, for
+ * hooks, TCP or EDNS0 trouble. Otherwise returns 0 with the length of each
+ * answer, or -1 for a question that got none, in *resplen1 and *resplen2;
+ * errno tells why then.
+ */
+int
+res_nsend_pair(res_state statp,
+	const u_char *buf1, int buflen1, u_char *ans1, int anssiz1, int *resplen1,
+	const u_char *buf2, int buflen2, u_char *ans2, int anssiz2, int *resplen2)
+{
+	struct res_pair_query q[2];
+	int answered[MAXNS];
+	u_char *rbuf;
+	int rbufsiz, gotsomewhere, terrno, tries, live, open, tcp, fatal;
+	int ns, i, n;
+
+	if (statp->nscount == 0 || EXT(statp).ext == NULL
+	    || anssiz1 < HFIXEDSZ || anssiz2 < HFIXEDSZ
+	    || buflen1 < HFIXEDSZ || buflen2 < HFIXEDSZ
+	    || buflen1 > PACKETSZ || buflen2 > PACKETSZ
+	    || (statp->options & (RES_USEVC | RES_SNGLKUP)) != 0U
+	    || statp->qhook != NULL || statp->rhook != NULL
+	    || ((const HEADER *)(const void *)buf1)->id
+		== ((const HEADER *)(const void *)buf2)->id)
+		return (-1);
+
+	rbufsiz = anssiz1 > anssiz2 ? anssiz1 : anssiz2;
+	rbuf = malloc((size_t)rbufsiz);
+	if (rbuf == NULL)
+		return (-1);
+
+	DprintQ((statp->options & RES_DEBUG) || (statp->pfcode & RES_PRF_QUERY),
+		(stdout, ";; res_send_pair()\n"), buf1, buflen1);
+	DprintQ((statp->options & RES_DEBUG) || (statp->pfcode & RES_PRF_QUERY),
+		(stdout, "%s", ""), buf2, buflen2);
+
+	q[0].buf = buf1;
+	q[0].buflen = buflen1;
+	q[0].ans = ans1;
+	q[0].anssiz = anssiz1;
+	q[1].buf = buf2;
+	q[1].buflen = buflen2;
+	q[1].ans = ans2;
+	q[1].anssiz = anssiz2;
+	for (i = 0; i < 2; i++) {
+		q[i].resplen = 0;
+		q[i].state = RES_PAIR_WAIT;
+	}
+	memset(answered, 0, sizeof(answered));
+	gotsomewhere = 0;
+	terrno = ETIMEDOUT;
+	tcp = 0;
+	fatal = 0;
+	open = 2;
+
+	live = res_nsend_prepare(statp);
+
+	for (tries = 0; tries < statp->retry && open > 0; tries++) {
+	    for (ns = 0; ns < statp->nscount && open > 0; ns++) {
+		/* a dead server only after the others did not answer */
+		if (tries == 0 && live > 0 && live < statp->nscount
+		    && res_server_dead(get_nsaddr(statp, (size_t)ns)))
+			continue;
+		statp->_flags &= ~RES_F_LASTMASK;
+		statp->_flags |= (ns << RES_F_LASTSHIFT);
+
+		n = send_dg_pair(statp, q, rbuf, rbufsiz, ns, tries,
+		    answered[ns], &terrno, &gotsomewhere);
+		if (n == -2) {
+			free(rbuf);
+			return (-1);
+		}
+		if (n < 0) {
+			fatal = 1;
+			goto done;
+		}
+		if (n > 0)
+			answered[ns] = 1;
+
+		/* truncated answers: the whole one over TCP */
+		for (i = 0; i < 2; i++) {
+			if (q[i].resplen != 0 || q[i].state != RES_PAIR_TCP)
+				continue;
+			tcp = 1;
+			n = send_vc(statp, q[i].buf, (size_t)q[i].buflen, q[i].ans,
+			    q[i].anssiz, &terrno, ns);
+			if (n != 0)
+				q[i].resplen = n;
+		}
+
+		open = 0;
+		for (i = 0; i < 2; i++) {
+			if (q[i].resplen == 0)
+				open++;
+		}
+	    }
+	}
+
+done:
+	if (fatal || tcp || (statp->options & RES_STAYOPEN) == 0U)
+		res_nclose(statp);
+	free(rbuf);
+
+	*resplen1 = q[0].resplen > 0 ? q[0].resplen : -1;
+	*resplen2 = q[1].resplen > 0 ? q[1].resplen : -1;
+	if (fatal || (open == 0 && (*resplen1 < 0 || *resplen2 < 0)))
+		errno = terrno;
+	else if (open > 0)
+		errno = gotsomewhere ? ETIMEDOUT : ECONNREFUSED;
+	return (0);
+}
+#endif	/* __HAIKU__ */
 
 /* Private */
 
@@ -963,6 +1289,106 @@ send_vc(res_state statp,
 	return (resplen);
 }
 
+/*%
+ * The datagram socket for server ns, opened and connected if need be.
+ * Returns it, -1 when this server cannot be used (try the next one), or -2
+ * on an error that ends the query.
+ */
+static int
+dg_socket(res_state statp, int ns, int *terrno)
+{
+	const struct sockaddr *nsap = get_nsaddr(statp, (size_t)ns);
+	socklen_t nsaplen = get_salen(nsap);
+
+	if (EXT(statp).nssocks[ns] == -1) {
+		EXT(statp).nssocks[ns] = socket(nsap->sa_family, SOCK_DGRAM
+			| SOCK_CLOEXEC, 0);
+#if SOCK_CLOEXEC == 0
+		fcntl(EXT(statp).nssocks[ns], F_SETFD, FD_CLOEXEC);
+#endif
+#if !defined(USE_POLL) && !defined(USE_KQUEUE)
+		if (EXT(statp).nssocks[ns] > highestFD) {
+			res_nclose(statp);
+			errno = ENOTSOCK;
+		}
+#endif
+		if (EXT(statp).nssocks[ns] < 0) {
+			switch (errno) {
+			case EPROTONOSUPPORT:
+#ifdef EPFNOSUPPORT
+			case EPFNOSUPPORT:
+#endif
+			case EAFNOSUPPORT:
+				Perror(statp, stderr, "socket(dg)", errno);
+				return (-1);
+			default:
+				*terrno = errno;
+				Perror(statp, stderr, "socket(dg)", errno);
+				return (-2);
+			}
+		}
+#ifndef CANNOT_CONNECT_DGRAM
+		/*
+		 * On a 4.3BSD+ machine (client and server,
+		 * actually), sending to a nameserver datagram
+		 * port with no nameserver will cause an
+		 * ICMP port unreachable message to be returned.
+		 * If our datagram socket is "connected" to the
+		 * server, we get an ECONNREFUSED error on the next
+		 * socket operation, and select returns if the
+		 * error message is received.  We can thus detect
+		 * the absence of a nameserver without timing out.
+		 *
+		 * When the option "insecure1" is specified, we'd
+		 * rather expect to see responses from an "unknown"
+		 * address.  In order to let the kernel accept such
+		 * responses, do not connect the socket here.
+		 * XXX: or do we need an explicit option to disable
+		 * connecting?
+ 		 */
+		if (!(statp->options & RES_INSECURE1) &&
+		    connect(EXT(statp).nssocks[ns], nsap, nsaplen) < 0) {
+			Aerror(statp, stderr, "connect(dg)", errno, nsap,
+			    nsaplen);
+			res_nclose(statp);
+			return (-1);
+		}
+#endif /* !CANNOT_CONNECT_DGRAM */
+		Dprint(statp->options & RES_DEBUG,
+		       (stdout, ";; new DG socket\n"))
+	}
+	return EXT(statp).nssocks[ns];
+}
+
+/*%
+ * How long to wait for an answer from server ns in round tries.
+ */
+static int
+dg_seconds(res_state statp, int ns, int tries, int *shortened)
+{
+	int seconds;
+
+	seconds = (statp->retrans << tries);
+	if (ns > 0)
+		seconds /= statp->nscount;
+	if (seconds <= 0)
+		seconds = 1;
+#ifdef __HAIKU__
+	/*
+	 * A short wait for a server that did not answer lately. Running out of
+	 * it does not renew the verdict, so a server that is only slow gets the
+	 * whole timeout again once its minute is over.
+	 */
+	*shortened = 0;
+	if (seconds > RES_DEAD_TIMEOUT
+	    && res_server_dead(get_nsaddr(statp, (size_t)ns))) {
+		seconds = RES_DEAD_TIMEOUT;
+		*shortened = 1;
+	}
+#endif
+	return seconds;
+}
+
 static int
 send_dg(res_state statp,
 #ifdef USE_KQUEUE
@@ -997,64 +1423,9 @@ send_dg(res_state statp,
 
 	nsap = get_nsaddr(statp, (size_t)ns);
 	nsaplen = get_salen(nsap);
-	if (EXT(statp).nssocks[ns] == -1) {
-		EXT(statp).nssocks[ns] = socket(nsap->sa_family, SOCK_DGRAM
-			| SOCK_CLOEXEC, 0);
-#if SOCK_CLOEXEC == 0
-		fcntl(EXT(statp).nssocks[ns], F_SETFD, FD_CLOEXEC);
-#endif
-#if !defined(USE_POLL) && !defined(USE_KQUEUE)
-		if (EXT(statp).nssocks[ns] > highestFD) {
-			res_nclose(statp);
-			errno = ENOTSOCK;
-		}
-#endif
-		if (EXT(statp).nssocks[ns] < 0) {
-			switch (errno) {
-			case EPROTONOSUPPORT:
-#ifdef EPFNOSUPPORT
-			case EPFNOSUPPORT:
-#endif
-			case EAFNOSUPPORT:
-				Perror(statp, stderr, "socket(dg)", errno);
-				return (0);
-			default:
-				*terrno = errno;
-				Perror(statp, stderr, "socket(dg)", errno);
-				return (-1);
-			}
-		}
-#ifndef CANNOT_CONNECT_DGRAM
-		/*
-		 * On a 4.3BSD+ machine (client and server,
-		 * actually), sending to a nameserver datagram
-		 * port with no nameserver will cause an
-		 * ICMP port unreachable message to be returned.
-		 * If our datagram socket is "connected" to the
-		 * server, we get an ECONNREFUSED error on the next
-		 * socket operation, and select returns if the
-		 * error message is received.  We can thus detect
-		 * the absence of a nameserver without timing out.
-		 *
-		 * When the option "insecure1" is specified, we'd
-		 * rather expect to see responses from an "unknown"
-		 * address.  In order to let the kernel accept such
-		 * responses, do not connect the socket here.
-		 * XXX: or do we need an explicit option to disable
-		 * connecting?
- 		 */
-		if (!(statp->options & RES_INSECURE1) &&
-		    connect(EXT(statp).nssocks[ns], nsap, nsaplen) < 0) {
-			Aerror(statp, stderr, "connect(dg)", errno, nsap,
-			    nsaplen);
-			res_nclose(statp);
-			return (0);
-		}
-#endif /* !CANNOT_CONNECT_DGRAM */
-		Dprint(statp->options & RES_DEBUG,
-		       (stdout, ";; new DG socket\n"))
-	}
-	s = EXT(statp).nssocks[ns];
+	s = dg_socket(statp, ns, terrno);
+	if (s < 0)
+		return (s == -1 ? 0 : -1);
 #ifndef CANNOT_CONNECT_DGRAM
 	if (statp->options & RES_INSECURE1) {
 		if (sendto(s, buf, buflen, 0, nsap, nsaplen) !=
@@ -1080,22 +1451,10 @@ send_dg(res_state statp,
 	/*
 	 * Wait for reply.
 	 */
-	seconds = (statp->retrans << tries);
-	if (ns > 0)
-		seconds /= statp->nscount;
-	if (seconds <= 0)
-		seconds = 1;
 #ifdef __HAIKU__
-	/*
-	 * A short wait for a server that did not answer lately. Running out of
-	 * it does not renew the verdict, so a server that is only slow gets the
-	 * whole timeout again once its minute is over.
-	 */
-	shortened = 0;
-	if (seconds > RES_DEAD_TIMEOUT && res_server_dead(nsap)) {
-		seconds = RES_DEAD_TIMEOUT;
-		shortened = 1;
-	}
+	seconds = dg_seconds(statp, ns, tries, &shortened);
+#else
+	seconds = dg_seconds(statp, ns, tries, NULL);
 #endif
 	now = evNowTime();
 	timeout = evConsTime((time_t)seconds, 0L);

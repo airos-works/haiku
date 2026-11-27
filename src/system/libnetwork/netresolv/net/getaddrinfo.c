@@ -296,6 +296,8 @@ static int _yp_getaddrinfo(void *, void *, va_list);
 #endif
 
 static int res_queryN(const char *, struct res_target *, res_state);
+static int res_queryN_pair(const char *, struct res_target *, res_state,
+    int *);
 static int res_searchN(const char *, struct res_target *, res_state);
 static int res_querydomainN(const char *, const char *,
     struct res_target *, res_state);
@@ -2929,6 +2931,60 @@ done:
 /* resolver logic */
 
 /*
+ * Sends the two questions of target (AAAA and A) together and waits for both
+ * answers, which costs one round trip instead of two. Returns 0 when they have
+ * to be sent one after the other; otherwise 1, with each answer's length (or
+ * -1) in length[].
+ */
+static int
+res_queryN_pair(const char *name, struct res_target *target,
+    res_state statp, int *length)
+{
+	u_char buf[2][PACKETSZ];
+	int n[2];
+	struct res_target *t;
+	HEADER *hp;
+	int i;
+
+	if (target == NULL || target->next == NULL
+	    || target->next->next != NULL)
+		return 0;
+
+	for (t = target, i = 0; i < 2; t = t->next, i++) {
+		hp = (HEADER *)(void *)t->answer;
+		hp->rcode = NOERROR;	/* default */
+		n[i] = res_nmkquery(statp, QUERY, name, t->qclass, t->qtype, NULL,
+		    0, NULL, buf[i], (int)sizeof(buf[i]));
+#ifdef RES_USE_EDNS0
+		if (n[i] > 0 && (statp->_flags & RES_F_EDNS0ERR) == 0 &&
+		    (statp->options & (RES_USE_EDNS0|RES_USE_DNSSEC)) != 0) {
+			u_char *rdata;
+
+			n[i] = res_nopt(statp, n[i], buf[i], (int)sizeof(buf[i]),
+			    t->anslen);
+			rdata = &buf[i][n[i]];
+			if (n[i] > 0 && (statp->options & RES_NSID) != 0U) {
+				n[i] = res_nopt_rdata(statp, n[i], buf[i],
+				    (int)sizeof(buf[i]), rdata, NS_OPT_NSID, 0, NULL);
+			}
+		}
+#endif
+		if (n[i] <= 0)
+			return 0;
+	}
+
+	/* the answers are told apart by their IDs */
+	if (((HEADER *)(void *)buf[0])->id == ((HEADER *)(void *)buf[1])->id) {
+		((HEADER *)(void *)buf[1])->id
+		    = htons(ntohs(((HEADER *)(void *)buf[1])->id) + 1);
+	}
+
+	return res_nsend_pair(statp, buf[0], n[0], target->answer,
+	    target->anslen, &length[0], buf[1], n[1], target->next->answer,
+	    target->next->anslen, &length[1]) == 0;
+}
+
+/*
  * Formulate a normal query, send, and await answer.
  * Returned answer is placed in supplied buffer "answer".
  * Perform preliminary check of answer, returning success only
@@ -2950,12 +3006,15 @@ res_queryN(const char *name, /* domain name */ struct res_target *target,
 	u_char *rdata;
 	int ancount;
 	int targets = 0, unanswered = 0;
+	int paired, pairlen[2];
 
 	_DIAGASSERT(name != NULL);
 	/* XXX: target may be NULL??? */
 
 	rcode = NOERROR;
 	ancount = 0;
+
+	paired = res_queryN_pair(name, target, statp, pairlen);
 
 	for (t = target; t; t = t->next) {
 		int class, type;
@@ -2966,6 +3025,10 @@ res_queryN(const char *name, /* domain name */ struct res_target *target,
 		hp = (HEADER *)(void *)t->answer;
 		oflags = statp->_flags;
 
+		if (paired) {
+			n = pairlen[targets];
+			goto sent;
+		}
 again:
 		hp->rcode = NOERROR;	/* default */
 
@@ -3013,6 +3076,9 @@ again:
 				goto again;
 			}
 #endif
+		}
+sent:
+		if (n < 0) {
 			/*
 			 * No name server answered (or none could be reached).
 			 * The next target is still asked: some servers drop

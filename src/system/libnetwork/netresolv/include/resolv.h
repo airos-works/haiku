@@ -108,11 +108,13 @@ union res_sockaddr_union {
 #define	RES_F_LASTMASK	0x000000F0	/*%< ordinal server of last res_nsend */
 #define	RES_F_LASTSHIFT	4		/*%< bit position of LASTMASK "flag" */
 #define	RES_GETLAST(res) (((res)._flags & RES_F_LASTMASK) >> RES_F_LASTSHIFT)
+#define	RES_F_PAIRLOST	0x00000100	/*%< res_nsend_pair() lost an answer */
 
 /*%
  * Resolver options (keep these in synch with res_debug.c, please)
  */
 #define RES_NSID		(1 << 18)   /*%< request name server ID */
+#define RES_SNGLKUP		(1 << 19)   /*%< AAAA and A one after the other */
 /* KAME extensions: use higher bit to avoid conflict with ISC use */
 #define RES_USE_DNAME	0x10000000	/*%< use DNAME */
 
@@ -164,6 +166,7 @@ extern const struct res_sym __p_rcode_syms[];
 #define res_findzonecut2	__res_findzonecut2
 #define res_pquery		__res_pquery
 #define res_nsendsigned		__res_nsendsigned
+#define res_nsend_pair		__res_nsend_pair
 #define res_nisourserver	__res_nisourserver
 #define res_rndinit		__res_rndinit
 #define res_nrandomid		__res_nrandomid
@@ -204,6 +207,8 @@ void		res_pquery(const res_state, const u_char *, int, FILE *);
 int		res_nisourserver(const res_state, const struct sockaddr_in *);
 int		res_nsendsigned(res_state, const u_char *, int,
 					 ns_tsig_key *, u_char *, int);
+int		res_nsend_pair(res_state, const u_char *, int, u_char *, int,
+					 int *, const u_char *, int, u_char *, int, int *);
 int		res_findzonecut(res_state, const char *, ns_class, int,
 					 char *, size_t, struct in_addr *, int);
 int		res_findzonecut2(res_state, const char *, ns_class, int,

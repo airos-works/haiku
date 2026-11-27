@@ -688,6 +688,14 @@ res_setoptions(res_state statp, const char *options, const char *source)
 #endif
 		} else if (!strncmp(cp, "rotate", sizeof("rotate") - 1)) {
 			statp->options |= RES_ROTATE;
+		} else if (!strncmp(cp, "single-request",
+				    sizeof("single-request") - 1)) {
+			/*
+			 * glibc's names (with "single-request-reopen"): AAAA
+			 * and A one after the other, for middleboxes that
+			 * lose one of two questions sent together.
+			 */
+			statp->options |= RES_SNGLKUP;
 		} else if (!strncmp(cp, "no-check-names",
 				    sizeof("no-check-names") - 1)) {
 			statp->options |= RES_NOCHECKNAME;

@@ -53,6 +53,11 @@ SimpleTest alias_route_test : alias_route_test.cpp
 SimpleTest resolver_test : resolver_test.cpp
 	: $(TARGET_NETWORK_LIBS) ;
 
+# getaddrinfo()'s AAAA and A questions one after the other
+# (airos-works/haiku#232)
+SimpleTest resolver_pair_test : resolver_pair_test.cpp
+	: $(TARGET_NETWORK_LIBS) ;
+
 SubInclude HAIKU_TOP src tests system network icmp ;
 SubInclude HAIKU_TOP src tests system network ipv6 ;
 SubInclude HAIKU_TOP src tests system network multicast ;
