@@ -14,6 +14,11 @@
 #include <NetworkAddress.h>
 
 
+static const bigtime_t kCacheLifetime = 60000000LL;
+	// how long a looked up name is used without asking again: what
+	// Chrome's host cache keeps an entry for without a TTL
+
+
 static bool
 strip_port(BString& host, BString& port)
 {
@@ -308,9 +313,15 @@ BNetworkAddressResolver::Resolve(int family, const char* address,
 	for (int i = 0; i < sCacheMap.CountItems(); i++) {
 		CacheEntry* entry = sCacheMap.ItemAt(i);
 		if (entry->Matches(family, address, service, flags)) {
+			if (system_time() - entry->fCreated > kCacheLifetime) {
+				// A name's addresses change (CDNs, dynamic DNS, a VPN, a
+				// captive portal that answered for everything): ask again.
+				// Holders of the old result keep their reference.
+				delete sCacheMap.RemoveItemAt(i);
+				break;
+			}
+
 			// This entry is now the MRU, move to end of list.
-			// TODO if the item is old (more than 1 minute), it should be
-			// dropped and a new request made.
 			sCacheMap.MoveItem(i, sCacheMap.CountItems());
 			return entry->fResolver;
 		}

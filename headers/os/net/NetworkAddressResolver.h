@@ -86,7 +86,8 @@ private:
 			fAddress(address),
 			fService(service),
 			fFlags(flags),
-			fResolver(resolver, false)
+			fResolver(resolver, false),
+			fCreated(system_time())
 		{
 		}
 
@@ -102,6 +103,7 @@ private:
 		uint32 fFlags;
 
 		BReference<const BNetworkAddressResolver> fResolver;
+		bigtime_t fCreated;
 	};
 
 	static	BLocker					sCacheLock;
