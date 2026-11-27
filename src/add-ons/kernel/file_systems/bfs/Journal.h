@@ -67,6 +67,7 @@ private:
 	static	void			_TransactionIdle(int32 transactionID, int32 event,
 								void* _journal);
 	static	status_t		_LogFlusher(void* _journal);
+			void			_SetUnwrittenTransactions(int32 count);
 
 private:
 			Volume*			fVolume;
@@ -76,6 +77,9 @@ private:
 			uint32			fMaxTransactionSize;
 			uint32			fUsed;
 			int32			fUnwrittenTransactions;
+			bigtime_t		fUnwrittenSince;
+				// when the oldest of them was done, 0 without any
+			int32			fIdleFlushRequested;
 			mutex			fEntriesLock;
 			LogEntryList	fEntries;
 			bigtime_t		fTimestamp;

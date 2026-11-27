@@ -58,12 +58,14 @@
 // #pragma mark - fssh_atomic.h
 
 #define atomic_set			fssh_atomic_set
-#define atomic_get_and_Set	fssh_atomic_get_and_set
+#define atomic_get_and_set	fssh_atomic_get_and_set
 #define atomic_test_and_set	fssh_atomic_test_and_set
 #define atomic_add			fssh_atomic_add
 #define atomic_and			fssh_atomic_and
 #define atomic_or			fssh_atomic_or
 #define atomic_get			fssh_atomic_get
+#define atomic_set64		fssh_atomic_set64
+#define atomic_get64		fssh_atomic_get64
 
 
 ////////////////////////////////////////////////////////////////////////////////

@@ -398,6 +398,15 @@ RunArrays::MaxArrayLength()
 //	#pragma mark - Journal
 
 
+/*!	How long finished transactions may stay in memory only. The log is
+	otherwise written when the batch of them gets large, or when no block was
+	changed for two seconds (TRANSACTION_IDLE); a volume that sees a small
+	change every second or so (a log file, a download) would keep everything
+	done on it meanwhile out of the log for hours.
+*/
+static const bigtime_t kMaxUnwrittenTime = 5000000;
+
+
 Journal::Journal(Volume* volume)
 	:
 	fVolume(volume),
@@ -406,6 +415,8 @@ Journal::Journal(Volume* volume)
 	fMaxTransactionSize(fLogSize / 2 - 5),
 	fUsed(0),
 	fUnwrittenTransactions(0),
+	fUnwrittenSince(0),
+	fIdleFlushRequested(0),
 	fHasSubtransaction(false),
 	fSeparateSubTransactions(false)
 {
@@ -422,15 +433,16 @@ Journal::Journal(Volume* volume)
 
 Journal::~Journal()
 {
-	FlushLogAndBlocks();
-
-	recursive_lock_destroy(&fLock);
-	mutex_destroy(&fEntriesLock);
-
+	// Stop the log flusher first: it may wait for the journal lock
 	sem_id logFlusher = fLogFlusherSem;
 	fLogFlusherSem = -1;
 	delete_sem(logFlusher);
 	wait_for_thread(fLogFlusher, NULL);
+
+	FlushLogAndBlocks();
+
+	recursive_lock_destroy(&fLock);
+	mutex_destroy(&fEntriesLock);
 }
 
 
@@ -701,21 +713,69 @@ Journal::_TransactionIdle(int32 transactionID, int32 event, void* _journal)
 	// The current transaction seems to be idle - flush it. (We can't do this
 	// in this thread, as flushing the log can produce new transaction events.)
 	Journal* journal = (Journal*)_journal;
+	atomic_set(&journal->fIdleFlushRequested, 1);
 	release_sem(journal->fLogFlusherSem);
 }
 
 
+/*!	Writes the log when the current transaction is idle, and when finished
+	transactions have waited in memory for kMaxUnwrittenTime.
+*/
 /*static*/ status_t
 Journal::_LogFlusher(void* _journal)
 {
 	Journal* journal = (Journal*)_journal;
-	while (journal->fLogFlusherSem >= 0) {
-		if (acquire_sem(journal->fLogFlusherSem) != B_OK)
-			continue;
+	while (true) {
+		sem_id sem = journal->fLogFlusherSem;
+		if (sem < 0)
+			break;
 
-		journal->_FlushLog(false, false);
+		// The time is read without the lock: it is only a hint, _FlushLog()
+		// looks again with the lock held.
+		bigtime_t since = atomic_get64(&journal->fUnwrittenSince);
+		status_t status;
+		if (since == 0)
+			status = acquire_sem(sem);
+		else {
+			status = acquire_sem_etc(sem, 1, B_ABSOLUTE_TIMEOUT,
+				since + kMaxUnwrittenTime);
+		}
+
+		if (status == B_OK) {
+			// The idle notice, or a new batch of transactions that needs
+			// a deadline
+			if (atomic_get_and_set(&journal->fIdleFlushRequested, 0) != 0)
+				journal->_FlushLog(false, false);
+		} else if (status == B_TIMED_OUT) {
+			since = atomic_get64(&journal->fUnwrittenSince);
+			if (since != 0 && system_time() >= since + kMaxUnwrittenTime) {
+				// Wait for the lock: a volume that is busy enough to never
+				// get idle is the one that needs this.
+				journal->_FlushLog(true, false);
+			}
+		} else if (status != B_INTERRUPTED)
+			break;
 	}
 	return B_OK;
+}
+
+
+/*!	Sets the number of finished transactions that are not in the log yet,
+	and when they started to wait. The journal must be locked.
+*/
+void
+Journal::_SetUnwrittenTransactions(int32 count)
+{
+	bool wasEmpty = fUnwrittenTransactions == 0;
+	fUnwrittenTransactions = count;
+
+	if (count == 0)
+		atomic_set64(&fUnwrittenSince, 0);
+	else if (wasEmpty) {
+		atomic_set64(&fUnwrittenSince, system_time());
+		// let the log flusher start waiting for it
+		release_sem_etc(fLogFlusherSem, 1, B_DO_NOT_RESCHEDULE);
+	}
 }
 
 
@@ -777,11 +837,12 @@ Journal::_WriteTransactionToLog()
 		if (detached) {
 			fTransactionID = cache_detach_sub_transaction(fVolume->BlockCache(),
 				fTransactionID, NULL, NULL);
-			fUnwrittenTransactions = 1;
+			_SetUnwrittenTransactions(0);
+			_SetUnwrittenTransactions(1);
 		} else {
 			cache_end_transaction(fVolume->BlockCache(), fTransactionID, NULL,
 				NULL);
-			fUnwrittenTransactions = 0;
+			_SetUnwrittenTransactions(0);
 		}
 		return B_OK;
 	}
@@ -904,7 +965,9 @@ Journal::_WriteTransactionToLog()
 	if (detached) {
 		fTransactionID = cache_detach_sub_transaction(fVolume->BlockCache(),
 			fTransactionID, _TransactionWritten, logEntry);
-		fUnwrittenTransactions = 1;
+		// the detached sub transaction is all that is left unwritten
+		_SetUnwrittenTransactions(0);
+		_SetUnwrittenTransactions(1);
 
 		if (status == B_OK && _TransactionSize() > fLogSize) {
 			// If the transaction is too large after writing, there is no way to
@@ -916,7 +979,7 @@ Journal::_WriteTransactionToLog()
 	} else {
 		cache_end_transaction(fVolume->BlockCache(), fTransactionID,
 			_TransactionWritten, logEntry);
-		fUnwrittenTransactions = 0;
+		_SetUnwrittenTransactions(0);
 	}
 
 	return status;
@@ -1121,7 +1184,7 @@ Journal::_TransactionDone(bool success)
 			// We can continue to use the parent transaction afterwards
 		} else {
 			cache_abort_transaction(fVolume->BlockCache(), fTransactionID);
-			fUnwrittenTransactions = 0;
+			_SetUnwrittenTransactions(0);
 		}
 
 		return B_OK;
@@ -1136,7 +1199,7 @@ Journal::_TransactionDone(bool success)
 		if (size > FreeLogBlocks())
 			cache_sync_transaction(fVolume->BlockCache(), fTransactionID);
 
-		fUnwrittenTransactions++;
+		_SetUnwrittenTransactions(fUnwrittenTransactions + 1);
 		return B_OK;
 	}
 
@@ -1266,6 +1329,10 @@ Journal::Dump()
 	kprintf("  max transaction size: %" B_PRIu32 "\n", fMaxTransactionSize);
 	kprintf("  used:                 %" B_PRIu32 "\n", fUsed);
 	kprintf("  unwritten:            %" B_PRId32 "\n", fUnwrittenTransactions);
+	if (fUnwrittenSince != 0) {
+		kprintf("  unwritten for:        %" B_PRId64 " ms\n",
+			(system_time() - fUnwrittenSince) / 1000);
+	}
 	kprintf("  timestamp:            %" B_PRId64 "\n", fTimestamp);
 	kprintf("  transaction ID:       %" B_PRId32 "\n", fTransactionID);
 	kprintf("  has subtransaction:   %d\n", fHasSubtransaction);
