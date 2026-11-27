@@ -63,13 +63,44 @@ struct select_sync_pool {
 };
 
 
-struct wait_for_objects_sync : public select_sync {
-	sem_id				sem;
-	uint32				count;
-	struct select_info*	set;
+// So many select_infos live in the sync object itself; more come from the
+// heap. A poll() or select() of a few descriptors then allocates nothing.
+static const uint32 kInlineSelectInfos = 16;
 
-	virtual ~wait_for_objects_sync();
-	virtual status_t Notify(select_info* info, uint16 events);
+
+/*!	The sync object of one select()/poll()/wait_for_objects() call. It lives
+	on the caller's stack. It used to be a heap object with a semaphore of its
+	own, and creating and deleting that semaphore cost about a third of a
+	poll() of one descriptor (#227). The waiting thread now blocks directly,
+	and Notify() unblocks it.
+
+	Others can still hold references when the call is done: close() of a
+	descriptor that is being selected takes its select_infos away and notifies
+	and deselects them itself (deselect_select_infos()), and so does a dying
+	thread. The destructor waits until they have put their references, so that
+	nothing touches the object after it is gone.
+*/
+struct wait_for_objects_sync : public select_sync {
+								wait_for_objects_sync();
+	virtual						~wait_for_objects_sync();
+
+			status_t			Init(uint32 count);
+			status_t			Wait(uint32 flags, bigtime_t timeout);
+
+	virtual	status_t			Notify(select_info* info, uint16 events);
+
+protected:
+	virtual	void				LastReferenceReleased();
+
+public:
+			struct select_info*	set;
+
+private:
+			spinlock			fLock;
+			Thread*				fWaiter;
+			bool				fNotified;
+			bool				fReleased;
+			select_info			fInlineSet[kInlineSelectInfos];
 };
 
 
@@ -360,34 +391,6 @@ fd_zero(fd_set *set, int numFDs)
 }
 
 
-static status_t
-create_select_sync(int numFDs, wait_for_objects_sync*& _sync)
-{
-	wait_for_objects_sync* sync = new(nothrow) wait_for_objects_sync;
-	if (sync == NULL)
-		return B_NO_MEMORY;
-	ObjectDeleter<wait_for_objects_sync> syncDeleter(sync);
-
-	sync->set = new(nothrow) select_info[numFDs];
-	if (sync->set == NULL)
-		return B_NO_MEMORY;
-	sync->count = numFDs;
-
-	sync->sem = create_sem(0, "select");
-	if (sync->sem < 0)
-		return sync->sem;
-
-	for (int i = 0; i < numFDs; i++) {
-		sync->set[i].next = NULL;
-		sync->set[i].sync = sync;
-	}
-
-	syncDeleter.Detach();
-	_sync = sync;
-	return B_OK;
-}
-
-
 void
 acquire_select_sync(select_sync* sync)
 {
@@ -404,27 +407,158 @@ put_select_sync(select_sync* sync)
 }
 
 
+wait_for_objects_sync::wait_for_objects_sync()
+	:
+	set(NULL),
+	fWaiter(NULL),
+	fNotified(false),
+	fReleased(false)
+{
+	B_INITIALIZE_SPINLOCK(&fLock);
+}
+
+
 wait_for_objects_sync::~wait_for_objects_sync()
 {
-	delete_sem(sem);
-	delete[] set;
+	// Put our own reference. If someone else still has one (see above), wait
+	// for it: the last one wakes us in LastReferenceReleased(). The wait is
+	// not interruptible, it is short and the object must not go away early.
+	if (ReleaseReference() != 1) {
+		Thread* thread = thread_get_current_thread();
+
+		InterruptsSpinLocker locker(fLock);
+		while (!fReleased) {
+			thread_prepare_to_block(thread, 0, THREAD_BLOCK_TYPE_OTHER,
+				"select sync");
+			fWaiter = thread;
+			locker.Unlock();
+
+			thread_block();
+				// A late Notify() can wake us as well, so check again.
+
+			locker.Lock();
+			fWaiter = NULL;
+		}
+	}
+
+	if (set != fInlineSet)
+		delete[] set;
 }
 
 
 status_t
+wait_for_objects_sync::Init(uint32 count)
+{
+	if (count <= kInlineSelectInfos)
+		set = fInlineSet;
+	else {
+		set = new(nothrow) select_info[count];
+		if (set == NULL)
+			return B_NO_MEMORY;
+	}
+
+	for (uint32 i = 0; i < count; i++) {
+		set[i].next = NULL;
+		set[i].sync = this;
+	}
+
+	return B_OK;
+}
+
+
+/*!	Waits until Notify() is called with one of an info's selected events, as
+	acquire_sem_etc(B_CAN_INTERRUPT | flags, timeout) of the old semaphore did,
+	with the same results: B_OK when notified (even when the timeout has
+	passed or a signal is pending), B_WOULD_BLOCK for a relative timeout of 0,
+	B_TIMED_OUT, B_INTERRUPTED, and B_BAD_VALUE for both timeout flags.
+*/
+status_t
+wait_for_objects_sync::Wait(uint32 flags, bigtime_t timeout)
+{
+	if ((flags & (B_RELATIVE_TIMEOUT | B_ABSOLUTE_TIMEOUT))
+			== (B_RELATIVE_TIMEOUT | B_ABSOLUTE_TIMEOUT)) {
+		return B_BAD_VALUE;
+	}
+
+	flags |= B_CAN_INTERRUPT;
+
+	Thread* thread = thread_get_current_thread();
+
+	InterruptsSpinLocker locker(fLock);
+	if (fNotified)
+		return B_OK;
+
+	if ((flags & B_RELATIVE_TIMEOUT) != 0 && timeout <= 0)
+		return B_WOULD_BLOCK;
+	if ((flags & B_ABSOLUTE_TIMEOUT) != 0 && timeout < 0)
+		return B_TIMED_OUT;
+
+	SpinLocker schedulerLocker(thread->scheduler_lock);
+	if (thread_is_interrupted(thread, flags))
+		return B_INTERRUPTED;
+	schedulerLocker.Unlock();
+
+	// As in switch_sem_etc(): poll() and select() turn a zero timeout into
+	// "now", don't block on a timer that fires at once.
+	if ((flags & B_ABSOLUTE_TIMEOUT) != 0
+		&& timeout <= ((flags & B_TIMEOUT_REAL_TIME_BASE) != 0
+			? real_time_clock_usecs() : system_time())) {
+		return B_TIMED_OUT;
+	}
+
+	thread_prepare_to_block(thread, flags, THREAD_BLOCK_TYPE_OTHER, "select");
+	fWaiter = thread;
+	locker.Unlock();
+
+	status_t status;
+	if ((flags & (B_RELATIVE_TIMEOUT | B_ABSOLUTE_TIMEOUT)) == 0
+		|| timeout == B_INFINITE_TIMEOUT) {
+		status = thread_block();
+	} else
+		status = thread_block_with_timeout(flags, timeout);
+
+	// Once fWaiter is cleared, no Notify() can unblock this thread any more
+	// (a timed out or interrupted thread is not waiting, so an unblock in
+	// between does nothing).
+	locker.Lock();
+	fWaiter = NULL;
+
+	return status;
+}
+
+
+/*!	Can be called in interrupt context and with spinlocks held, like
+	notify_select_event().
+*/
+status_t
 wait_for_objects_sync::Notify(select_info* info, uint16 events)
 {
-	if (sem < B_OK)
-		return B_BAD_VALUE;
-
 	atomic_or(&info->events, events);
 
 	// only wake up the waiting select()/poll() call if the events
 	// match one of the selected ones
-	if (info->selected_events & events)
-		return release_sem_etc(sem, 1, B_DO_NOT_RESCHEDULE);
+	if ((info->selected_events & events) == 0)
+		return B_OK;
+
+	InterruptsSpinLocker locker(fLock);
+	fNotified = true;
+	if (fWaiter != NULL)
+		thread_unblock(fWaiter, B_OK);
 
 	return B_OK;
+}
+
+
+void
+wait_for_objects_sync::LastReferenceReleased()
+{
+	// The object is on the stack of the thread that waits in the destructor,
+	// don't delete it. The locker is the last access to it: the destructor
+	// cannot return before it has the lock again.
+	InterruptsSpinLocker locker(fLock);
+	fReleased = true;
+	if (fWaiter != NULL)
+		thread_unblock(fWaiter, B_OK);
 }
 
 
@@ -449,9 +583,8 @@ common_select(int numFDs, fd_set *readSet, fd_set *writeSet, fd_set *errorSet,
 			return B_FILE_ERROR;
 	}
 
-	// allocate sync object
-	wait_for_objects_sync* sync;
-	status = create_select_sync(numFDs, sync);
+	wait_for_objects_sync sync;
+	status = sync.Init(numFDs);
 	if (status != B_OK)
 		return status;
 
@@ -460,22 +593,22 @@ common_select(int numFDs, fd_set *readSet, fd_set *writeSet, fd_set *errorSet,
 	// start selecting file descriptors
 
 	for (fd = 0; fd < numFDs; fd++) {
-		sync->set[fd].selected_events = 0;
-		sync->set[fd].events = 0;
+		sync.set[fd].selected_events = 0;
+		sync.set[fd].events = 0;
 
 		if (readSet && FD_ISSET(fd, readSet)) {
-			sync->set[fd].selected_events = SELECT_FLAG(B_SELECT_READ)
+			sync.set[fd].selected_events = SELECT_FLAG(B_SELECT_READ)
 				| SELECT_FLAG(B_SELECT_DISCONNECTED) | SELECT_FLAG(B_SELECT_ERROR);
 		}
 		if (writeSet && FD_ISSET(fd, writeSet)) {
-			sync->set[fd].selected_events |= SELECT_FLAG(B_SELECT_WRITE)
+			sync.set[fd].selected_events |= SELECT_FLAG(B_SELECT_WRITE)
 				| SELECT_FLAG(B_SELECT_ERROR);
 		}
 		if (errorSet && FD_ISSET(fd, errorSet))
-			sync->set[fd].selected_events |= SELECT_FLAG(B_SELECT_ERROR);
+			sync.set[fd].selected_events |= SELECT_FLAG(B_SELECT_ERROR);
 
-		if (sync->set[fd].selected_events != 0) {
-			select_fd(fd, sync->set + fd, kernel);
+		if (sync.set[fd].selected_events != 0) {
+			select_fd(fd, sync.set + fd, kernel);
 				// array position is the same as the fd for select()
 		}
 	}
@@ -492,14 +625,13 @@ common_select(int numFDs, fd_set *readSet, fd_set *writeSet, fd_set *errorSet,
 	}
 
 	// wait for something to happen
-	status = acquire_sem_etc(sync->sem, 1,
-		B_CAN_INTERRUPT | (timeout >= 0 ? B_ABSOLUTE_TIMEOUT : 0), timeout);
+	status = sync.Wait(timeout >= 0 ? B_ABSOLUTE_TIMEOUT : 0, timeout);
 
 	// restore the old signal mask
 	if (sigMask != NULL && kernel)
 		sigprocmask(SIG_SETMASK, &oldSigMask, NULL);
 
-	PRINT(("common_select(): acquire_sem_etc() returned: %lx\n", status));
+	PRINT(("common_select(): Wait() returned: %lx\n", status));
 
 	// deselect file descriptors
 
@@ -512,7 +644,7 @@ common_select(int numFDs, fd_set *readSet, fd_set *writeSet, fd_set *errorSet,
 		if ((readSet != NULL && FD_ISSET(fd, readSet))
 			|| (writeSet != NULL && FD_ISSET(fd, writeSet))
 			|| (errorSet != NULL && FD_ISSET(fd, errorSet))) {
-			deselect_fd(fd, sync->set + fd, kernel);
+			deselect_fd(fd, sync.set + fd, kernel);
 		}
 	}
 
@@ -525,7 +657,6 @@ common_select(int numFDs, fd_set *readSet, fd_set *writeSet, fd_set *errorSet,
 	if (status == B_INTERRUPTED) {
 		// We must not clear the sets in this case, as applications may
 		// rely on the contents of them.
-		put_select_sync(sync);
 		T(SelectDone(numFDs, readSet, writeSet, errorSet, status));
 		return B_INTERRUPTED;
 	}
@@ -539,19 +670,19 @@ common_select(int numFDs, fd_set *readSet, fd_set *writeSet, fd_set *errorSet,
 
 	if (status == B_OK) {
 		for (count = 0, fd = 0; fd < numFDs; fd++) {
-			if (readSet && sync->set[fd].events & (SELECT_FLAG(B_SELECT_READ)
+			if (readSet && sync.set[fd].events & (SELECT_FLAG(B_SELECT_READ)
 					| SELECT_FLAG(B_SELECT_DISCONNECTED) | SELECT_FLAG(B_SELECT_ERROR))) {
 				FD_SET(fd, readSet);
 				count++;
 			}
 			if (writeSet
-				&& sync->set[fd].events & (SELECT_FLAG(B_SELECT_WRITE)
+				&& sync.set[fd].events & (SELECT_FLAG(B_SELECT_WRITE)
 					| SELECT_FLAG(B_SELECT_ERROR))) {
 				FD_SET(fd, writeSet);
 				count++;
 			}
 			if (errorSet
-				&& sync->set[fd].events & SELECT_FLAG(B_SELECT_ERROR)) {
+				&& sync.set[fd].events & SELECT_FLAG(B_SELECT_ERROR)) {
 				FD_SET(fd, errorSet);
 				count++;
 			}
@@ -559,8 +690,6 @@ common_select(int numFDs, fd_set *readSet, fd_set *writeSet, fd_set *errorSet,
 	}
 
 	// B_TIMED_OUT and B_WOULD_BLOCK are supposed to return 0
-
-	put_select_sync(sync);
 
 	T(SelectDone(numFDs, readSet, writeSet, errorSet, status));
 
@@ -572,9 +701,8 @@ static int
 common_poll(struct pollfd *fds, nfds_t numFDs, bigtime_t timeout,
 	const sigset_t *sigMask, bool kernel)
 {
-	// allocate sync object
-	wait_for_objects_sync* sync;
-	status_t status = create_select_sync(numFDs, sync);
+	wait_for_objects_sync sync;
+	status_t status = sync.Init(numFDs);
 	if (status != B_OK)
 		return status;
 
@@ -588,16 +716,16 @@ common_poll(struct pollfd *fds, nfds_t numFDs, bigtime_t timeout,
 
 		// initialize events masks
 		fds[i].events |= POLLNVAL | POLLERR | POLLHUP;
-		sync->set[i].selected_events = fds[i].events;
-		sync->set[i].events = 0;
+		sync.set[i].selected_events = fds[i].events;
+		sync.set[i].events = 0;
 		fds[i].revents = 0;
 
-		if (fd >= 0 && select_fd(fd, sync->set + i, kernel) != B_OK) {
+		if (fd >= 0 && select_fd(fd, sync.set + i, kernel) != B_OK) {
 			// If the FD returned events as well as an error, ignore the error.
-			if (sync->set[i].events != 0)
+			if (sync.set[i].events != 0)
 				continue;
 
-			sync->set[i].events = POLLNVAL;
+			sync.set[i].events = POLLNVAL;
 			fds[i].revents = POLLNVAL;
 				// indicates that the FD doesn't need to be deselected
 			invalid = true;
@@ -615,10 +743,8 @@ common_poll(struct pollfd *fds, nfds_t numFDs, bigtime_t timeout,
 		}
 	}
 
-	if (!invalid) {
-		status = acquire_sem_etc(sync->sem, 1,
-			B_CAN_INTERRUPT | (timeout >= 0 ? B_ABSOLUTE_TIMEOUT : 0), timeout);
-	}
+	if (!invalid)
+		status = sync.Wait(timeout >= 0 ? B_ABSOLUTE_TIMEOUT : 0, timeout);
 
 	// restore the old signal mask
 	if (sigMask != NULL && kernel)
@@ -627,8 +753,8 @@ common_poll(struct pollfd *fds, nfds_t numFDs, bigtime_t timeout,
 	// deselect file descriptors
 
 	for (uint32 i = 0; i < numFDs; i++) {
-		if (fds[i].fd >= 0 && (sync->set[i].events & POLLNVAL) == 0)
-			deselect_fd(fds[i].fd, sync->set + i, kernel);
+		if (fds[i].fd >= 0 && (sync.set[i].events & POLLNVAL) == 0)
+			deselect_fd(fds[i].fd, sync.set + i, kernel);
 	}
 
 	// collect the events that have happened in the meantime
@@ -641,7 +767,7 @@ common_poll(struct pollfd *fds, nfds_t numFDs, bigtime_t timeout,
 					continue;
 
 				// POLLxxx flags and B_SELECT_xxx flags are compatible
-				fds[i].revents = sync->set[i].events & fds[i].events;
+				fds[i].revents = sync.set[i].events & fds[i].events;
 				if (fds[i].revents != 0)
 					count++;
 			}
@@ -653,8 +779,6 @@ common_poll(struct pollfd *fds, nfds_t numFDs, bigtime_t timeout,
 			// B_TIMED_OUT, and B_WOULD_BLOCK
 			break;
 	}
-
-	put_select_sync(sync);
 
 	T(PollDone(fds, numFDs, count));
 
@@ -668,9 +792,8 @@ common_wait_for_objects(object_wait_info* infos, int numInfos, uint32 flags,
 {
 	status_t status = B_OK;
 
-	// allocate sync object
-	wait_for_objects_sync* sync;
-	status = create_select_sync(numInfos, sync);
+	wait_for_objects_sync sync;
+	status = sync.Init(numInfos);
 	if (status != B_OK)
 		return status;
 
@@ -683,32 +806,30 @@ common_wait_for_objects(object_wait_info* infos, int numInfos, uint32 flags,
 
 		// initialize events masks
 		infos[i].events |= B_EVENT_INVALID | B_EVENT_ERROR | B_EVENT_DISCONNECTED;
-		sync->set[i].selected_events = infos[i].events;
-		sync->set[i].events = 0;
+		sync.set[i].selected_events = infos[i].events;
+		sync.set[i].events = 0;
 
-		if (select_object(type, object, sync->set + i, kernel) != B_OK) {
+		if (select_object(type, object, sync.set + i, kernel) != B_OK) {
 			// If the object returned events as well as an error, ignore the error.
-			if (sync->set[i].events != 0)
+			if (sync.set[i].events != 0)
 				continue;
 
-			sync->set[i].events = B_EVENT_INVALID;
+			sync.set[i].events = B_EVENT_INVALID;
 			infos[i].events = B_EVENT_INVALID;
 				// indicates that the object doesn't need to be deselected
 			invalid = true;
 		}
 	}
 
-	if (!invalid) {
-		status = acquire_sem_etc(sync->sem, 1, B_CAN_INTERRUPT | flags,
-			timeout);
-	}
+	if (!invalid)
+		status = sync.Wait(flags, timeout);
 
 	// deselect objects
 
 	for (int i = 0; i < numInfos; i++) {
 		uint16 type = infos[i].type;
-		if ((sync->set[i].events & B_EVENT_INVALID) == 0)
-			deselect_object(type, infos[i].object, sync->set + i, kernel);
+		if ((sync.set[i].events & B_EVENT_INVALID) == 0)
+			deselect_object(type, infos[i].object, sync.set + i, kernel);
 	}
 
 	// collect the events that have happened in the meantime
@@ -716,7 +837,7 @@ common_wait_for_objects(object_wait_info* infos, int numInfos, uint32 flags,
 	ssize_t count = 0;
 	if (status == B_OK) {
 		for (int i = 0; i < numInfos; i++) {
-			infos[i].events &= sync->set[i].events;
+			infos[i].events &= sync.set[i].events;
 			if (infos[i].events != 0)
 				count++;
 		}
@@ -726,8 +847,6 @@ common_wait_for_objects(object_wait_info* infos, int numInfos, uint32 flags,
 		for (int i = 0; i < numInfos; i++)
 			infos[i].events = 0;
 	}
-
-	put_select_sync(sync);
 
 	return count;
 }

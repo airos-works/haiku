@@ -167,6 +167,11 @@ SimpleTest null_poll_test : null_poll_test.cpp ;
 SimpleTest select_check : select_check.cpp ;
 SimpleTest select_close_test : select_close_test.cpp ;
 
+# poll(), select() and wait_for_objects() are woken by writes, semaphores,
+# ports, exiting threads, closed descriptors and signals, also under stress
+# (airos-works/haiku#227)
+SimpleTest select_wakeup_test : select_wakeup_test.cpp ;
+
 # poll(), select() and acquire_sem_etc() with a zero or passed timeout return
 # at once, with the same results as before (airos-works/haiku#227)
 SimpleTest poll_timeout_test : poll_timeout_test.cpp ;
