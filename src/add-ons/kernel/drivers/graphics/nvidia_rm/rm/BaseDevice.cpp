@@ -66,8 +66,11 @@ NvHaikuBaseDeviceHandle::~NvHaikuBaseDeviceHandle()
 {
 	//dprintf("-NvHaikuBaseDeviceHandle\n");
 
+	status_t gate = NvHaikuDriver::Instance().EnterUserCall(0);
 	RmStack stack;
 	rm_cleanup_file_private(stack.Get(), &fDevice->fNvState, &fNvfp);
+	if (gate == B_OK)
+		NvHaikuDriver::Instance().LeaveUserCall();
 
     ConsumeMmapContext();
 }
@@ -121,6 +124,30 @@ status_t NvHaikuBaseDeviceHandle::Control(uint32 op, void *data, size_t len)
 	uint32 cmd = op - NV_HAIKU_BASE;
 	//dprintf("NvHaikuBaseDeviceHandle::Control(cmd: %" B_PRIu32 ", len: %" B_PRIu32 ")\n", cmd, len);
 
+	// What reaches resman or the GPU waits while the system suspends and
+	// resumes, as on Linux (nv_system_pm_lock): resman refused it then
+	// ("GPU not in full power"), and the registers are not there. What only
+	// looks at the driver's own state does not, waiting for the resume least
+	// of all.
+	switch (cmd) {
+		case NV_HAIKU_GET_COOKIE:
+		case NV_HAIKU_WAIT_FOR_RESUME:
+		case NV_HAIKU_PUBLISH_SCANOUT:
+		case NV_HAIKU_GET_SCANOUT:
+		case NV_ESC_CARD_INFO:
+			return ControlUngated(cmd, data, len);
+	}
+
+	CHECK_RET(NvHaikuDriver::Instance().EnterUserCall());
+	status_t status = ControlUngated(cmd, data, len);
+	NvHaikuDriver::Instance().LeaveUserCall();
+	return status;
+}
+
+
+status_t NvHaikuBaseDeviceHandle::ControlUngated(uint32 cmd, void *data,
+	size_t len)
+{
 	switch (cmd) {
 		case NV_HAIKU_GET_COOKIE: {
 			if (!IS_KERNEL_ADDRESS(data)) {

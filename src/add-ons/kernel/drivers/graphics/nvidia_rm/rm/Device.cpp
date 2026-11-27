@@ -302,21 +302,33 @@ status_t NvHaikuDevice::Resume()
 	if (!stack.IsValid())
 		return B_NO_MEMORY;
 
+	bigtime_t start = system_time();
 	NV_STATUS status = rm_power_management(stack.Get(), nv,
 		NV_PM_ACTION_RESUME);
-	if (status != NV_OK) {
-		dprintf("nvidia_rm: rm_power_management(resume): %#" B_PRIx32 "\n",
-			status);
-	}
+	dprintf("nvidia_rm: GPU %#" B_PRIx32 ": resman resumed in %" B_PRId64
+		" ms: %#" B_PRIx32 "\n", nv->gpu_id, (system_time() - start) / 1000,
+		status);
 
 	fSuspended = false;
 
+	if (status != NV_OK) {
+		// Like Linux (nvidia_resume()): NVKMS resumes only on a GPU that
+		// did; it would drive a display engine resman did not bring back.
+		dprintf("[!] nvidia_rm: GPU %#" B_PRIx32 " did not resume; its "
+			"displays stay off\n", nv->gpu_id);
+		return B_ERROR;
+	}
+
 	const nvidia_modeset_callbacks_t *callbacks
 		= NvHaikuDriver::Instance().ModesetCallbacks();
-	if (callbacks != nullptr && callbacks->resume != nullptr)
+	if (callbacks != nullptr && callbacks->resume != nullptr) {
+		start = system_time();
 		callbacks->resume(nv->gpu_id);
+		dprintf("nvidia_rm: GPU %#" B_PRIx32 ": NVKMS resumed in %" B_PRId64
+			" ms\n", nv->gpu_id, (system_time() - start) / 1000);
+	}
 
-	return status == NV_OK ? B_OK : B_ERROR;
+	return B_OK;
 }
 
 
@@ -328,7 +340,12 @@ status_t NvHaikuDevice::Open(uint32 flags, DevfsNodeHandle &handle)
 	if (!handleImpl.IsSet())
 		return B_NO_MEMORY;
 
-	CHECK_RET(AcquireRef());
+	// (Linux' nvidia_open() waits for nv_system_pm_lock too: opening
+	// starts a GPU that is not in use)
+	CHECK_RET(NvHaikuDriver::Instance().EnterUserCall());
+	status_t status = AcquireRef();
+	NvHaikuDriver::Instance().LeaveUserCall();
+	CHECK_RET(status);
 
 	handle = DevfsNodeHandle(nullptr, handleImpl.Detach());
 
@@ -386,6 +403,11 @@ NvHaikuDeviceHandle::~NvHaikuDeviceHandle()
 status_t NvHaikuDeviceHandle::Close()
 {
 //	dprintf("NvHaikuDeviceHandle::Close()\n");
+	// The last close stops the GPU: not while it is suspended (Linux'
+	// nvidia_close() waits for nv_system_pm_lock too).
+	status_t gate = NvHaikuDriver::Instance().EnterUserCall(0);
 	GetDevice()->Closed();
+	if (gate == B_OK)
+		NvHaikuDriver::Instance().LeaveUserCall();
 	return NvHaikuBaseDeviceHandle::Close();
 }

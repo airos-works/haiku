@@ -210,6 +210,11 @@ private:
 	// test setting makes it lose itself (0: never).
 	bigtime_t fEngineRecoveredAt = 0;
 	bigtime_t fEngineTestLoss = 0;
+	// From the start of a system suspend to the end of the resume the
+	// engine is not used: its channel is reached through a mapping of the
+	// GPU, which is in standby, then without power, then not set up again.
+	bool fEngineParked = false;
+	void ParkEngine(bool park);
 	status_t CreateSource(uint16 width, uint16 height, color_space space,
 		bool systemMemory, frame_buffer_source *source);
 	uint32 fNextSourceID = 1;
@@ -620,6 +625,8 @@ void NvAccelerant::ResumeThread()
 		return;
 	}
 	uint32 generation = params.generation;
+	if ((generation & 1) != 0)
+		ParkEngine(true);
 
 	while (!fQuitResumeThread) {
 		params.generation = generation;
@@ -633,6 +640,15 @@ void NvAccelerant::ResumeThread()
 			continue;
 
 		generation = params.generation;
+		if ((generation & 1) != 0) {
+			// The system suspends (the generation stays odd until it has
+			// resumed): before, app_server's flush went on submitting to the
+			// GPU until it was gone (airos-works/haiku#208).
+			debug_printf("nvidia_rm: system suspends, 2D engine parked\n");
+			ParkEngine(true);
+			continue;
+		}
+		ParkEngine(false);
 		debug_printf("nvidia_rm: restoring display state after resume\n");
 		try {
 			RestoreAfterResume();
@@ -1088,6 +1104,8 @@ void NvAccelerant::StartEngine()
 // (after a resume, on a mode set). Called with the engine's lock held.
 bool NvAccelerant::EngineWorks(bool now)
 {
+	if (fEngineParked)
+		return false;
 	if (!fEngine->IsLost())
 		return true;
 	const bigtime_t kRecoveryInterval = 5000000;
@@ -1103,6 +1121,20 @@ bool NvAccelerant::EngineWorks(bool now)
 	if (fEngineTestLoss > 0)
 		fEngine->LoseAt(system_time() + fEngineTestLoss);
 	return true;
+}
+
+// Callers find the engine not working while it is parked, and use the
+// CPU; what was submitted before is waited for (a copy that the stopped
+// channels keep from finishing is given up after its timeout, and the
+// engine set up again after the resume).
+void NvAccelerant::ParkEngine(bool park)
+{
+	if (!fEngine)
+		return;
+	std::lock_guard<std::recursive_mutex> lock(fEngine->Lock());
+	if (park && !fEngineParked)
+		fEngine->WaitIdle();
+	fEngineParked = park;
 }
 
 void NvAccelerant::RecoverEngineNow()
@@ -2222,11 +2254,13 @@ void NvAccelerant::HotplugThread()
 {
 	NvU32 lastMask = 0;
 	bool haveMask = false;
+	bool readFailed = false;
 	try {
 		lastMask = ConnectedDisplayMask();
 		haveMask = true;
 	} catch (const std::system_error &ex) {
 		debug_printf("nvidia_rm: cannot read the hot plug lines: %s\n", ex.what());
+		readFailed = true;
 	}
 
 	while (!fQuitHotplugThread.load()) {
@@ -2262,19 +2296,24 @@ void NvAccelerant::HotplugThread()
 			snooze(2000000);
 		}
 
-		if (haveMask) {
-			try {
-				NvU32 mask = ConnectedDisplayMask();
-				if (mask != lastMask) {
-					debug_printf("nvidia_rm: hot plug lines 0x%" B_PRIx32 " -> 0x%" B_PRIx32 "\n",
-						lastMask, mask);
-					lastMask = mask;
-					check = true;
-				}
-			} catch (const std::system_error &ex) {
-				debug_printf("nvidia_rm: cannot read the hot plug lines: %s\n", ex.what());
-				haveMask = false;
+		// Tried again after a failure: one during a resume ("GPU not in full
+		// power") stopped the polling for good (airos-works/haiku#208).
+		try {
+			NvU32 mask = ConnectedDisplayMask();
+			if (readFailed)
+				debug_printf("nvidia_rm: hot plug lines readable again\n");
+			readFailed = false;
+			if (haveMask && mask != lastMask) {
+				debug_printf("nvidia_rm: hot plug lines 0x%" B_PRIx32 " -> 0x%" B_PRIx32 "\n",
+					lastMask, mask);
+				check = true;
 			}
+			lastMask = mask;
+			haveMask = true;
+		} catch (const std::system_error &ex) {
+			if (!readFailed)
+				debug_printf("nvidia_rm: cannot read the hot plug lines: %s\n", ex.what());
+			readFailed = true;
 		}
 
 		bigtime_t recheckAt = fRecheckAt.load();

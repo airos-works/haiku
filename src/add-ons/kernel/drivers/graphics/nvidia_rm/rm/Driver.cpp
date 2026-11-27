@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <errno.h>
 
 #include <AutoDeleter.h>
@@ -68,6 +69,10 @@ NvHaikuDriver::~NvHaikuDriver()
 
 	if (fPowerHookAdded)
 		device_manager_remove_power_hook(PowerHook, this);
+	if (fResumeThread >= 0) {
+		status_t result;
+		wait_for_thread(fResumeThread, &result);
+	}
 
 	for (int32 i = 0; i < fDevices.Count(); i++) {
 		delete fDevices[i];
@@ -99,6 +104,7 @@ status_t NvHaikuDriver::Init()
 	CHECK_RET(get_module(B_PCI_MODULE_NAME, (module_info**)&fPCI));
 
 	fResumeCondition.Init(this, "nvidia_rm resume");
+	fPowerCondition.Init(this, "nvidia_rm power");
 
 	fIntrSafePool.Maintain();
 
@@ -147,34 +153,177 @@ status_t NvHaikuDriver::Init()
 	return B_OK;
 }
 
+// How long the resume of the GPUs may take before the rest of the system
+// goes on without them: far longer than a resume should take, but a resume
+// that does not return must not keep the devices after it (and the resume of
+// the whole system) from coming back (airos-works/haiku#208).
+static const bigtime_t kResumeTimeout = 15000000;
+// How long a suspend waits for calls from user land that are running.
+static const bigtime_t kUserCallDrainTimeout = 1000000;
+
+
 status_t NvHaikuDriver::PowerHook(void *cookie, bool resume, int32 state)
 {
 	NvHaikuDriver *driver = static_cast<NvHaikuDriver*>(cookie);
-	status_t result = B_OK;
+	return resume ? driver->ResumeDevices() : driver->SuspendDevices();
+}
 
-	if (!resume) {
-		// Like Linux: stop user channels of all GPUs before suspending them.
-		for (int32 i = 0; i < driver->fDevices.Count(); i++)
-			driver->fDevices[i]->PreemptUserChannels();
-		for (int32 i = driver->fDevices.Count() - 1; i >= 0; i--) {
-			status_t status = driver->fDevices[i]->Suspend();
-			if (status != B_OK)
-				result = status;
-		}
-	} else {
-		for (int32 i = 0; i < driver->fDevices.Count(); i++) {
-			status_t status = driver->fDevices[i]->Resume();
-			if (status != B_OK)
-				result = status;
-		}
-		for (int32 i = 0; i < driver->fDevices.Count(); i++)
-			driver->fDevices[i]->RestoreUserChannels();
 
-		driver->fResumeGeneration++;
-		driver->fResumeCondition.NotifyAll();
+/*!	Like Linux' nv_set_system_power_state(): user land is locked out from
+	here to the end of the resume (nv_system_pm_lock there), the user
+	channels are stopped, then each GPU suspends (NVKMS, then resman).
+	Haiku does not freeze user land as Linux does during a suspend, so
+	without the lock app_server's calls went on into a GPU in standby ("GPU
+	not in full power"). The generation turns odd, which tells the accelerant
+	to stop using its 2D engine until it turns even again.
+*/
+status_t NvHaikuDriver::SuspendDevices()
+{
+	{
+		MutexLocker locker(fPowerLock);
+		if (fPowerState != kPowerRunning) {
+			dprintf("[!] nvidia_rm: the GPUs have not finished resuming from "
+				"the last suspend; they are not suspended\n");
+			return B_BUSY;
+		}
+		fPowerState = kPowerSuspended;
+		fResumeGeneration++;
+		fResumeCondition.NotifyAll();
+
+		bigtime_t deadline = system_time() + kUserCallDrainTimeout;
+		while (fUserCalls > 0) {
+			ConditionVariableEntry entry;
+			fPowerCondition.Add(&entry);
+			locker.Unlock();
+			status_t status = entry.Wait(B_ABSOLUTE_TIMEOUT, deadline);
+			locker.Lock();
+			if (status == B_TIMED_OUT && fUserCalls > 0) {
+				dprintf("nvidia_rm: %" B_PRId32 " calls from user land still "
+					"running at suspend\n", fUserCalls);
+				break;
+			}
+		}
 	}
 
+	status_t result = B_OK;
+	for (int32 i = 0; i < fDevices.Count(); i++)
+		fDevices[i]->PreemptUserChannels();
+	for (int32 i = fDevices.Count() - 1; i >= 0; i--) {
+		status_t status = fDevices[i]->Suspend();
+		if (status != B_OK)
+			result = status;
+	}
 	return result;
+}
+
+
+/*!	The resume runs in a thread of its own: if it does not return within
+	kResumeTimeout, the rest of the system resumes without the GPUs, calls
+	from user land fail rather than wait for them, and a line says so. When
+	it does finish, late, they are given back.
+*/
+status_t NvHaikuDriver::ResumeDevices()
+{
+	MutexLocker locker(fPowerLock);
+	if (fPowerState != kPowerSuspended)
+		return B_OK;
+	fResumeDone = false;
+	locker.Unlock();
+
+	if (fResumeThread >= 0) {
+		// the last one has finished, or the state would not be suspended
+		status_t result;
+		wait_for_thread(fResumeThread, &result);
+		fResumeThread = -1;
+	}
+	thread_id thread = spawn_kernel_thread(&ResumeThreadEntry,
+		"nvidia_rm resume", B_URGENT_DISPLAY_PRIORITY, this);
+	if (thread < 0) {
+		ResumeDevicesNow();
+		return fResumeResult;
+	}
+	fResumeThread = thread;
+	resume_thread(thread);
+
+	locker.Lock();
+	bigtime_t deadline = system_time() + kResumeTimeout;
+	while (!fResumeDone) {
+		ConditionVariableEntry entry;
+		fPowerCondition.Add(&entry);
+		locker.Unlock();
+		status_t status = entry.Wait(B_ABSOLUTE_TIMEOUT, deadline);
+		locker.Lock();
+		if (status == B_TIMED_OUT && !fResumeDone) {
+			fPowerState = kPowerResumeStuck;
+			fPowerCondition.NotifyAll();
+			dprintf("[!] nvidia_rm: the GPUs have not resumed after %" B_PRId64
+				" s; the system goes on without them\n",
+				kResumeTimeout / 1000000);
+			return B_TIMED_OUT;
+		}
+	}
+	return fResumeResult;
+}
+
+
+status_t NvHaikuDriver::ResumeThreadEntry(void *data)
+{
+	static_cast<NvHaikuDriver*>(data)->ResumeDevicesNow();
+	return B_OK;
+}
+
+
+void NvHaikuDriver::ResumeDevicesNow()
+{
+	bigtime_t start = system_time();
+	status_t result = B_OK;
+	for (int32 i = 0; i < fDevices.Count(); i++) {
+		status_t status = fDevices[i]->Resume();
+		if (status != B_OK)
+			result = status;
+	}
+	for (int32 i = 0; i < fDevices.Count(); i++)
+		fDevices[i]->RestoreUserChannels();
+
+	MutexLocker locker(fPowerLock);
+	bool late = fPowerState == kPowerResumeStuck;
+	fPowerState = kPowerRunning;
+	fResumeResult = result;
+	fResumeDone = true;
+	fResumeGeneration++;
+	fResumeCondition.NotifyAll();
+	fPowerCondition.NotifyAll();
+	locker.Unlock();
+
+	dprintf("nvidia_rm: GPUs resumed%s in %" B_PRId64 " ms: %s\n",
+		late ? " late" : "", (system_time() - start) / 1000, strerror(result));
+}
+
+
+status_t NvHaikuDriver::EnterUserCall(uint32 flags)
+{
+	MutexLocker locker(fPowerLock);
+	while (fPowerState == kPowerSuspended) {
+		ConditionVariableEntry entry;
+		fPowerCondition.Add(&entry);
+		locker.Unlock();
+		status_t status = entry.Wait(flags & B_CAN_INTERRUPT);
+		locker.Lock();
+		if (status != B_OK)
+			return status;
+	}
+	if (fPowerState == kPowerResumeStuck)
+		return B_DEV_NOT_READY;
+	fUserCalls++;
+	return B_OK;
+}
+
+
+void NvHaikuDriver::LeaveUserCall()
+{
+	MutexLocker locker(fPowerLock);
+	if (--fUserCalls == 0 && fPowerState != kPowerRunning)
+		fPowerCondition.NotifyAll();
 }
 
 

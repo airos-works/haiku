@@ -63,6 +63,8 @@ protected:
 
 	nv_alloc_mapping_context_t fMmapContext {};
 
+	status_t ControlUngated(uint32 cmd, void *data, size_t len);
+
 public:
 	NvHaikuBaseDeviceHandle(NvHaikuBaseDevice *device);
 	~NvHaikuBaseDeviceHandle();

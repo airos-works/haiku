@@ -95,6 +95,17 @@ int nvidia_module_set_callbacks(const nvidia_modeset_callbacks_t *cb)
 }
 
 
+static status_t nvidia_module_enter_user_call(uint32 flags)
+{
+	return NvHaikuDriver::Instance().EnterUserCall(flags);
+}
+
+static void nvidia_module_leave_user_call()
+{
+	NvHaikuDriver::Instance().LeaveUserCall();
+}
+
+
 static status_t NvidiaModuleOps(int32 op, ...)
 {
 	switch (op) {
@@ -122,6 +133,8 @@ nvidia_module_info gNvidiaModule = {
 	.close_gpu = nvidia_module_close_gpu,
 	.op = nvidia_module_op,
 	.set_callbacks = nvidia_module_set_callbacks,
+	.enter_user_call = nvidia_module_enter_user_call,
+	.leave_user_call = nvidia_module_leave_user_call,
 };
 
 _EXPORT module_info *modules[] = {

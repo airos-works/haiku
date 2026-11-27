@@ -54,4 +54,13 @@ struct nvidia_module_info {
     void (*op)(void *ops_cmd);
 
     int (*set_callbacks)(const nvidia_modeset_callbacks_t *cb);
+
+	/*
+	 * Calls from user land into NVKMS: like those into resman, they wait
+	 * while the system suspends and resumes (B_CAN_INTERRUPT in flags lets
+	 * them be interrupted), and fail while a resume is stuck. Each
+	 * successful enter_user_call() is followed by a leave_user_call().
+	 */
+	status_t (*enter_user_call)(uint32 flags);
+	void (*leave_user_call)(void);
 };

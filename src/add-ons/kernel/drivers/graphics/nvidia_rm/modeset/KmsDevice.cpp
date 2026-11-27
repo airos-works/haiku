@@ -10,6 +10,7 @@
 #include <fs/select_sync_pool.h>
 
 #include "KmsDriver.h"
+#include "rm/nv-haiku-kernel.h"
 
 
 #define CHECK_RET(err) {status_t _err = (err); if (_err < B_OK) return _err;}
@@ -30,10 +31,13 @@ status_t NvHaikuKmsDevice::Open(uint32 flags, DevfsNodeHandle &handle)
 		return B_NO_MEMORY;
 	}
 
+	nvidia_module_info &rm = NvHaikuKmsDriver::Instance().NvidiaModule();
+	CHECK_RET(rm.enter_user_call(B_CAN_INTERRUPT));
 	{
 		MutexLocker lock(&NvHaikuKmsDriver::Instance().Locker());
 		handleImpl->fCookie = nvKmsOpen(team_get_current_team_id(), NVKMS_CLIENT_USER_SPACE, (nvkms_per_open_handle_t*)handleImpl.Get());
 	}
+	rm.leave_user_call();
 	if (handleImpl->fCookie == NULL) {
 		return B_NO_MEMORY;
 	}
@@ -47,8 +51,14 @@ status_t NvHaikuKmsDevice::Open(uint32 flags, DevfsNodeHandle &handle)
 NvHaikuKmsDeviceHandle::~NvHaikuKmsDeviceHandle()
 {
 	if (fCookie != NULL) {
-		MutexLocker lock(&NvHaikuKmsDriver::Instance().Locker());
-		nvKmsClose(fCookie);
+		nvidia_module_info &rm = NvHaikuKmsDriver::Instance().NvidiaModule();
+		status_t gate = rm.enter_user_call(0);
+		{
+			MutexLocker lock(&NvHaikuKmsDriver::Instance().Locker());
+			nvKmsClose(fCookie);
+		}
+		if (gate == B_OK)
+			rm.leave_user_call();
 	}
 }
 
@@ -79,11 +89,17 @@ status_t NvHaikuKmsDeviceHandle::Control(uint32 op, void *data, size_t len)
 
 	uint32 cmd = op - NV_HAIKU_KMS_BASE;
 
+	// Not while the system suspends and resumes: NVKMS has shut its heads
+	// down then, and resman is in standby (Linux: nvkms_ioctl() waits for
+	// the pm lock that nvkms_suspend() takes).
+	nvidia_module_info &rm = NvHaikuKmsDriver::Instance().NvidiaModule();
+	CHECK_RET(rm.enter_user_call(B_CAN_INTERRUPT));
 	NvBool res;
 	{
 		MutexLocker lock(&NvHaikuKmsDriver::Instance().Locker());
 		res = nvKmsIoctl(fCookie, cmd, (addr_t)data, len);
 	}
+	rm.leave_user_call();
 	return res ? B_OK : EINVAL;
 }
 

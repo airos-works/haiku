@@ -40,7 +40,10 @@ typedef struct {
 // NV_HAIKU_WAIT_FOR_RESUME: waits until the resume generation differs from
 // the passed one (or the timeout expires) and returns the current one. Display
 // state is lost when resuming from suspend, so clients restore their modes
-// when the generation changes.
+// when the generation changes. The generation is odd from the start of a
+// system suspend to the end of the resume: the GPU must not be touched then,
+// not even through mappings (a 2D engine's channel), and calls into the driver
+// wait.
 typedef struct {
 	uint32 generation;
 	uint32 reserved;
