@@ -672,10 +672,17 @@ select_fd(int32 fd, struct select_info* info, bool kernel)
 
 	// Add the info to the IO context. Even if nothing has been selected -- we
 	// always support B_EVENT_INVALID.
-	WriteLocker writeLocker(context->lock);
+	// The table is only read-locked: remove_fd() and dup2_fd(), which take
+	// the lists away, write-lock it, and select_infos_lock orders the
+	// selecting threads among themselves. A write lock here, once per
+	// descriptor and call, queued every read(), write() and get_fd() of the
+	// team's other threads behind each poll() (#227).
+	readLocker.Lock();
 	if (context->fds[fd] != descriptor.Get()) {
+		readLocker.Unlock();
+
 		// Someone close()d the index in the meantime. deselect() all
-		// events.
+		// events. The info is on no list, nobody else sees it.
 		info->next = NULL;
 		deselect_select_infos(descriptor.Get(), info, false);
 
@@ -686,12 +693,14 @@ select_fd(int32 fd, struct select_info* info, bool kernel)
 
 	// The FD index hasn't changed, so we add the select info to the table.
 
-	info->next = context->select_infos[fd];
-	context->select_infos[fd] = info;
-
 	// As long as the info is in the list, we keep a reference to the sync
 	// object.
 	acquire_select_sync(info->sync);
+
+	InterruptsSpinLocker listLocker(context->select_infos_lock);
+	info->next = context->select_infos[fd];
+	context->select_infos[fd] = info;
+	listLocker.Unlock();
 
 	// Finally release our open reference. It is safe just to decrement,
 	// since as long as the descriptor is associated with the slot,
@@ -712,7 +721,8 @@ deselect_fd(int32 fd, struct select_info* info, bool kernel)
 		// define before the context locker, so it will be destroyed after it
 
 	io_context* context = get_current_io_context(kernel);
-	WriteLocker locker(context->lock);
+	ReadLocker locker(context->lock);
+		// see select_fd()
 
 	descriptor.SetTo(get_fd_locked(context, fd));
 	if (!descriptor.IsSet())
@@ -720,6 +730,7 @@ deselect_fd(int32 fd, struct select_info* info, bool kernel)
 
 	// remove the info from the IO context
 
+	InterruptsSpinLocker listLocker(context->select_infos_lock);
 	select_info** infoLocation = &context->select_infos[fd];
 	while (*infoLocation != NULL && *infoLocation != info)
 		infoLocation = &(*infoLocation)->next;
@@ -730,6 +741,7 @@ deselect_fd(int32 fd, struct select_info* info, bool kernel)
 
 	*infoLocation = info->next;
 
+	listLocker.Unlock();
 	locker.Unlock();
 
 	// deselect the selected events

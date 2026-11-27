@@ -55,6 +55,9 @@ typedef struct io_context {
 	uint32		num_used_fds;
 	struct file_descriptor **fds;
 	struct select_info **select_infos;
+		// changed with lock write-locked, or read-locked and
+		// select_infos_lock held (select_fd(), deselect_fd())
+	spinlock	select_infos_lock;
 	uint8		*fds_close_on_exec;
 	uint8		*fds_close_on_fork;
 	struct list node_monitors;

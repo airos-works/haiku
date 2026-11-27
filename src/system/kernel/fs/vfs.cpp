@@ -5005,6 +5005,7 @@ vfs_new_io_context(const io_context* parentContext, bool purgeCloseOnExec)
 	memset(context, 0, sizeof(io_context));
 	context->ref_count = 1;
 	rw_lock_init(&context->lock, "I/O context");
+	B_INITIALIZE_SPINLOCK(&context->select_infos_lock);
 
 	WriteLocker contextLocker(context->lock);
 	ReadLocker parentLocker;
