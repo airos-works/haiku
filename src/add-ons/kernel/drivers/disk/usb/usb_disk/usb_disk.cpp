@@ -2007,14 +2007,21 @@ usb_disk_io(void* cookie, io_request* request)
 
 	MutexLocker deviceLocker(lun->device->lock);
 
+	// A request we do not take is finished here, as devfs does it: for one
+	// of the parts of a file's I/O nobody else would, and the whole request
+	// would be waited for for ever (a write to a stick that was pulled).
+	status_t status = B_OK;
 	if (lun->device->removed)
-		return B_DEV_NOT_READY;
-	if (!lun->media_present)
-		return B_DEV_NO_MEDIA;
-
-	if (lun->io_scheduler == NULL) {
+		status = B_DEV_NOT_READY;
+	else if (!lun->media_present)
+		status = B_DEV_NO_MEDIA;
+	else if (lun->io_scheduler == NULL) {
 		// We must be in the middle of a media change.
-		return B_BUSY;
+		status = B_BUSY;
+	}
+	if (status != B_OK) {
+		request->SetStatusAndNotify(status);
+		return status;
 	}
 
 	return lun->io_scheduler->ScheduleRequest(request);
