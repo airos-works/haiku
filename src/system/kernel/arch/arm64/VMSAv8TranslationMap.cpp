@@ -648,8 +648,16 @@ VMSAv8TranslationMap::Map(addr_t va, phys_addr_t pa, uint32 attributes, uint32 m
 
 	ProcessRange(fPageTable, fInitialLevel, va, B_PAGE_SIZE, reservation,
 		[=](uint64_t* ptePtr, uint64_t effectiveVa) {
+			phys_addr_t effectivePa = effectiveVa - va + pa;
+
+			// The instruction caches first, as Linux does it: once the entry
+			// is in place, another thread of the team can run the page.
+			if ((attributes & (B_EXECUTE_AREA | B_KERNEL_EXECUTE_AREA)) != 0) {
+				arch_cpu_sync_icache((void*)(KERNEL_PMAP_BASE + effectivePa),
+					B_PAGE_SIZE);
+			}
+
 			while (true) {
-				phys_addr_t effectivePa = effectiveVa - va + pa;
 				uint64_t oldPte = atomic_get64((int64*)ptePtr);
 				uint64_t newPte = effectivePa | attr | kPteTypeL3Page;
 
@@ -667,8 +675,6 @@ VMSAv8TranslationMap::Map(addr_t va, phys_addr_t pa, uint32 attributes, uint32 m
 				atomic_set64((int64*)ptePtr, newPte);
 				arm64_dsb(ishst); // Ensure PTE write completed
 				arm64_isb();
-				if ((attributes & (B_EXECUTE_AREA | B_KERNEL_EXECUTE_AREA)) != 0)
-					arch_cpu_sync_icache((void*)(KERNEL_PMAP_BASE + effectivePa), B_PAGE_SIZE);
 				break;
 			}
 		});
@@ -891,7 +897,23 @@ VMSAv8TranslationMap::Protect(addr_t start, addr_t end, uint32 attributes, uint3
 	ProcessRange(fPageTable, fInitialLevel, start, size, nullptr,
 		[=](uint64_t* ptePtr, uint64_t effectiveVa) {
 			ASSERT(effectiveVa <= end);
-			phys_addr_t pa = *ptePtr & kPteAddrMask;
+			uint64_t currentPte = atomic_get64((int64_t*)ptePtr);
+			phys_addr_t pa = currentPte & kPteAddrMask;
+
+			// The instruction caches need to be brought in line with the page
+			// when it becomes executable, or when it was writable through this
+			// entry (JIT code made read+execute). A page that stays executable
+			// and was read-only here has nothing new for them (#235): fork()
+			// and mprotect() on such ranges used to clean and invalidate
+			// every page of them again.
+			if ((attributes & (B_EXECUTE_AREA | B_KERNEL_EXECUTE_AREA)) != 0
+				&& (currentPte & kPteValidMask) != 0 && pa != 0
+				&& ((currentPte & (kAttrUXN | kAttrPXN))
+						== (kAttrUXN | kAttrPXN)
+					|| (currentPte & kAttrSWDBM) != 0)) {
+				arch_cpu_sync_icache((void*)(KERNEL_PMAP_BASE + pa),
+					B_PAGE_SIZE);
+			}
 
 			// We need to use an atomic compare-swap loop because we must
 			// need to clear somes bits while setting others.
@@ -930,9 +952,6 @@ VMSAv8TranslationMap::Protect(addr_t start, addr_t end, uint32 attributes, uint3
 					}
 				}
 			}
-
-			if ((attributes & (B_EXECUTE_AREA | B_KERNEL_EXECUTE_AREA)) != 0 && pa != 0)
-				arch_cpu_sync_icache((void*)(KERNEL_PMAP_BASE + pa), B_PAGE_SIZE);
 		});
 
 	return B_OK;
@@ -1214,11 +1233,11 @@ VMSAv8TranslationMap::MapLarge(addr_t va, phys_addr_t pa, uint32 attributes,
 	// It is about to be accessed: start with AF set, so that there is no
 	// access flag fault on CPUs that leave it to software.
 	uint64_t attr = GetMemoryAttr(attributes, memoryType, false) | kAttrAF;
+	if ((attributes & (B_EXECUTE_AREA | B_KERNEL_EXECUTE_AREA)) != 0)
+		arch_cpu_sync_icache((void*)(KERNEL_PMAP_BASE + pa), largeSize);
 	atomic_set64((int64_t*)entry, pa | attr | kPteTypeL12Block);
 	arm64_dsb(ishst);
 	arm64_isb();
-	if ((attributes & (B_EXECUTE_AREA | B_KERNEL_EXECUTE_AREA)) != 0)
-		arch_cpu_sync_icache((void*)(KERNEL_PMAP_BASE + pa), largeSize);
 
 	atomic_add(&fLargePageCount, 1);
 	return B_OK;

@@ -256,6 +256,62 @@ arm64_cpu_capacity(uint64 mpidr, uint64 midr)
 }
 
 
+// The instruction cache maintenance all CPUs allow (#235). CTR_EL0 differs
+// between the cores of a big.LITTLE system: the ROCK 5's and the Cubie's
+// Cortex-A55 have VIPT instruction caches that can hold a line under another
+// index than the one the physical map gives it, their Cortex-A76 PIPT ones.
+// Until every CPU has reported its cache type, the conservative way is used.
+static int32 sCacheTypesReported;
+static int32 sAliasingICacheSeen;
+static int32 sMinDCacheLineShift = 31;
+static int32 sMinICacheLineShift = 31;
+static bool sPIPTInstructionCaches;
+static uint64 sDCacheLineSize;
+static uint64 sICacheLineSize;
+
+
+static void
+atomic_min32(int32* value, int32 candidate)
+{
+	int32 current = atomic_get(value);
+	while (candidate < current) {
+		int32 previous = atomic_test_and_set(value, candidate, current);
+		if (previous == current)
+			break;
+		current = previous;
+	}
+}
+
+
+static void
+arm64_cache_type_add_cpu(uint32 cpuCount)
+{
+	uint64 ctr = READ_SPECIALREG(CTR_EL0);
+
+	// L1Ip: 0b11 PIPT, 0b10 VIPT, 0b01 AIVIVT, 0b00 VPIPT. Only a PIPT cache
+	// is sure to have no aliases (Linux assumes VIPT ones alias as well).
+	if (((ctr >> 14) & 0x3) != 0x3)
+		atomic_or(&sAliasingICacheSeen, 1);
+
+	atomic_min32(&sMinDCacheLineShift, (ctr >> 16) & 0xf);
+	atomic_min32(&sMinICacheLineShift, ctr & 0xf);
+
+	if ((uint32)atomic_add(&sCacheTypesReported, 1) + 1 != cpuCount)
+		return;
+
+	// the last one: line sizes first, then the flag that makes them used
+	sDCacheLineSize = UINT64_C(4) << atomic_get(&sMinDCacheLineShift);
+	sICacheLineSize = UINT64_C(4) << atomic_get(&sMinICacheLineShift);
+	bool pipt = atomic_get(&sAliasingICacheSeen) == 0;
+	__atomic_store_n(&sPIPTInstructionCaches, pipt, __ATOMIC_RELEASE);
+
+	dprintf("arm64: instruction caches of all %" B_PRIu32 " CPUs %s, lines "
+		"%" B_PRIu64 "/%" B_PRIu64 " bytes (data/instruction)\n", cpuCount,
+		pipt ? "PIPT: invalidated by line" : "may alias: invalidated whole",
+		sDCacheLineSize, sICacheLineSize);
+}
+
+
 status_t
 arch_cpu_init_percpu(kernel_args *args, int curr_cpu)
 {
@@ -281,6 +337,8 @@ arch_cpu_init_percpu(kernel_args *args, int curr_cpu)
 	arm64_cpu_hwcaps(caps);
 	atomic_and64(&gARM64HWCaps[0], caps[0]);
 	atomic_and64(&gARM64HWCaps[1], caps[1]);
+
+	arm64_cache_type_add_cpu(args->num_cpus);
 
 	return 0;
 }
@@ -454,25 +512,49 @@ arch_cpu_shutdown(bool reboot)
 void
 arch_cpu_sync_icache(void *address, size_t len)
 {
-	uint64_t ctr_el0 = 0;
-	asm volatile ("mrs\t%0, ctr_el0":"=r" (ctr_el0));
+	if (len == 0)
+		return;
 
-	const uint64_t dcache_line_size = arm64_data_cache_line_size(ctr_el0);
+	// Line sizes valid for every CPU once all have reported; before that,
+	// this CPU's own, together with the invalidation of everything.
+	const bool pipt = __atomic_load_n(&sPIPTInstructionCaches,
+		__ATOMIC_ACQUIRE);
+	uint64_t dcacheLineSize = sDCacheLineSize;
+	uint64_t icacheLineSize = sICacheLineSize;
+	if (!pipt) {
+		uint64_t ctr = READ_SPECIALREG(CTR_EL0);
+		dcacheLineSize = arm64_data_cache_line_size(ctr);
+		icacheLineSize = arm64_instruction_cache_line_size(ctr);
+	}
+
 	uint64_t addr = (uint64_t)address;
 	uint64_t end = addr + len;
 
-	for (uint64_t address_dcache = ROUNDDOWN(addr, dcache_line_size);
-	     address_dcache < end; address_dcache += dcache_line_size) {
+	for (uint64_t address_dcache = ROUNDDOWN(addr, dcacheLineSize);
+	     address_dcache < end; address_dcache += dcacheLineSize) {
 		asm volatile ("dc cvau, %0" : : "r"(address_dcache) : "memory");
 	}
 
 	asm volatile("dsb ish" : : : "memory");
 
-	// Executable mappings are synchronized through the physical map, whose
-	// virtual address can have a different I-cache index from the execution
-	// address. Invalidate every alias in the inner-shareable domain. Another
-	// CPU can have an aliasing VIPT I-cache even when this CPU uses PIPT.
-	asm volatile("ic ialluis" : : : "memory");
+	if (pipt) {
+		// No CPU has an instruction cache that can hold the line under
+		// another address than its physical one: invalidating the lines of
+		// this address (any alias of the memory, the physical map's too) is
+		// enough, in the inner-shareable domain, and leaves the rest of
+		// every CPU's instruction cache alone.
+		for (uint64_t address_icache = ROUNDDOWN(addr, icacheLineSize);
+		     address_icache < end; address_icache += icacheLineSize) {
+			asm volatile ("ic ivau, %0" : : "r"(address_icache) : "memory");
+		}
+	} else {
+		// Executable mappings are synchronized through the physical map,
+		// whose virtual address can have a different I-cache index from the
+		// execution address. Invalidate every alias in the inner-shareable
+		// domain. Another CPU can have an aliasing VIPT I-cache even when
+		// this CPU uses PIPT.
+		asm volatile("ic ialluis" : : : "memory");
+	}
 	asm volatile("dsb ish" : : : "memory");
 	asm volatile("isb" : : : "memory");
 }
