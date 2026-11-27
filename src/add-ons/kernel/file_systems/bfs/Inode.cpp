@@ -1790,8 +1790,15 @@ Inode::WriteAt(Transaction& transaction, off_t pos, const uint8* buffer,
 		rw_lock_read_lock(&fGapLock);
 
 	// the transaction doesn't have to be started already
-	if (changeSize && !transaction.IsStarted())
+	if (changeSize && !transaction.IsStarted()) {
+		// The page writer's requests for this file hold fLock until they are
+		// on the disk. Wait for them before the journal is locked, not with
+		// it: no other transaction on the volume could start meanwhile.
+		rw_lock_write_lock(&fLock);
+		rw_lock_write_unlock(&fLock);
+
 		transaction.Start(fVolume, BlockNumber());
+	}
 
 	WriteLocker writeLocker(fLock);
 
@@ -1815,11 +1822,13 @@ Inode::WriteAt(Transaction& transaction, off_t pos, const uint8* buffer,
 	}
 
 	off_t oldSize = Size();
+	off_t newSize = pos + length;
 	status_t status = B_OK;
+	bool sizeDone = false;
 
 	if ((uint64)pos + (uint64)length > (uint64)oldSize) {
 		// let's grow the data stream to the size needed
-		status = SetFileSize(transaction, pos + length);
+		status = SetFileSize(transaction, newSize);
 		if (status != B_OK) {
 			*_length = 0;
 			writeLocker.Unlock();
@@ -1832,30 +1841,45 @@ Inode::WriteAt(Transaction& transaction, off_t pos, const uint8* buffer,
 			// go into this transaction (we cannot wait until the file
 			// is closed)
 			status = WriteBack(transaction);
-			writeLocker.Unlock();
+
+			if (status == B_OK && ownTransaction && transaction.IsStarted()) {
+				// The new size is all this transaction has to do: the data
+				// is not logged. Ending it here keeps the journal free
+				// while the data is copied, which can wait for the page
+				// writer (the modified page quota) and for its requests on
+				// this file at the end; nothing else on the volume could
+				// create, delete or extend a file meanwhile. fLock stays
+				// with the transaction until then.
+				WriteLockInTransaction(transaction);
+				writeLocker.Unlock();
+				status = transaction.Done();
+				sizeDone = status == B_OK;
+			} else
+				writeLocker.Unlock();
 		}
 	} else
 		writeLocker.Unlock();
 
 	if (status == B_OK) {
-		if (oldSize < pos && gapLockedExclusively) {
-			// Zeroing the gap is as much writing as the gap is long. With
-			// the transaction open, nothing else could create, delete or
-			// extend a file on the volume meanwhile, so it ends here if it
-			// is ours: all it had to do, the new size, is done. (The caller
-			// of bfs_write_stat() has the same problem and the same answer.)
-			if (ownTransaction && transaction.IsStarted()) {
-				WriteLockInTransaction(transaction);
-				status = transaction.Done();
-			}
-			if (status == B_OK)
-				status = FillGapWithZeros(oldSize, pos);
-		}
+		if (oldSize < pos && gapLockedExclusively)
+			status = FillGapWithZeros(oldSize, pos);
 
 		// If we don't want to write anything, we can now return (we may
 		// just have changed the file size using the position parameter)
 		if (status == B_OK && length != 0)
 			status = file_cache_write(FileCache(), pos, buffer, _length);
+	}
+
+	if (sizeDone && (status != B_OK || pos + (off_t)*_length < newSize)) {
+		// The new size is already done, but the data did not get there:
+		// take back what holds none (as the failed transaction would have
+		// done), or reading it would show what the blocks held before.
+		// fGapLock keeps other writers out until here.
+		off_t keepSize = status == B_OK ? pos + *_length : oldSize;
+		Transaction undo(fVolume, BlockNumber());
+		WriteLockInTransaction(undo);
+		if (Size() == newSize && SetFileSize(undo, keepSize) == B_OK)
+			undo.Done();
 	}
 
 	if (gapLockedExclusively)
