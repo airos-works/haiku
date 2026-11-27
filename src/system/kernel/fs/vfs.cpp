@@ -998,10 +998,37 @@ free_vnode(struct vnode* vnode, bool reenter)
 	// will be discarded
 
 	if (!vnode->IsRemoved() && HAS_FS_CALL(vnode, fsync)) {
+		// The file system's io hook takes a reference of its own for each
+		// request (acquire_vnode()), which it may only do while there is
+		// one: give the vnode one for the time. Usually there is nothing
+		// left to write here, but a page whose write failed is tried again,
+		// for example when the device is gone (airos-works/haiku#222).
+		// Nobody else gets a reference: the vnode is busy, and once we have
+		// had sVnodeLock write locked, anyone who looked at it before it
+		// became busy (get_vnode()) is done.
+		rw_lock_write_lock(&sVnodeLock);
+		vnode->ref_count = 1;
+		rw_lock_write_unlock(&sVnodeLock);
+
 		// only the data needs to go back, this is no request to make it
 		// durable (that would cost a journal commit for every unlink, whose
 		// parent directory is freed here)
 		FS_CALL(vnode, fsync, true);
+
+		// An io hook's reference can be put after the request's waiter was
+		// woken: wait for the last one.
+		bigtime_t start = system_time();
+		bool reported = false;
+		while (atomic_test_and_set(&vnode->ref_count, 0, 1) != 1) {
+			if (!reported && system_time() - start > 10 * 1000 * 1000) {
+				dprintf("free_vnode(): vnode %p (%" B_PRIdDEV ":%" B_PRIdINO
+					") still has %" B_PRId32 " references after its "
+					"write-back\n", vnode, vnode->device, vnode->id,
+					atomic_get(&vnode->ref_count) - 1);
+				reported = true;
+			}
+			snooze(1000);
+		}
 	}
 
 	// Note: If this vnode has a cache attached, there will still be two
@@ -7887,10 +7914,17 @@ fs_unmount(char* path, dev_t mountID, uint32 flags, bool kernel)
 			return B_ENTRY_NOT_FOUND;
 	}
 
-	// sync() first, so there's less to write during teardown
+	// sync() first, so there's less to write during teardown. A forced
+	// unmount goes on when that fails: the device may be gone, and then
+	// nothing will ever be written (airos-works/haiku#222).
 	err = fs_sync(path != NULL ? pathVnode->device : mountID);
-	if (err != B_OK)
-		return err;
+	if (err != B_OK) {
+		if ((flags & B_FORCE_UNMOUNT) == 0)
+			return err;
+		dprintf("fs_unmount(): syncing volume %" B_PRIdDEV " failed (%s), "
+			"unmounting it anyway\n", path != NULL ? pathVnode->device
+				: mountID, strerror(err));
+	}
 
 	RecursiveLocker mountOpLocker(sMountOpLock);
 	ReadLocker mountLocker(sMountLock);
@@ -8125,6 +8159,7 @@ fs_sync(dev_t device)
 	marker.SetRemoved(true);
 
 	// First, synchronize all file caches
+	status_t pagesStatus = B_OK;
 
 	while (true) {
 		WriteLocker locker(sVnodeLock);
@@ -8175,8 +8210,13 @@ fs_sync(dev_t device)
 
 		locker.Unlock();
 
-		if (vnode->cache != NULL && !vnode->IsRemoved())
-			vnode->cache->WriteModified();
+		if (vnode->cache != NULL && !vnode->IsRemoved()) {
+			// (a page that cannot be written makes it an error: an unmount
+			// then fails unless it is forced, its vnode would lose it)
+			status_t writeStatus = vnode->cache->WriteModified();
+			if (writeStatus != B_OK && pagesStatus == B_OK)
+				pagesStatus = writeStatus;
+		}
 
 		put_vnode(vnode);
 	}
@@ -8184,6 +8224,8 @@ fs_sync(dev_t device)
 	// Let the file systems do their synchronizing work
 	if (HAS_FS_MOUNT_CALL(mount, sync))
 		status = FS_MOUNT_CALL_NO_PARAMS(mount, sync);
+	if (status == B_OK)
+		status = pagesStatus;
 
 	// Finally, flush the underlying device's write cache (if possible.)
 	if (mount->partition != NULL && mount->partition->Device() != NULL)

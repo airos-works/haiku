@@ -3729,11 +3729,29 @@ block_cache_delete(void* _cache, bool allowWrites)
 
 	// free all blocks
 
+	uint32 unwrittenBlocks = 0;
 	cached_block* block = cache->hash.Clear(true);
 	while (block != NULL) {
 		cached_block* next = block->next;
+		if (allowWrites
+			&& (block->original_data != NULL || block->parent_data != NULL)) {
+			// A transaction's change that the sync above could not write:
+			// the device failed, or is gone and its volume is unmounted by
+			// force (airos-works/haiku#222). There is nowhere to put it.
+			if (block->parent_data != NULL)
+				cache->FreeBlockParentData(block);
+			if (block->original_data != NULL) {
+				cache->Free(block->original_data);
+				block->original_data = NULL;
+			}
+			unwrittenBlocks++;
+		}
 		cache->FreeBlock(block);
 		block = next;
+	}
+	if (unwrittenBlocks > 0) {
+		TRACE_ALWAYS("block_cache_delete(): %" B_PRIu32 " changed blocks "
+			"could not be written and are lost\n", unwrittenBlocks);
 	}
 
 	// free all transactions (they will all be aborted)
