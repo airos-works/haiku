@@ -101,6 +101,9 @@ struct cached_block {
 	bool			discard : 1;
 	bool			busy_reading_waiters : 1;
 	bool			busy_writing_waiters : 1;
+	bool			busy_writing_copy : 1;
+		// The block writer writes a copy of the data: a transaction can
+		// change the block meanwhile.
 	cache_transaction* transaction;
 		// This is the current active transaction, if any, the block is
 		// currently in (meaning was changed as a part of it).
@@ -290,7 +293,8 @@ struct cache_transaction {
 class BlockWriter {
 public:
 								BlockWriter(block_cache* cache,
-									size_t max = SIZE_MAX);
+									size_t max = SIZE_MAX,
+									bool copyData = false);
 								~BlockWriter();
 
 			bool				Add(cached_block* block,
@@ -309,7 +313,8 @@ public:
 
 private:
 			void*				_Data(cached_block* block) const;
-			status_t			_WriteBlocks(cached_block** blocks, uint32 count);
+			void				_CopyData();
+			status_t			_WriteBlocks(uint32 first, uint32 count);
 			void				_BlockDone(cached_block* block,
 									cache_transaction* transaction);
 			void				_UnmarkWriting(cached_block* block);
@@ -327,6 +332,8 @@ private:
 			size_t				fTotal;
 			size_t				fCapacity;
 			size_t				fMax;
+			bool				fCopyData;
+			void**				fCopies;
 			status_t			fStatus;
 			bool				fDeletedTransaction;
 };
@@ -392,6 +399,29 @@ public:
 };
 
 typedef AutoLocker<block_cache, TransactionLocking> TransactionLocker;
+	// For the transaction functions that change or free the data of blocks,
+	// or move blocks between transactions: they wait for all writes.
+
+class BlockLocking {
+public:
+	inline bool Lock(block_cache* cache)
+	{
+		rw_lock_write_lock(&cache->lock);
+		return true;
+	}
+
+	inline void Unlock(block_cache* cache)
+	{
+		rw_lock_write_unlock(&cache->lock);
+	}
+};
+
+typedef AutoLocker<block_cache, BlockLocking> BlockLocker;
+	// For those that only look at a transaction, start one, or only change
+	// blocks of an open transaction, which the block writer never writes.
+	// Waiting for all writes made each of them take as long as the block
+	// writer's whole run on a busy disk, more than a second, while the file
+	// system held its journal (airos-works/haiku#221).
 
 } // namespace
 
@@ -1213,7 +1243,7 @@ cached_block::CanBeWritten() const
 //	#pragma mark - BlockWriter
 
 
-BlockWriter::BlockWriter(block_cache* cache, size_t max)
+BlockWriter::BlockWriter(block_cache* cache, size_t max, bool copyData)
 	:
 	fCache(cache),
 	fBlocks(fBuffer),
@@ -1221,6 +1251,8 @@ BlockWriter::BlockWriter(block_cache* cache, size_t max)
 	fTotal(0),
 	fCapacity(kBufferSize),
 	fMax(max),
+	fCopyData(copyData),
+	fCopies(NULL),
 	fStatus(B_OK),
 	fDeletedTransaction(false)
 {
@@ -1330,9 +1362,15 @@ BlockWriter::Write(cache_transaction* transaction, bool canUnlock)
 	qsort(fBlocks, fCount, sizeof(void*), &_CompareBlocks);
 	fDeletedTransaction = false;
 
+	if (fCopyData && canUnlock) {
+		rw_lock_write_lock(&fCache->lock);
+		_CopyData();
+		rw_lock_write_unlock(&fCache->lock);
+	}
+
 	bigtime_t start = system_time();
 
-	for (uint32 i = 0; i < fCount; i++) {
+	for (uint32 i = 0; i < fCount;) {
 		uint32 blocks = 1;
 		for (; (i + blocks) < fCount && blocks < IOV_MAX; blocks++) {
 			const uint32 j = i + blocks;
@@ -1340,7 +1378,15 @@ BlockWriter::Write(cache_transaction* transaction, bool canUnlock)
 				break;
 		}
 
-		status_t status = _WriteBlocks(fBlocks + i, blocks);
+		status_t status = _WriteBlocks(i, blocks);
+
+		// Each run of blocks is done as soon as it is on the disk: a
+		// transaction that needs one of them waits for that write only, not
+		// for all the others, which on a busy disk can take seconds while
+		// the file system holds its journal (airos-works/haiku#221).
+		if (canUnlock)
+			rw_lock_write_lock(&fCache->lock);
+
 		if (status != B_OK) {
 			// propagate to global error handling
 			if (fStatus == B_OK)
@@ -1348,12 +1394,25 @@ BlockWriter::Write(cache_transaction* transaction, bool canUnlock)
 
 			for (uint32 j = i; j < (i + blocks); j++) {
 				_UnmarkWriting(fBlocks[j]);
-				fBlocks[j] = NULL;
 					// This block will not be marked clean
+			}
+		} else {
+			for (uint32 j = i; j < (i + blocks); j++)
+				_BlockDone(fBlocks[j], transaction);
+		}
+		if (fCopies != NULL) {
+			for (uint32 j = i; j < (i + blocks); j++) {
+				if (fCopies[j] == NULL)
+					continue;
+				fBlocks[j]->busy_writing_copy = false;
+				fCache->Free(fCopies[j]);
 			}
 		}
 
-		i += (blocks - 1);
+		if (canUnlock)
+			rw_lock_write_unlock(&fCache->lock);
+
+		i += blocks;
 	}
 
 	bigtime_t finish = system_time();
@@ -1367,9 +1426,8 @@ BlockWriter::Write(cache_transaction* transaction, bool canUnlock)
 			/ fCount;
 	}
 
-	for (uint32 i = 0; i < fCount; i++)
-		_BlockDone(fBlocks[i], transaction);
-
+	free(fCopies);
+	fCopies = NULL;
 	fCount = 0;
 	return fStatus;
 }
@@ -1400,10 +1458,38 @@ BlockWriter::_Data(cached_block* block) const
 }
 
 
+/*!	Copies what is to be written of each block, so that a transaction can
+	change the block while it is written, instead of waiting until all
+	blocks of this writer are on the disk (airos-works/haiku#221). That is
+	for the block writer's runs, which are short: the writers that a file
+	system waits for do not copy. Without the memory, a block has no copy and
+	is waited for as before.
+	The cache must be locked.
+*/
+void
+BlockWriter::_CopyData()
+{
+	fCopies = (void**)calloc(fCount, sizeof(void*));
+	if (fCopies == NULL)
+		return;
+
+	for (uint32 i = 0; i < fCount; i++) {
+		cached_block* block = fBlocks[i];
+		fCopies[i] = fCache->Allocate();
+		if (fCopies[i] == NULL)
+			continue;
+
+		memcpy(fCopies[i], _Data(block), fCache->block_size);
+		block->busy_writing_copy = true;
+	}
+}
+
+
 status_t
-BlockWriter::_WriteBlocks(cached_block** blocks, uint32 count)
+BlockWriter::_WriteBlocks(uint32 first, uint32 count)
 {
 	const size_t blockSize = fCache->block_size;
+	cached_block** blocks = fBlocks + first;
 
 	BStackOrHeapArray<iovec, 8> vecs(count);
 	for (uint32 i = 0; i < count; i++) {
@@ -1416,7 +1502,8 @@ BlockWriter::_WriteBlocks(cached_block** blocks, uint32 count)
 		TB(Write(fCache, block));
 		TB2(BlockData(fCache, block, "before write"));
 
-		vecs[i].iov_base = _Data(block);
+		vecs[i].iov_base = fCopies != NULL && fCopies[first + i] != NULL
+			? fCopies[first + i] : _Data(block);
 		vecs[i].iov_len = blockSize;
 	}
 
@@ -1449,8 +1536,9 @@ BlockWriter::_BlockDone(cached_block* block,
 	if (fCache->num_dirty_blocks > 0)
 		fCache->num_dirty_blocks--;
 
-	if (_Data(block) == block->current_data)
+	if (_Data(block) == block->current_data && block->transaction == NULL)
 		block->is_dirty = false;
+			// (a block written from a copy may have been changed since)
 
 	_UnmarkWriting(block);
 
@@ -1864,6 +1952,7 @@ block_cache::NewBlock(off_t blockNumber)
 	block->discard = false;
 	block->busy_reading_waiters = false;
 	block->busy_writing_waiters = false;
+	block->busy_writing_copy = false;
 #if BLOCK_CACHE_DEBUG_CHANGED
 	block->compare = NULL;
 #endif
@@ -2340,7 +2429,12 @@ get_writable_cached_block(block_cache* cache, off_t blockNumber,
 	if (status != B_OK)
 		return status;
 
-	if (block->busy_writing)
+	// A block that is written from a copy can join a transaction right
+	// away: the write does not depend on its data, and taking the block out
+	// of its previous transaction waits for all writes. Without one, the
+	// write could finish with changes that are not in a log yet.
+	if (block->busy_writing
+		&& (transactionID == -1 || !block->busy_writing_copy))
 		wait_for_busy_writing_block(cache, block);
 
 	block->discard = false;
@@ -2957,7 +3051,7 @@ block_notifier_and_writer(void* /*data*/)
 				continue;
 			}
 
-			BlockWriter writer(cache, 64);
+			BlockWriter writer(cache, 64, true);
 			bool hasMoreBlocks = false;
 
 			size_t cacheUsedMemory;
@@ -3158,7 +3252,7 @@ int32
 cache_start_transaction(void* _cache)
 {
 	block_cache* cache = (block_cache*)_cache;
-	TransactionLocker locker(cache);
+	BlockLocker locker(cache);
 
 	if (cache->last_transaction && cache->last_transaction->open) {
 		panic("last transaction (%" B_PRId32 ") still open!\n",
@@ -3545,7 +3639,7 @@ status_t
 cache_start_sub_transaction(void* _cache, int32 id)
 {
 	block_cache* cache = (block_cache*)_cache;
-	TransactionLocker locker(cache);
+	BlockLocker locker(cache);
 
 	TRACE("cache_start_sub_transaction(id = %" B_PRId32 ")\n", id);
 
@@ -3610,7 +3704,7 @@ cache_add_transaction_listener(void* _cache, int32 id, int32 events,
 	transaction_notification_hook hook, void* data)
 {
 	block_cache* cache = (block_cache*)_cache;
-	TransactionLocker locker(cache);
+	BlockLocker locker(cache);
 
 	cache_transaction* transaction = lookup_transaction(cache, id);
 	if (transaction == NULL)
@@ -3625,7 +3719,7 @@ cache_remove_transaction_listener(void* _cache, int32 id,
 	transaction_notification_hook hookFunction, void* data)
 {
 	block_cache* cache = (block_cache*)_cache;
-	TransactionLocker locker(cache);
+	BlockLocker locker(cache);
 
 	cache_transaction* transaction = lookup_transaction(cache, id);
 	if (transaction == NULL)
@@ -3657,7 +3751,7 @@ cache_next_block_in_transaction(void* _cache, int32 id, bool mainOnly,
 {
 	cached_block* block = (cached_block*)*_cookie;
 	block_cache* cache = (block_cache*)_cache;
-	TransactionLocker locker(cache);
+	BlockLocker locker(cache);
 
 	cache_transaction* transaction = lookup_transaction(cache, id);
 	if (transaction == NULL || !transaction->open)
@@ -3699,7 +3793,7 @@ int32
 cache_blocks_in_transaction(void* _cache, int32 id)
 {
 	block_cache* cache = (block_cache*)_cache;
-	TransactionLocker locker(cache);
+	BlockLocker locker(cache);
 
 	cache_transaction* transaction = lookup_transaction(cache, id);
 	if (transaction == NULL)
@@ -3717,7 +3811,7 @@ int32
 cache_blocks_in_main_transaction(void* _cache, int32 id)
 {
 	block_cache* cache = (block_cache*)_cache;
-	TransactionLocker locker(cache);
+	BlockLocker locker(cache);
 
 	cache_transaction* transaction = lookup_transaction(cache, id);
 	if (transaction == NULL)
@@ -3734,7 +3828,7 @@ int32
 cache_blocks_in_sub_transaction(void* _cache, int32 id)
 {
 	block_cache* cache = (block_cache*)_cache;
-	TransactionLocker locker(cache);
+	BlockLocker locker(cache);
 
 	cache_transaction* transaction = lookup_transaction(cache, id);
 	if (transaction == NULL)
@@ -3750,7 +3844,7 @@ bool
 cache_has_block_in_transaction(void* _cache, int32 id, off_t blockNumber)
 {
 	block_cache* cache = (block_cache*)_cache;
-	TransactionLocker locker(cache);
+	BlockLocker locker(cache);
 
 	cached_block* block = cache->hash.Lookup(blockNumber);
 
