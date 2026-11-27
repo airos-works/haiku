@@ -110,6 +110,11 @@ __RCSID("$NetBSD: res_send.c,v 1.29 2013/02/16 13:45:45 para Exp $");
 
 #include <isc/eventlib.h>
 
+#ifdef __HAIKU__
+#include <pthread.h>
+#include <time.h>
+#endif
+
 #include "port_after.h"
 
 #if 0
@@ -177,6 +182,89 @@ void res_pquery(const res_state, const u_char *, int, FILE *);
 #ifdef DEBUG
 static const int niflags = NI_NUMERICHOST | NI_NUMERICSERV;
 #endif
+
+#ifdef __HAIKU__
+/*
+ * Name servers that let a query time out recently, for the whole team. Every
+ * query starts again at the first server of resolv.conf, so one that cannot
+ * be reached (its network went away, it is down) cost its full timeout on
+ * every query of every lookup. For a minute such a server is asked only
+ * after the others did not answer, and with a short timeout.
+ */
+#define RES_DEAD_SERVERS	8
+#define RES_DEAD_SECONDS	60
+#define RES_DEAD_TIMEOUT	1
+
+static struct {
+	union res_sockaddr_union	address;
+	time_t				until;
+} sDeadServers[RES_DEAD_SERVERS];
+static pthread_mutex_t sDeadServersLock = PTHREAD_MUTEX_INITIALIZER;
+
+static time_t
+res_dead_now(void)
+{
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return now.tv_sec;
+}
+
+static int
+res_server_dead(const struct sockaddr *address)
+{
+	time_t now = res_dead_now();
+	int dead = 0;
+	int i;
+
+	pthread_mutex_lock(&sDeadServersLock);
+	for (i = 0; i < RES_DEAD_SERVERS && !dead; i++) {
+		if (sDeadServers[i].until > now
+		    && sock_eq((struct sockaddr *)(void *)&sDeadServers[i].address,
+			(struct sockaddr *)(uintptr_t)address))
+			dead = 1;
+	}
+	pthread_mutex_unlock(&sDeadServersLock);
+	return dead;
+}
+
+static void
+res_server_mark(const struct sockaddr *address, int dead)
+{
+	socklen_t length = get_salen(address);
+	time_t now = res_dead_now();
+	int slot = -1;
+	int i;
+
+	if (length == 0 || length > sizeof(sDeadServers[0].address))
+		return;
+
+	pthread_mutex_lock(&sDeadServersLock);
+	for (i = 0; i < RES_DEAD_SERVERS; i++) {
+		if (sock_eq((struct sockaddr *)(void *)&sDeadServers[i].address,
+			(struct sockaddr *)(uintptr_t)address)) {
+			slot = i;
+			break;
+		}
+	}
+	if (dead) {
+		if (slot < 0) {
+			/* a free entry, or else the one that expires first */
+			slot = 0;
+			for (i = 1; i < RES_DEAD_SERVERS; i++) {
+				if (sDeadServers[i].until < sDeadServers[slot].until)
+					slot = i;
+			}
+			memset(&sDeadServers[slot].address, 0,
+			    sizeof(sDeadServers[slot].address));
+			memcpy(&sDeadServers[slot].address, address, length);
+		}
+		sDeadServers[slot].until = now + RES_DEAD_SECONDS;
+	} else if (slot >= 0)
+		sDeadServers[slot].until = 0;
+	pthread_mutex_unlock(&sDeadServersLock);
+}
+#endif	/* __HAIKU__ */
 
 /* Public. */
 
@@ -326,6 +414,9 @@ res_nsend(res_state statp,
 	  const u_char *buf, int buflen, u_char *ans, int anssiz)
 {
 	int gotsomewhere, terrno, tries, v_circuit, resplen, ns, n;
+#ifdef __HAIKU__
+	int live;
+#endif
 #ifdef USE_KQUEUE
 	int kq;
 #endif
@@ -441,6 +532,15 @@ res_nsend(res_state statp,
 		EXT(statp).nstimes[lastns] = nstime;
 	}
 
+#ifdef __HAIKU__
+	/* the servers that are not known to be dead */
+	live = 0;
+	for (ns = 0; ns < statp->nscount; ns++) {
+		if (!res_server_dead(get_nsaddr(statp, (size_t)ns)))
+			live++;
+	}
+#endif
+
 	/*
 	 * Send request, RETRY times, or until successful.
 	 */
@@ -450,6 +550,12 @@ res_nsend(res_state statp,
 		socklen_t nsaplen;
 		nsap = get_nsaddr(statp, (size_t)ns);
 		nsaplen = get_salen(nsap);
+#ifdef __HAIKU__
+		/* a dead server only after the others did not answer */
+		if (tries == 0 && live > 0 && live < statp->nscount
+		    && res_server_dead(nsap))
+			continue;
+#endif
 		statp->_flags &= ~RES_F_LASTMASK;
 		statp->_flags |= (ns << RES_F_LASTSHIFT);
  same_ns:
@@ -866,6 +972,9 @@ send_dg(res_state statp,
 	ISC_SOCKLEN_T fromlen;
 	ssize_t resplen;
 	int seconds, n, s;
+#ifdef __HAIKU__
+	int shortened;
+#endif
 #ifdef USE_KQUEUE
 	struct kevent kv;
 #else
@@ -967,6 +1076,18 @@ send_dg(res_state statp,
 		seconds /= statp->nscount;
 	if (seconds <= 0)
 		seconds = 1;
+#ifdef __HAIKU__
+	/*
+	 * A short wait for a server that did not answer lately. Running out of
+	 * it does not renew the verdict, so a server that is only slow gets the
+	 * whole timeout again once its minute is over.
+	 */
+	shortened = 0;
+	if (seconds > RES_DEAD_TIMEOUT && res_server_dead(nsap)) {
+		seconds = RES_DEAD_TIMEOUT;
+		shortened = 1;
+	}
+#endif
 	now = evNowTime();
 	timeout = evConsTime((time_t)seconds, 0L);
 	finish = evAddTime(now, timeout);
@@ -1001,6 +1122,10 @@ send_dg(res_state statp,
 	if (n == 0) {
 		Dprint(statp->options & RES_DEBUG, (stdout, ";; timeout\n"));
 		*gotsomewhere = 1;
+#ifdef __HAIKU__
+		if (!shortened)
+			res_server_mark(nsap, 1);
+#endif
 		return (0);
 	}
 	if (n < 0) {
@@ -1099,6 +1224,10 @@ send_dg(res_state statp,
 			ans, (int)(resplen > anssiz) ? anssiz : resplen);
 		goto wait;
 	}
+#ifdef __HAIKU__
+	/* it answers */
+	res_server_mark(nsap, 0);
+#endif
 	if (anhp->rcode == SERVFAIL ||
 	    anhp->rcode == NOTIMP ||
 	    anhp->rcode == REFUSED) {

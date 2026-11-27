@@ -239,6 +239,9 @@ static int gai_srvok(const char *);
 static int str2number(const char *);
 static int explore_fqdn(const struct addrinfo *, const char *,
     const char *, struct addrinfo **, struct servent_data *);
+static int explore_copy(const struct addrinfo *, const struct addrinfo *,
+    const char *, struct addrinfo **, struct servent_data *);
+struct addrinfo *allocaddrinfo(socklen_t);
 static int explore_null(const struct addrinfo *,
     const char *, struct addrinfo **, struct servent_data *);
 static int explore_numeric(const struct addrinfo *, const char *,
@@ -275,8 +278,10 @@ static struct addrinfo *getanswer(res_state, const querybuf *, int,
 static void aisort(struct addrinfo *s, res_state res);
 static struct addrinfo * _dns_query(struct res_target *,
     const struct addrinfo *, res_state, int);
+#ifdef AI_SRV
 static struct addrinfo * _dns_srv_lookup(const char *, const char *,
     const struct addrinfo *);
+#endif
 static struct addrinfo * _dns_host_lookup(const char *,
     const struct addrinfo *);
 static int _dns_getaddrinfo(void *, void *, va_list);
@@ -466,6 +471,8 @@ getaddrinfo(const char *hostname, const char *servname,
 	struct servent_data svd;
 	uint64_t mask = (uint64_t)~0ULL;
 	int numeric = 0;
+	struct addrinfo *afai = NULL;
+	int looked_up = 0;
 
 	/* hostname is allowed to be NULL */
 	/* servname is allowed to be NULL */
@@ -630,10 +637,30 @@ getaddrinfo(const char *hostname, const char *servname,
 	if (pai->ai_flags & AI_NUMERICHOST)
 		ERR(EAI_NONAME);
 
+#ifdef __HAIKU__
+	/*
+	 * With AI_ADDRCONFIG, don't ask for the addresses of a family that no
+	 * interface has: they would only be dropped below, and on a network
+	 * without IPv6 the AAAA question costs a round trip per name.
+	 */
+	if ((ai0.ai_flags & AI_ADDRCONFIG) != 0 && ai0.ai_family == PF_UNSPEC) {
+		int has_inet = (mask & ((uint64_t)1 << PF_INET)) != 0;
+		int has_inet6 = (mask & ((uint64_t)1 << PF_INET6)) != 0;
+		if (has_inet && !has_inet6)
+			ai0.ai_family = PF_INET;
+		else if (has_inet6 && !has_inet)
+			ai0.ai_family = PF_INET6;
+	}
+#endif
+
 	/*
 	 * hostname as alphabetical name.
 	 * we would like to prefer AF_INET6 than AF_INET, so we'll make a
 	 * outer loop by AFs.
+	 * The entries differ only in socket type and protocol, so the name is
+	 * looked up once (with the first one that matches) and the result is
+	 * copied for the others, as FreeBSD does: each lookup reads the hosts
+	 * file and asks the name servers again.
 	 */
 	for (ex = explore; ex->e_af >= 0; ex++) {
 		*pai = ai0;
@@ -663,8 +690,19 @@ getaddrinfo(const char *hostname, const char *servname,
 		if (pai->ai_protocol == ANY && ex->e_protocol != ANY)
 			pai->ai_protocol = ex->e_protocol;
 
-		error = explore_fqdn(pai, hostname, servname, &cur->ai_next,
-		    &svd);
+		/* if the servname does not match socktype/protocol, ignore it */
+		if (get_portmatch(pai, servname, &svd) != 0)
+			continue;
+
+		if (!looked_up) {
+			/* without the service: its port depends on the protocol */
+			looked_up = 1;
+			error = explore_fqdn(pai, hostname, NULL, &afai, &svd);
+		}
+		if (afai != NULL) {
+			error = explore_copy(pai, afai, servname,
+			    &cur->ai_next, &svd);
+		}
 
 #ifndef __HAIKU__
 		while (cur && cur->ai_next)
@@ -683,6 +721,11 @@ getaddrinfo(const char *hostname, const char *servname,
 			}
 		}
 #endif
+	}
+
+	if (afai != NULL) {
+		freeaddrinfo(afai);
+		afai = NULL;
 	}
 
 	/* XXX */
@@ -727,6 +770,8 @@ getaddrinfo(const char *hostname, const char *servname,
  free:
  bad:
 	endservent_r(&svd);
+	if (afai != NULL)
+		freeaddrinfo(afai);
 	if (sentinel.ai_next)
 		freeaddrinfo(sentinel.ai_next);
 	*res = NULL;
@@ -1262,6 +1307,64 @@ explore_fqdn(const struct addrinfo *pai, const char *hostname,
 free:
 	if (result)
 		freeaddrinfo(result);
+	return error;
+}
+
+/*
+ * The addresses of a name looked up for another socket type, for the socket
+ * type and protocol of pai, with the port of servname for that protocol.
+ */
+static int
+explore_copy(const struct addrinfo *pai, const struct addrinfo *src0,
+    const char *servname, struct addrinfo **res, struct servent_data *svd)
+{
+	int error;
+	struct addrinfo sentinel, *cur;
+	const struct addrinfo *src;
+
+	_DIAGASSERT(pai != NULL);
+	_DIAGASSERT(src0 != NULL);
+	_DIAGASSERT(res != NULL);
+
+	*res = NULL;
+	sentinel.ai_next = NULL;
+	cur = &sentinel;
+
+	for (src = src0; src != NULL; src = src->ai_next) {
+		if (src->ai_family != pai->ai_family
+		    && pai->ai_family != PF_UNSPEC)
+			continue;
+
+		cur->ai_next = allocaddrinfo(src->ai_addrlen);
+		if (cur->ai_next == NULL) {
+			error = EAI_MEMORY;
+			goto free;
+		}
+		cur = cur->ai_next;
+		cur->ai_flags = pai->ai_flags;
+		cur->ai_family = src->ai_family;
+		cur->ai_socktype = pai->ai_socktype;
+		cur->ai_protocol = pai->ai_protocol;
+		memcpy(cur->ai_addr, src->ai_addr, src->ai_addrlen);
+		if (src->ai_canonname != NULL) {
+			cur->ai_canonname = strdup(src->ai_canonname);
+			if (cur->ai_canonname == NULL) {
+				error = EAI_MEMORY;
+				goto free;
+			}
+		}
+
+		/* the port of the service for this protocol */
+		*getport(cur) = 0;
+		GET_PORT(cur, servname, svd);
+	}
+
+	*res = sentinel.ai_next;
+	return 0;
+
+free:
+	if (sentinel.ai_next != NULL)
+		freeaddrinfo(sentinel.ai_next);
 	return error;
 }
 
@@ -2152,6 +2255,7 @@ out:
 	return NULL;
 }
 
+#ifdef AI_SRV
 /*ARGSUSED*/
 static struct addrinfo *
 _dns_srv_lookup(const char *name, const char *servname,
@@ -2227,6 +2331,7 @@ _dns_srv_lookup(const char *name, const char *servname,
 
 	return sentinel.ai_next;
 }
+#endif
 
 /*ARGSUSED*/
 static struct addrinfo *
@@ -2459,13 +2564,15 @@ _dns_getaddrinfo(void *rv, void *cb_data, va_list ap)
 		pai = &ai0;
 	}
 
+#ifdef AI_SRV
 	/*
 	 * Try doing SRV lookup on service first.
+	 * Only when asked for: Haiku has no AI_SRV flag, and without one this
+	 * asked every name server for _<service>._tcp.<name> before the
+	 * address of every name looked up with a service name ("https").
 	 */
 	if (servname
-#ifdef AI_SRV
 	    && (pai->ai_flags & AI_SRV)
-#endif
 	    && !(pai->ai_flags & AI_NUMERICSERV)
 	    && str2number(servname) == -1) {
 
@@ -2474,6 +2581,9 @@ _dns_getaddrinfo(void *rv, void *cb_data, va_list ap)
 #endif
 		ai = _dns_srv_lookup(name, servname, pai);
 	}
+#else
+	(void)servname;
+#endif
 
 	/*
 	 * Do lookup on name.
@@ -2839,6 +2949,7 @@ res_queryN(const char *name, /* domain name */ struct res_target *target,
 	int rcode;
 	u_char *rdata;
 	int ancount;
+	int targets = 0, unanswered = 0;
 
 	_DIAGASSERT(name != NULL);
 	/* XXX: target may be NULL??? */
@@ -2902,15 +3013,18 @@ again:
 				goto again;
 			}
 #endif
-#if 0
+			/*
+			 * No name server answered (or none could be reached).
+			 * The next target is still asked: some servers drop
+			 * AAAA questions and answer A ones.
+			 */
 #ifdef DEBUG
 			if (statp->options & RES_DEBUG)
 				printf(";; res_query: send error\n");
 #endif
-			h_errno = TRY_AGAIN;
-			return n;
-#endif
+			unanswered++;
 		}
+		targets++;
 
 		if (n < 0 || hp->rcode != NOERROR || ntohs(hp->ancount) == 0) {
 			rcode = hp->rcode;	/* record most recent error */
@@ -2931,6 +3045,15 @@ again:
 	}
 
 	if (ancount == 0) {
+		if (unanswered == targets) {
+			/*
+			 * A temporary failure, not "no such name": the callers
+			 * do not walk the search list for TRY_AGAIN, every
+			 * name of which would wait for the same servers.
+			 */
+			h_errno = TRY_AGAIN;
+			return -1;
+		}
 		switch (rcode) {
 		case NXDOMAIN:
 			h_errno = HOST_NOT_FOUND;
@@ -2968,6 +3091,7 @@ res_searchN(const char *name, struct res_target *target, res_state res)
 	char buf[MAXHOSTNAMELEN];
 	int trailing_dot, ret, saved_herrno;
 	int got_nodata = 0, got_servfail = 0, tried_as_is = 0;
+	int root_on_list = 0;
 
 	_DIAGASSERT(name != NULL);
 	_DIAGASSERT(target != NULL);
@@ -3000,6 +3124,16 @@ res_searchN(const char *name, struct res_target *target, res_state res)
 		ret = res_querydomainN(name, NULL, target, res);
 		if (ret > 0)
 			return ret;
+		/*
+		 * As BIND's res_nsearch(): only a negative answer is worth
+		 * the search list. When no server answered, every name of
+		 * the list would wait for the same servers again.
+		 */
+		if (errno == ECONNREFUSED || (h_errno == TRY_AGAIN
+		    && hp->rcode != SERVFAIL)) {
+			h_errno = TRY_AGAIN;
+			return -1;
+		}
 		saved_herrno = h_errno;
 		tried_as_is++;
 	}
@@ -3017,6 +3151,17 @@ res_searchN(const char *name, struct res_target *target, res_state res)
 		for (domain = (const char * const *)res->dnsrch;
 		   *domain && !done;
 		   domain++) {
+			/*
+			 * The root domain (res_init() puts an empty one on
+			 * the list when neither resolv.conf nor the host name
+			 * gives a domain) asks for the name as is again.
+			 */
+			if (domain[0][0] == '\0'
+			    || (domain[0][0] == '.' && domain[0][1] == '\0')) {
+				root_on_list++;
+				if (tried_as_is)
+					continue;
+			}
 
 			ret = res_querydomainN(name, *domain, target, res);
 			if (ret > 0)
@@ -3053,7 +3198,8 @@ res_searchN(const char *name, struct res_target *target, res_state res)
 					got_servfail++;
 					break;
 				}
-				/* FALLTHROUGH */
+				/* no server answered: neither would they now */
+				return -1;
 			default:
 				/* anything else implies that we're done */
 				done++;
@@ -3072,7 +3218,7 @@ res_searchN(const char *name, struct res_target *target, res_state res)
 	 * note that we do this regardless of how many dots were in the
 	 * name or whether it ends with a dot.
 	 */
-	if (!tried_as_is) {
+	if (!tried_as_is && !root_on_list) {
 		ret = res_querydomainN(name, NULL, target, res);
 		if (ret > 0)
 			return ret;
