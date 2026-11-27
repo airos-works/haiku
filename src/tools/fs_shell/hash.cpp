@@ -154,32 +154,33 @@ void
 hash_remove_current(struct hash_table *table, struct hash_iterator *iterator)
 {
 	uint32_t index = iterator->bucket;
-	void *element;
+	void *lastElement = NULL;
 
 	if (iterator->current == NULL)
 		fssh_panic("hash_remove_current() called too early.");
 
-	for (element = table->table[index]; index < table->table_size; index++) {
-		void *lastElement = NULL;
+	// The current element is always in the iterator's bucket. The element
+	// before it has to be remembered: unlinking it from the bucket's head
+	// instead dropped every entry before it from the table.
+	for (void *element = table->table[index]; element != NULL;
+			lastElement = element, element = NEXT(table, element)) {
+		if (element != iterator->current)
+			continue;
 
-		while (element != NULL) {
-			if (element == iterator->current) {
-				iterator->current = lastElement;
-
-				if (lastElement != NULL) {
-					// connect the previous entry with the next one
-					PUT_IN_NEXT(table, lastElement, NEXT(table, element));
-				} else {
-					table->table[index] = (struct hash_element *)NEXT(table,
-						element);
-				}
-
-				table->num_elements--;
-				return;
-			}
-
-			element = NEXT(table, element);
+		if (lastElement != NULL) {
+			// connect the previous entry with the next one
+			PUT_IN_NEXT(table, lastElement, NEXT(table, element));
+			iterator->current = lastElement;
+		} else {
+			table->table[index] = (struct hash_element *)NEXT(table,
+				element);
+			// let hash_next() start over with this bucket's new head
+			iterator->current = NULL;
+			iterator->bucket--;
 		}
+
+		table->num_elements--;
+		return;
 	}
 }
 
