@@ -657,6 +657,10 @@ dump_mapping_info(int argc, char** argv)
 		phys_addr_t physicalAddress;
 		if (pageLookup) {
 			vm_page* page = (vm_page*)(addr_t)addressValue;
+			if (vm_page_is_dummy(page)) {
+				kprintf("%p is not in the page array\n", page);
+				return 0;
+			}
 			physicalAddress = page->PhysicalPageNumber() * B_PAGE_SIZE;
 		} else {
 			physicalAddress = (phys_addr_t)addressValue;

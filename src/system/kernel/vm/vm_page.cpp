@@ -167,6 +167,7 @@ update_cache_churn()
 
 static vm_page *sPages;
 static page_num_t sPhysicalPageOffset;
+vm_page* gPageArrayOrigin;
 static page_num_t sNumPages;
 static page_num_t sNonExistingPages;
 	// pages in the sPages array that aren't backed by physical memory
@@ -963,7 +964,11 @@ dump_page_long(int argc, char **argv)
 
 	kprintf("queue_next,prev: %p, %p\n", page->queue_link.next,
 		page->queue_link.previous);
-	kprintf("physical_number: %#" B_PRIxPHYSADDR "\n", page->PhysicalPageNumber());
+	if (!vm_page_is_dummy(page)) {
+		kprintf("physical_number: %#" B_PRIxPHYSADDR "\n",
+			page->PhysicalPageNumber());
+	} else
+		kprintf("physical_number: - (not in the page array)\n");
 	kprintf("cache:           %p\n", page->Cache());
 	kprintf("cache_offset:    %" B_PRIuPHYSADDR "\n", page->cache_offset);
 	kprintf("cache_next:      %p\n", page->cache_next);
@@ -994,7 +999,7 @@ dump_page_long(int argc, char **argv)
 		mapping = mapping->page_link.next;
 	}
 
-	if (searchMappings) {
+	if (searchMappings && !vm_page_is_dummy(page)) {
 		struct Callback : VMTranslationMap::ReverseMappingInfoCallback {
 			VMAddressSpace*	fAddressSpace;
 
@@ -2153,7 +2158,7 @@ free_cached_page(vm_page *page, bool dontWait)
 static uint32
 free_cached_pages(uint32 pagesToFree, bool dontWait)
 {
-	vm_page marker(-1);
+	vm_page marker;
 	init_page_marker(marker);
 	forbid_page_faults();
 
@@ -2324,7 +2329,7 @@ full_scan_inactive_pages(page_stats& pageStats, int32 despairLevel)
 	// scale only when things get desperate.
 	uint32 maxToFlush = despairLevel <= 1 ? 32 : 10000;
 
-	vm_page marker(-1);
+	vm_page marker;
 	init_page_marker(marker);
 
 	VMPageQueue& queue = sInactivePageQueue;
@@ -2454,7 +2459,7 @@ full_scan_inactive_pages(page_stats& pageStats, int32 despairLevel)
 static void
 full_scan_active_pages(page_stats& pageStats, int32 despairLevel)
 {
-	vm_page marker(-1);
+	vm_page marker;
 	init_page_marker(marker);
 
 	VMPageQueue& queue = sActivePageQueue;
@@ -2780,6 +2785,9 @@ vm_page_init(kernel_args *args)
 	// map in the new free page table
 	sPages = (vm_page *)vm_allocate_early(args, sNumPages * sizeof(vm_page),
 		~0L, B_KERNEL_READ_AREA | B_KERNEL_WRITE_AREA, 0);
+	// a page's number is its distance from here (vm_page::PhysicalPageNumber())
+	gPageArrayOrigin = (vm_page*)((addr_t)sPages
+		- (addr_t)sPhysicalPageOffset * sizeof(vm_page));
 
 	TRACE(("vm_init: putting free_page_table @ %p, # ents %" B_PRIuPHYSADDR
 		" (size %#" B_PRIxPHYSADDR ")\n", sPages, sNumPages,
@@ -2787,7 +2795,7 @@ vm_page_init(kernel_args *args)
 
 	// initialize the free page table
 	for (uint32 i = 0; i < sNumPages; i++) {
-		new(&sPages[i]) vm_page(sPhysicalPageOffset + i);
+		new(&sPages[i]) vm_page;
 		sFreePageQueue.Append(&sPages[i]);
 
 #if VM_PAGE_ALLOCATION_TRACKING_AVAILABLE

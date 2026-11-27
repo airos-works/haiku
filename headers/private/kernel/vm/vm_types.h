@@ -113,10 +113,9 @@ struct VMCacheRef {
 
 
 struct vm_page {
-private:
-	const page_num_t		physical_page_number;
+	// The physical page number is not stored: it is the page's place in the
+	// page array (PhysicalPageNumber()).
 
-public:
 	DoublyLinkedListLink<vm_page> queue_link;
 
 private:
@@ -155,10 +154,9 @@ public:
 
 	uint8					usage_count;
 
-	inline vm_page(page_num_t pageNumber);
+	inline vm_page();
 
-	page_num_t PhysicalPageNumber() const
-		{ return physical_page_number; }
+	inline page_num_t PhysicalPageNumber() const;
 
 	VMCacheRef* CacheRef() const			{ return cache_ref; }
 	void SetCacheRef(VMCacheRef* cacheRef)	{ this->cache_ref = cacheRef; }
@@ -206,10 +204,28 @@ enum {
 	// page runs: fail instead of waiting for pages; free pages only
 
 
+extern "C" bool vm_page_is_dummy(struct vm_page *page);
+
+extern vm_page* gPageArrayOrigin;
+	// Where the page array would start if it began at physical page 0, so
+	// that a page's number is its distance from here. Set up by
+	// vm_page_init(); never dereferenced.
+
+
+/*!	Only for pages in the page array: the markers that are not (see
+	vm_page_is_dummy()) have no physical page.
+*/
+inline page_num_t
+vm_page::PhysicalPageNumber() const
+{
+	ASSERT_PRINT(!vm_page_is_dummy(const_cast<vm_page*>(this)),
+		"page %p is not in the page array", this);
+	return this - gPageArrayOrigin;
+}
+
+
 inline
-vm_page::vm_page(page_num_t pageNumber)
-	:
-	physical_page_number(pageNumber)
+vm_page::vm_page()
 {
 	new(&mappings) vm_page_mappings();
 	SetCacheRef(NULL);
@@ -234,6 +250,16 @@ vm_page::vm_page(page_num_t pageNumber)
 #if DEBUG_PAGE_ACCESS && __GNUC__ != 2
 #	include <thread.h>
 
+/*!	For the messages below: markers take part in the access checks, too, but
+	have no physical page. */
+static inline phys_addr_t
+vm_page_debug_physical_address(vm_page* page)
+{
+	if (vm_page_is_dummy(page))
+		return 0;
+	return (phys_addr_t)page->PhysicalPageNumber() * B_PAGE_SIZE;
+}
+
 static inline void
 vm_page_debug_access_start(vm_page* page)
 {
@@ -243,7 +269,7 @@ vm_page_debug_access_start(vm_page* page)
 	if (previousThread != -1) {
 		panic("Invalid concurrent access to page 0x%" B_PRIXPHYSADDR " (start), currently "
 			"accessed by: %" B_PRId32 "@! page -m %p; sc %" B_PRId32 "; cache _cache",
-			page->PhysicalPageNumber() * B_PAGE_SIZE, previousThread, page, previousThread);
+			vm_page_debug_physical_address(page), previousThread, page, previousThread);
 	}
 }
 
@@ -257,7 +283,7 @@ vm_page_debug_access_end(vm_page* page)
 	if (previousThread != threadID) {
 		panic("Invalid concurrent access to page 0x%" B_PRIXPHYSADDR " (end) by "
 			"current thread, current accessor is: %" B_PRId32 "@! page -m %p; "
-			"sc %" B_PRId32 "; cache _cache", page->PhysicalPageNumber() * B_PAGE_SIZE,
+			"sc %" B_PRId32 "; cache _cache", vm_page_debug_physical_address(page),
 			previousThread, page, previousThread);
 	}
 }
@@ -270,7 +296,7 @@ vm_page_debug_access_check(vm_page* page)
 	if (thread != thread_get_current_thread_id()) {
 		panic("Invalid concurrent access to page 0x%" B_PRIXPHYSADDR " (check), currently "
 			"accessed by: %" B_PRId32 "@! page -m %p; sc %" B_PRId32 "; cache _cache",
-			page->PhysicalPageNumber() * B_PAGE_SIZE, thread, page, thread);
+			vm_page_debug_physical_address(page), thread, page, thread);
 	}
 }
 
