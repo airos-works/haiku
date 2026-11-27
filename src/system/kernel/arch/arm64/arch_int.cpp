@@ -339,7 +339,12 @@ do_sync_handler(iframe * frame)
 		case EXCP_DATA_ABORT_L:
 		case EXCP_DATA_ABORT:
 		{
-			bool write = (frame->esr & ISS_DATA_WnR) != 0;
+			// A cache maintenance instruction (DC CVAU of clear_caches()) is
+			// reported as a write (CM set), but it needs only read access:
+			// treated as a write it could not fault in a page of a
+			// read+execute area (#238).
+			bool write = !isExec && (frame->esr & ISS_DATA_WnR) != 0
+				&& (frame->esr & ISS_DATA_CM) == 0;
 			bool known = false;
 
 			int initialLevel = VMSAv8TranslationMap::CalcStartLevel(48, 12);

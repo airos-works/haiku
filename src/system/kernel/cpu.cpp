@@ -13,8 +13,11 @@
 #include <cpu.h>
 #include <arch/cpu.h>
 #include <arch/system_info.h>
+#include <arch/user_memory.h>
 
 #include <string.h>
+
+#include <algorithm>
 
 #include <cpufreq.h>
 #include <cpuidle.h>
@@ -364,7 +367,31 @@ cpu_wait(int32* variable, int32 test)
 void
 _user_clear_caches(void *address, size_t length, uint32 flags)
 {
-	clear_caches(address, length, flags);
+	// The cache maintenance instructions run in the kernel on the program's
+	// addresses (#238): only on a range of user space, and under a fault
+	// handler, so that a page that cannot be faulted in ends the operation
+	// instead of the kernel ("unhandled page fault in kernel space").
+	if (length == 0 || !is_user_address_range(address, length))
+		return;
+
+	// Pieces, so that a thread asked to die does not stay in here for all of
+	// a huge range.
+	const size_t kChunkSize = 16 * 1024 * 1024;
+	Thread* thread = thread_get_current_thread();
+	addr_t start = (addr_t)address;
+	while (length > 0) {
+		size_t chunk = std::min(length, kChunkSize - start % kChunkSize);
+#ifdef __i386__
+		clear_caches((void*)start, chunk, flags);
+#else
+		if (!user_access([=] { clear_caches((void*)start, chunk, flags); }))
+			return;
+#endif
+		start += chunk;
+		length -= chunk;
+		if (length > 0 && thread_is_interrupted(thread, B_KILL_CAN_INTERRUPT))
+			return;
+	}
 }
 
 
