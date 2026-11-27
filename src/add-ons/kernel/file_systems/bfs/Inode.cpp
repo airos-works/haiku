@@ -2326,6 +2326,12 @@ Inode::_GrowStream(Transaction& transaction, off_t size)
 			// a new one
 			if (run.length == 0)
 				continue;
+
+			// Add what is left of the run: blocksNeeded already counts it
+			// as added, and nothing else would know about its blocks.
+			status = _AddBlockRun(transaction, data, run, size, NULL);
+			if (status != B_OK)
+				return status;
 		}
 	}
 	// update the size of the data stream
@@ -2396,6 +2402,11 @@ Inode::_FreeStaticStreamArray(Transaction& transaction, int32 level,
 			if (level == 0) {
 				status = _FreeStaticStreamArray(transaction, 1, array[index],
 					size, offset, max);
+				if (status == B_OK && offset >= size) {
+					// nothing of this array is used anymore: free its blocks
+					// as well, not only the runs it pointed to
+					status = fVolume->Free(transaction, array[index]);
+				}
 			} else if (offset >= size)
 				status = fVolume->Free(transaction, array[index]);
 			else
@@ -2404,8 +2415,15 @@ Inode::_FreeStaticStreamArray(Transaction& transaction, int32 level,
 			if (status < B_OK)
 				RETURN_ERROR(status);
 
-			if (offset >= size)
+			if (offset >= size) {
 				array[index].SetTo(0, 0, 0);
+
+				// The stream now ends before this run. When the new size
+				// is on a run boundary, no run is kept to set "max" above,
+				// and the stream claimed the freed runs as preallocated.
+				if ((off_t)BFS_ENDIAN_TO_HOST_INT64(max) > offset)
+					max = HOST_ENDIAN_TO_BFS_INT64(offset);
+			}
 
 			offset += indirectSize;
 		}
@@ -2596,11 +2614,23 @@ Inode::NeedsTrimming() const
 		|| (IsSymLink() && (Flags() & INODE_LONG_SYMLINK) == 0))
 		return false;
 
+	const data_stream& data = Node().data;
 	off_t roundedSize = round_up(Size(), fVolume->BlockSize());
 
-	return Node().data.MaxDirectRange() > roundedSize
-		|| Node().data.MaxIndirectRange() > roundedSize
-		|| Node().data.MaxDoubleIndirectRange() > roundedSize;
+	if (data.MaxDoubleIndirectRange() > 0
+		&& Size() > data.MaxIndirectRange()) {
+		// Runs in the double indirect range are not cut: the end of the
+		// stream can be up to one run past the size without anything to
+		// trim (or every close of the file would trim nothing).
+		off_t runSize = (off_t)data.double_indirect.Length()
+			<< fVolume->BlockShift();
+		roundedSize = data.MaxIndirectRange()
+			+ round_up(Size() - data.MaxIndirectRange(), runSize);
+	}
+
+	return data.MaxDirectRange() > roundedSize
+		|| data.MaxIndirectRange() > roundedSize
+		|| data.MaxDoubleIndirectRange() > roundedSize;
 }
 
 
