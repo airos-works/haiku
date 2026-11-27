@@ -48,12 +48,140 @@ assembly_rx(bt_usb_dev* bdev, bt_packet_t type, void* data, int count)
 #pragma mark --- RX Complete ---
 #endif
 
+// Receive transfers that may fail in a row before the endpoint is given up.
+// Errors come singly (a CRC error on a noisy bus, a stall the device clears
+// at once); a device that fails every transfer has gone wrong for good, and
+// retrying it for ever would keep the host controller busy for nothing.
+static const int32 kMaxReceiveErrors = 16;
+
+
+struct halt_request {
+	bt_usb_dev*	bdev;
+	void*		buffer;
+	bool		events;
+};
+
+
+static status_t
+queue_receive(bt_usb_dev* bdev, bool events, void* buffer)
+{
+	if (events) {
+		return usb->queue_interrupt(bdev->intr_in_ep->handle, buffer,
+			max_c(HCI_MAX_EVENT_SIZE, bdev->max_packet_size_intr_in),
+			event_complete, bdev);
+	}
+
+	return usb->queue_bulk(bdev->bulk_in_ep->handle, buffer,
+		max_c(HCI_MAX_FRAME_SIZE, bdev->max_packet_size_bulk_in),
+		acl_rx_complete, bdev);
+}
+
+
+static void
+resubmit_receive(bt_usb_dev* bdev, bool events, void* buffer)
+{
+	status_t error = queue_receive(bdev, events, buffer);
+	if (error != B_OK) {
+		reuse_room(events ? &bdev->eventRoom : &bdev->aclRoom, buffer);
+		bdev->stat.rejectedRX++;
+		ERROR("%s: RX %s resubmittion failed %s\n", __func__,
+			events ? "event" : "acl", strerror(error));
+	} else {
+		bdev->stat.acceptedRX++;
+	}
+}
+
+
+static void
+halt_cleared(void* cookie, status_t status, void* data, size_t actualLength)
+{
+	halt_request* request = (halt_request*)cookie;
+	bt_usb_dev* bdev = request->bdev;
+	void* buffer = request->buffer;
+	bool events = request->events;
+	free(request);
+
+	if (status == B_CANCELED) {
+		// The device is going away: it may be gone already. Nothing will
+		// use the buffer again.
+		free(buffer);
+		return;
+	}
+
+	if (status != B_OK) {
+		ERROR("%s: the %s endpoint could not be cleared: %s\n", __func__,
+			events ? "event" : "ACL", strerror(status));
+	}
+
+	if ((bdev->state & RUNNING) == 0) {
+		reuse_room(events ? &bdev->eventRoom : &bdev->aclRoom, buffer);
+		return;
+	}
+
+	// Even when clearing it failed: the next failure counts too, and the
+	// count gives up on the endpoint in the end.
+	resubmit_receive(bdev, events, buffer);
+}
+
+
+/*!	A receive transfer failed. Returns whether to queue it again now; when
+	not, the buffer is taken care of: it waits for the endpoint's halt to
+	be cleared, or the endpoint is given up.
+*/
+static bool
+receive_failed(bt_usb_dev* bdev, bool events, void* buffer, status_t status)
+{
+	int32& errors = events ? bdev->eventErrors : bdev->aclErrors;
+	const usb_endpoint_info* endpoint
+		= events ? bdev->intr_in_ep : bdev->bulk_in_ep;
+
+	bdev->stat.errorRX++;
+
+	if (++errors > kMaxReceiveErrors) {
+		// TODO: tell the bluetooth_server, so that it can reset the radio
+		// (it does nothing about a Hardware Error event yet).
+		ERROR("%s: %" B_PRId32 " %s transfers failed in a row (the last: "
+			"%s), no longer receiving\n", __func__, errors - 1,
+			events ? "event" : "ACL", strerror(status));
+		reuse_room(events ? &bdev->eventRoom : &bdev->aclRoom, buffer);
+		return false;
+	}
+
+	if (status != B_DEV_STALLED)
+		return true;
+
+	// The device halted the endpoint, and it stays halted in the device
+	// until the host clears that: receiving again at once would only stall
+	// again (the host controller resets its own side of the endpoint on
+	// every stall). Clear it, and receive again once that is done. This
+	// runs on the host controller's completion thread, which must not wait.
+	halt_request* request = (halt_request*)malloc(sizeof(halt_request));
+	if (request == NULL)
+		return true;
+	request->bdev = bdev;
+	request->buffer = buffer;
+	request->events = events;
+
+	status_t error = usb->queue_request(bdev->dev,
+		USB_REQTYPE_STANDARD | USB_REQTYPE_ENDPOINT_OUT,
+		USB_REQUEST_CLEAR_FEATURE, USB_FEATURE_ENDPOINT_HALT,
+		endpoint->descr->endpoint_address, 0, NULL, halt_cleared, request);
+	if (error != B_OK) {
+		ERROR("%s: clearing the %s endpoint's halt failed: %s\n", __func__,
+			events ? "event" : "ACL", strerror(error));
+		free(request);
+		return true;
+	}
+
+	return false;
+}
+
+
 void
 event_complete(void* cookie, status_t status, void* data, size_t actual_len)
 {
 	bt_usb_dev* bdev = (bt_usb_dev*)cookie;
 	// bt_usb_dev* bdev = fetch_device(cookie, 0); -> safer / slower option
-	status_t error;
 
 	TRACE("%s: cookie@%p status=%s len=%" B_PRIuSIZE "\n", __func__, cookie,
 		strerror(status), actual_len);
@@ -61,41 +189,28 @@ event_complete(void* cookie, status_t status, void* data, size_t actual_len)
 	if (bdev == NULL)
 		return;
 
-	if (status == B_CANCELED || status == B_DEV_CRC_ERROR
-		|| (bdev->state & RUNNING) == 0)
+	if (status == B_CANCELED || (bdev->state & RUNNING) == 0)
 		return; // or not running anymore...
 
-	if (status == B_DEV_STALLED) {
-		// The endpoint is halted in the device, and nothing here clears
-		// that. Resubmitting would only stall again, at once: the
-		// controller resets its side of the endpoint on each stall.
-		ERROR("%s: endpoint stalled, no longer receiving\n", __func__);
-		return;
-	}
-
-	if (status != B_OK || actual_len == 0)
-		goto resubmit;
-
-	if (assembly_rx(bdev, BT_EVENT, data, actual_len) == B_OK) {
-		bdev->stat.successfulTX++;
+	// A failed transfer is queued again too: the driver keeps exactly one
+	// queued, so one that is not means no events (Command Complete,
+	// connections) until the radio is opened again.
+	if (status != B_OK) {
+		if (!receive_failed(bdev, true, data, status))
+			return;
 	} else {
-		bdev->stat.errorRX++;
+		bdev->eventErrors = 0;
+
+		if (actual_len > 0) {
+			if (assembly_rx(bdev, BT_EVENT, data, actual_len) == B_OK) {
+				bdev->stat.successfulTX++;
+			} else {
+				bdev->stat.errorRX++;
+			}
+		}
 	}
 
-resubmit:
-
-	error = usb->queue_interrupt(bdev->intr_in_ep->handle, data,
-		max_c(HCI_MAX_EVENT_SIZE, bdev->max_packet_size_intr_in),
-		event_complete, bdev);
-
-	if (error != B_OK) {
-		reuse_room(&bdev->eventRoom, data);
-		bdev->stat.rejectedRX++;
-		ERROR("%s: RX event resubmittion failed %s\n", __func__,
-			strerror(error));
-	} else {
-		bdev->stat.acceptedRX++;
-	}
+	resubmit_receive(bdev, true, data);
 }
 
 
@@ -104,45 +219,29 @@ acl_rx_complete(void* cookie, status_t status, void* data, size_t actual_len)
 {
 	bt_usb_dev* bdev = (bt_usb_dev*)cookie;
 	// bt_usb_dev* bdev = fetch_device(cookie, 0); -> safer / slower option
-	status_t error;
 
 	if (bdev == NULL)
 		return;
 
-	if (status == B_CANCELED || status == B_DEV_CRC_ERROR
-		|| (bdev->state & RUNNING) == 0)
+	if (status == B_CANCELED || (bdev->state & RUNNING) == 0)
 		return; // or not running anymore...
 
-	if (status == B_DEV_STALLED) {
-		// The endpoint is halted in the device, and nothing here clears
-		// that. Resubmitting would only stall again, at once: the
-		// controller resets its side of the endpoint on each stall.
-		ERROR("%s: endpoint stalled, no longer receiving\n", __func__);
-		return;
-	}
-
-	if (status != B_OK || actual_len == 0)
-		goto resubmit;
-
-	if (assembly_rx(bdev, BT_ACL, data, actual_len) == B_OK) {
-		bdev->stat.successfulRX++;
+	if (status != B_OK) {
+		if (!receive_failed(bdev, false, data, status))
+			return;
 	} else {
-		bdev->stat.errorRX++;
+		bdev->aclErrors = 0;
+
+		if (actual_len > 0) {
+			if (assembly_rx(bdev, BT_ACL, data, actual_len) == B_OK) {
+				bdev->stat.successfulRX++;
+			} else {
+				bdev->stat.errorRX++;
+			}
+		}
 	}
 
-resubmit:
-
-	error = usb->queue_bulk(bdev->bulk_in_ep->handle, data,
-		max_c(HCI_MAX_FRAME_SIZE, bdev->max_packet_size_bulk_in),
-		acl_rx_complete, (void*) bdev);
-
-	if (error != B_OK) {
-		reuse_room(&bdev->aclRoom, data);
-		bdev->stat.rejectedRX++;
-		ERROR("%s: RX acl resubmittion failed %s\n", __func__, strerror(error));
-	} else {
-		bdev->stat.acceptedRX++;
-	}
+	resubmit_receive(bdev, false, data);
 }
 
 
@@ -321,7 +420,8 @@ command_complete(void* cookie, status_t status, void* data, size_t actual_len)
 		// the packet has been lost, too late to requeue it
 	}
 
-	snb_park(&bdev->snetBufferRecycleTrash, snbuf);
+	snb_park(&bdev->snetBufferRecycleTrash,
+		&bdev->snetBufferRecycleLock, snbuf);
 
 #ifdef BT_RESCHEDULING_AFTER_COMPLETITIONS
 	// TODO: check just the empty queues

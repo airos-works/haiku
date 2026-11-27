@@ -174,66 +174,57 @@ snb_remaining_to_pull(snet_buffer* snb)
 */
 
 
-static snet_buffer*
-snb_attempt_reuse(snet_buffer* snb, uint16 size)
-{
-	if (snb == NULL || (snb->allocatedSize < size)) {
-
-		// Impossible or not worth, Creating a new one
-		snb_free(snb);
-		return snb_create(size);
-
-	} else {
-		snb_reset(snb);
-		snb->expectedSize = size;
-		return snb;
-	}
-
-}
-
-
 void
-snb_park(struct list* l, snet_buffer* snb)
+snb_park(struct list* l, spinlock* lock, snet_buffer* snb)
 {
 	snet_buffer* item = NULL;
+
+	cpu_status state = disable_interrupts();
+	acquire_spinlock(lock);
 
 	// insert it by order
 	while ((item = (snet_buffer*)list_get_next_item(l, item)) != NULL) {
 		// This one has allocated more than us place us back
 		if (item->allocatedSize > snb->allocatedSize) {
 			list_insert_item_before(l, item, snb);
-			return;
+			break;
 		}
 	}
-	// no buffer bigger than us(or empty).. then at the end
-	list_add_item(l, snb);
+	if (item == NULL) {
+		// no buffer bigger than us(or empty).. then at the end
+		list_add_item(l, snb);
+	}
+
+	release_spinlock(lock);
+	restore_interrupts(state);
 }
 
 
 snet_buffer*
-snb_fetch(struct list* l, uint16 size)
+snb_fetch(struct list* l, spinlock* lock, uint16 size)
 {
 	snet_buffer* item = NULL;
-	snet_buffer* newitem = NULL;
 
-	if (!list_is_empty(l))
+	cpu_status state = disable_interrupts();
+	acquire_spinlock(lock);
+
 	while ((item = (snet_buffer*)list_get_next_item(l, item)) != NULL) {
 		if (item->allocatedSize >= size) {
 			// This one is for us
+			list_remove_item(l, item);
 			break;
 		}
 	}
-	
-	newitem = snb_attempt_reuse(item, size); 
-	
-	/* the resulting reused one is the same 
-	 * as we fetched? => remove it from list
-	 */
-	if (item == newitem) {
-		list_remove_item(l, item);
-	}
 
-	return newitem;
+	release_spinlock(lock);
+	restore_interrupts(state);
+
+	if (item == NULL)
+		return snb_create(size);
+
+	snb_reset(item);
+	item->expectedSize = size;
+	return item;
 }
 
 

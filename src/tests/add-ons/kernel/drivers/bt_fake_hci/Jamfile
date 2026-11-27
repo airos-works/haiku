@@ -1,0 +1,16 @@
+SubDir HAIKU_TOP src tests add-ons kernel drivers bt_fake_hci ;
+
+# bt_fake_hci, a Bluetooth transport driver with no radio behind it, and
+# bt_receive_test, which drives the HCI module's receive path through it
+# (#228). For a machine without Bluetooth (the test VM); see the sources.
+
+UsePrivateHeaders bluetooth net ;
+UsePrivateKernelHeaders ;
+
+KernelAddon bt_fake_hci :
+	bt_fake_hci.cpp
+;
+
+SimpleTest bt_receive_test :
+	bt_receive_test.cpp
+;

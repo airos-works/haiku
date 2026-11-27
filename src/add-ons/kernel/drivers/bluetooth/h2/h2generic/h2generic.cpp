@@ -575,20 +575,28 @@ submit_nbuffer(hci_id hid, net_buffer* nbuf)
 				break;
 			case BT_COMMAND:
 			{
-				snet_buffer* snbuf = snb_fetch(&bdev->snetBufferRecycleTrash, nbuf->size);
+				snet_buffer* snbuf = snb_fetch(&bdev->snetBufferRecycleTrash,
+					&bdev->snetBufferRecycleLock, nbuf->size);
 				if (snbuf == NULL)
 					return B_NO_MEMORY;
 
 				BStackOrHeapArray<uint8, 512> data(nbuf->size);
 				if (!data.IsValid()) {
-					snb_park(&bdev->snetBufferRecycleTrash, snbuf);
+					snb_park(&bdev->snetBufferRecycleTrash,
+						&bdev->snetBufferRecycleLock, snbuf);
 					return B_NO_MEMORY;
 				}
 
 				nb->read(nbuf, 0, data, nbuf->size);
 				snb_put(snbuf, data, nbuf->size);
 
-				return submit_tx_command(bdev, snbuf);
+				status_t status = submit_tx_command(bdev, snbuf);
+				if (status != B_OK) {
+					// not queued: no completion gives the buffer back
+					snb_park(&bdev->snetBufferRecycleTrash,
+						&bdev->snetBufferRecycleLock, snbuf);
+				}
+				return status;
 				break;
 			}
 
@@ -670,6 +678,9 @@ device_open(const char* name, uint32 flags, void **cookie)
 	init_room(&bdev->scoRoom);
 
 	list_init(&bdev->snetBufferRecycleTrash);
+	B_INITIALIZE_SPINLOCK(&bdev->snetBufferRecycleLock);
+	bdev->eventErrors = 0;
+	bdev->aclErrors = 0;
 
 	// Allocate set and register the HCI device
 	if (btDevices != NULL) {
@@ -834,7 +845,8 @@ device_control(void* cookie, uint32 msg, void* params, size_t size)
 
 			// TODO: Reuse from some TXcompleted queue
 			// snbuf = snb_create(size);
-			snbuf = snb_fetch(&bdev->snetBufferRecycleTrash, size);
+			snbuf = snb_fetch(&bdev->snetBufferRecycleTrash,
+				&bdev->snetBufferRecycleLock, size);
 			if (snbuf == NULL) {
 				err = B_NO_MEMORY;
 				break;
@@ -845,7 +857,8 @@ device_control(void* cookie, uint32 msg, void* params, size_t size)
 			if (err != B_OK) {
 				// it was not queued, so its completion will not give the
 				// buffer back
-				snb_park(&bdev->snetBufferRecycleTrash, snbuf);
+				snb_park(&bdev->snetBufferRecycleTrash,
+					&bdev->snetBufferRecycleLock, snbuf);
 				ERROR("%s: Queing failed at submit_tx_command()\n", __func__);
 			} else
 				TRACE("%s: command launched\n", __func__);

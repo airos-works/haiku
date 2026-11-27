@@ -76,12 +76,17 @@ struct snet_buffer {
 	bool	parked;
 };
 
+struct spinlock {
+	int unused;
+};
+
 struct bt_usb_dev {
 	sem_id				lock;
 	uint32				state;
 	hci_id				hdev;
 	bt_hci_statistics	stat;
 	struct list			snetBufferRecycleTrash;
+	spinlock			snetBufferRecycleLock;
 };
 
 
@@ -183,6 +188,21 @@ snb_park(struct list*, snet_buffer* buffer)
 {
 	buffer->parked = true;
 	sBuffersOut--;
+}
+
+
+// since the recycle list has a lock (haiku#228)
+static snet_buffer*
+snb_fetch(struct list* list, spinlock*, uint16 size)
+{
+	return snb_fetch(list, size);
+}
+
+
+static void
+snb_park(struct list* list, spinlock*, snet_buffer* buffer)
+{
+	snb_park(list, buffer);
 }
 
 

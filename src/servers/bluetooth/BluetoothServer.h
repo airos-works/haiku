@@ -46,7 +46,8 @@ typedef BObjectList<LocalDeviceImpl> LocalDevicesList;
 typedef BObjectList<BMessenger> WatchersList;
 typedef PortListener<struct hci_event_header, 
 	HCI_MAX_EVENT_SIZE, // Event Body can hold max 255 + 2 header
-	24					// Some devices have sent chunks of 24 events(inquiry result)
+	128					// Some devices have sent chunks of 24 events(inquiry
+						// result); the kernel waits for no one
 	> BluetoothPortListener;
 
 class BluetoothServer : public BApplication

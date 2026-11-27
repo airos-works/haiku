@@ -50,12 +50,14 @@ public:
 	}
 
 
-	status_t Trigger(int32 code, TYPE* buffer, size_t size)
+	status_t Trigger(int32 code, TYPE* buffer, size_t size,
+		bigtime_t timeout = B_INFINITE_TIMEOUT)
 	{
 		if (buffer == NULL)
 			return B_ERROR;
 
-		return write_port(fPort, code, buffer, size);
+		return write_port_etc(fPort, code, buffer, size, B_RELATIVE_TIMEOUT,
+			timeout);
 	}
 
 
@@ -146,13 +148,17 @@ private:
 
 		while ((ssizePort = port_buffer_size(*port)) != B_BAD_PORT_ID) {
 
-			if (ssizePort <= 0) {
+			if (ssizePort < 0) {
+				// interrupted, or a port in a strange state
 				snooze(500 * 1000);
 				continue;
 			}
 
-			if (ssizePort >	MAX_MESSAGE_SIZE) {
-				snooze(500 * 1000);
+			if (ssizePort == 0 || ssizePort > MAX_MESSAGE_SIZE) {
+				// Nothing a handler could use. Take it out of the port
+				// (left there, it would be looked at again for ever and
+				// hold up everything behind it).
+				read_port(*port, &code, (void*)buffer, MAX_MESSAGE_SIZE);
 				continue;
 			}
 
@@ -161,11 +167,10 @@ private:
 			if (ssizeRead != ssizePort)
 				continue;
 
+			// A message the handler cannot use (say, for a device that
+			// has just gone) is its business: this thread is the only one
+			// there is, and must stay for the next message.
 			status = handler(buffer, code,	ssizePort);
-
-			if (status != B_OK)
-				break;
-
 		}
 
 		#ifdef DEBUG_PORTLISTENER

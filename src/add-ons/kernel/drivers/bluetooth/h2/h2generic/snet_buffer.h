@@ -5,6 +5,7 @@
 #ifndef _SNET_BUFFER_H_
 #define _SNET_BUFFER_H_
 
+#include <KernelExport.h>
 #include <util/list.h>
 
 /* 
@@ -69,8 +70,11 @@ uint16 snb_remaining_to_pull(snet_buffer* snb);
  * another one snb_fetch it. That funcion will reuse most appropiated
  * previous used one snb_buff by its memory use.
  */
-void			snb_park(struct list* l, snet_buffer* snb);
-snet_buffer*	snb_fetch(struct list* l, uint16 size);
+/* The list is changed under the given lock: buffers are parked from USB
+ * completions and fetched from ioctls and from the HCI module's threads.
+ */
+void			snb_park(struct list* l, spinlock* lock, snet_buffer* snb);
+snet_buffer*	snb_fetch(struct list* l, spinlock* lock, uint16 size);
 uint16			snb_packets(struct list* l);
 
 void			snb_dump(snet_buffer* snb);

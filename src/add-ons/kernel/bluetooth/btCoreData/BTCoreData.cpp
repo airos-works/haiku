@@ -156,11 +156,27 @@ PostEvent(bluetooth_device* ndev, void* event, size_t size)
 	// forward to bluetooth server
 	port_id port = find_port(BT_USERLAND_PORT_NAME);
 	if (port != B_NAME_NOT_FOUND) {
+		// The HCI receive thread calls this, and ACL data (keyboards, mice,
+		// audio) waits behind it. A server that is busy for a moment gets
+		// a little time; one that does not read at all (stopped, hung, in
+		// a crash alert) none, until it reads again.
+		static int32 sServerStalled = 0;
+		const bigtime_t timeout = atomic_get(&sServerStalled) != 0
+			? 0 : 100000;
 
 		err = write_port_etc(port, PACK_PORTCODE(BT_EVENT, ndev->index, -1),
-			event, size, B_TIMEOUT, 1 * 1000 * 1000);
+			event, size, B_RELATIVE_TIMEOUT, timeout);
 
-		if (err != B_OK)
+		if (err == B_OK) {
+			if (atomic_get_and_set(&sServerStalled, 0) != 0)
+				ERROR("%s: the bluetooth_server reads events again\n",
+					__func__);
+		} else if (err == B_TIMED_OUT || err == B_WOULD_BLOCK) {
+			if (atomic_get_and_set(&sServerStalled, 1) == 0) {
+				ERROR("%s: the bluetooth_server does not read its events, "
+					"dropping them\n", __func__);
+			}
+		} else
 			ERROR("%s: Error posting userland %s\n", __func__, strerror(err));
 
 	} else {

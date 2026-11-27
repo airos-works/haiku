@@ -137,6 +137,9 @@ struct bluetooth_device : DoublyLinkedListLinkImpl<bluetooth_device> {
 		// the same for LE links; 0 when they share the ACL buffers
 	acl_flow_control*			flow;
 		// the HCI module's, see there
+	int32						references;
+		// the HCI module's: its threads working on the device right now;
+		// UnregisterDriver() waits for them
 
 };
 #else

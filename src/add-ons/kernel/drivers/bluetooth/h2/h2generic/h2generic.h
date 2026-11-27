@@ -108,6 +108,11 @@ struct bt_usb_dev {
 
 	// for who ever needs preallocated buffers
 	struct list		snetBufferRecycleTrash;
+	spinlock		snetBufferRecycleLock;
+
+	// receive transfers that failed in a row
+	int32			eventErrors;
+	int32			aclErrors;
 
 };
 
