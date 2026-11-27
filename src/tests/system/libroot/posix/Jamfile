@@ -55,6 +55,10 @@ SimpleTest user_thread_fork_test : user_thread_fork_test.cpp ;
 SimpleTest pthread_barrier_test : pthread_barrier_test.cpp ;
 SimpleTest pthread_clock_test : pthread_clock_test.cpp ;
 SimpleTest pthread_fork_lock_test : pthread_fork_lock_test.cpp ;
+# libroot's private mutex (locks.h)
+SourceHdrs pthread_mutex_contention_test.cpp
+	: [ FDirName $(HAIKU_TOP) headers private shared ] ;
+SimpleTest pthread_mutex_contention_test : pthread_mutex_contention_test.cpp ;
 SimpleTest posix_spawn_test : posix_spawn_test.cpp ;
 SimpleTest posix_spawn_redir_test : posix_spawn_redir_test.c ;
 SimpleTest posix_spawn_redir_err : posix_spawn_redir_err.c ;

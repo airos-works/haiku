@@ -37,6 +37,9 @@ struct UserMutexEntry {
 
 	rw_lock				lock;
 	ConditionVariable	condition;
+	int32				starving;
+		// waiters that lost the released mutex kMaxCompeteLosses times; as
+		// long as there are any, unlocking hands the mutex over again
 };
 
 struct UserMutexHashDefinition {
@@ -73,6 +76,15 @@ struct user_mutex_context {
 };
 static user_mutex_context sSharedUserMutexContext;
 static const char* kUserMutexEntryType = "umtx entry";
+
+// The wait status of a waiter woken because the mutex was released rather
+// than handed to it (B_USER_MUTEX_UNBLOCK_RELEASED): it competes for the mutex
+// with the threads that are running. It never leaves the kernel.
+static const status_t kUserMutexCompete = B_GENERAL_ERROR_BASE + 0xfff0;
+
+// A waiter that found the mutex taken this many times after being woken to
+// compete for it is handed the mutex, so that it cannot starve.
+static const int32 kMaxCompeteLosses = 2;
 
 
 // #pragma mark - user atomics
@@ -286,6 +298,7 @@ get_user_mutex_entry(struct user_mutex_context* context,
 
 	entry->address = address;
 	entry->ref_count = 1;
+	entry->starving = 0;
 	rw_lock_init(&entry->lock, "UserMutexEntry lock");
 	entry->condition.Init(entry, kUserMutexEntryType);
 
@@ -366,7 +379,28 @@ user_mutex_lock_locked(UserMutexEntry* entry, int32* mutex,
 	if (user_mutex_prepare_to_lock(entry, mutex, isWired))
 		return B_OK;
 
-	status_t error = user_mutex_wait_locked(entry, flags, timeout, locker);
+	int32 losses = 0;
+	status_t error;
+	while (true) {
+		error = user_mutex_wait_locked(entry, flags, timeout, locker);
+		if (error != kUserMutexCompete)
+			break;
+
+		// The mutex was released, not handed to us: try to take it. If a
+		// running thread was faster, the attempt has set WAITING again, so
+		// that thread's unlock will wake a waiter; wait again.
+		locker.Lock();
+		if (user_mutex_prepare_to_lock(entry, mutex, isWired)) {
+			error = B_OK;
+			break;
+		}
+
+		if (++losses == kMaxCompeteLosses)
+			atomic_add(&entry->starving, 1);
+	}
+
+	if (losses >= kMaxCompeteLosses)
+		atomic_add(&entry->starving, -1);
 
 	// possibly unset waiting flag
 	if (error != B_OK && entry->condition.EntriesCount() == 0) {
@@ -386,6 +420,26 @@ user_mutex_unblock(UserMutexEntry* entry, int32* mutex, uint32 flags, bool isWir
 	if (entry->condition.EntriesCount() == 0) {
 		// Nobody is actually waiting at present.
 		user_atomic_and(mutex, ~(int32)B_USER_MUTEX_WAITING, isWired);
+		return;
+	}
+
+	if ((flags & (B_USER_MUTEX_UNBLOCK_ALL | B_USER_MUTEX_UNBLOCK_RELEASED))
+			== B_USER_MUTEX_UNBLOCK_RELEASED
+		&& atomic_get(&entry->starving) == 0) {
+		// The caller has released the mutex. Wake one waiter to compete for
+		// it rather than handing it the mutex: handing it over makes every
+		// other locker wait until that thread has been scheduled, and so
+		// separates all critical sections by a wake-up (a lock convoy). If a
+		// running thread has taken the mutex in the meantime, there is no
+		// need to wake anyone: WAITING is still set, so its unlock comes here.
+		const int32 value = user_atomic_get(mutex, isWired);
+		if ((value & B_USER_MUTEX_DISABLED) != 0)
+			entry->condition.NotifyAll(B_OK);
+		else if ((value & B_USER_MUTEX_LOCKED) == 0)
+			entry->condition.NotifyOne(kUserMutexCompete);
+
+		if (entry->condition.EntriesCount() == 0)
+			user_atomic_and(mutex, ~(int32)B_USER_MUTEX_WAITING, isWired);
 		return;
 	}
 
@@ -588,6 +642,13 @@ user_mutex_switch_lock(int32* fromMutex, uint32 fromFlags,
 
 		if (!alreadyLocked)
 			error = waiter.Wait(toFlags, timeout);
+		if (error == kUserMutexCompete) {
+			// Only if someone unlocked the second mutex with
+			// B_USER_MUTEX_UNBLOCK_RELEASED: compete for it like a locker.
+			ReadLocker entryLocker(toEntry->lock);
+			error = user_mutex_lock_locked(toEntry, toMutex, toFlags, timeout,
+				entryLocker, toFetcher.IsWired());
+		}
 	}
 	put_user_mutex_entry(fromFetcher.Context(), fromEntry);
 	put_user_mutex_entry(toFetcher.Context(), toEntry);

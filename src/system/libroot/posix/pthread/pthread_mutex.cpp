@@ -15,6 +15,7 @@
 
 #include <syscalls.h>
 #include <user_mutex_defs.h>
+#include <user_mutex_spin.h>
 #include <time_private.h>
 
 
@@ -89,10 +90,8 @@ __pthread_mutex_lock(pthread_mutex_t* mutex, uint32 flags, bigtime_t timeout)
 		}
 	}
 
-	// set the locked flag
-	const int32 oldValue = atomic_test_and_set((int32*)&mutex->lock, B_USER_MUTEX_LOCKED, 0);
-	if (oldValue != 0) {
-		// someone else has the lock or is at least waiting for it
+	// set the locked flag, spinning a while if someone else has the lock
+	if (!__user_mutex_try_lock((int32*)&mutex->lock, timeout >= 0)) {
 		if (timeout < 0)
 			return EBUSY;
 		if ((mutex->flags & MUTEX_FLAG_SHARED) != 0)
@@ -186,8 +185,8 @@ pthread_mutex_unlock(pthread_mutex_t* mutex)
 	int32 oldValue = atomic_and((int32*)&mutex->lock,
 		~(int32)B_USER_MUTEX_LOCKED);
 	if ((oldValue & B_USER_MUTEX_WAITING) != 0) {
-		_kern_mutex_unblock((int32*)&mutex->lock,
-			(mutex->flags & MUTEX_FLAG_SHARED) ? B_USER_MUTEX_SHARED : 0);
+		_kern_mutex_unblock((int32*)&mutex->lock, B_USER_MUTEX_UNBLOCK_RELEASED
+			| ((mutex->flags & MUTEX_FLAG_SHARED) ? B_USER_MUTEX_SHARED : 0));
 	}
 
 	if (MUTEX_TYPE(mutex) == PTHREAD_MUTEX_ERRORCHECK

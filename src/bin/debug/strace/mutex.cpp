@@ -32,6 +32,7 @@ static const FlagsTypeHandler::FlagInfo kMutexOptionFlagsInfo[] = {
 
 	FLAG_INFO_ENTRY(B_USER_MUTEX_SHARED),
 	FLAG_INFO_ENTRY(B_USER_MUTEX_UNBLOCK_ALL),
+	FLAG_INFO_ENTRY(B_USER_MUTEX_UNBLOCK_RELEASED),
 
 	{ 0, NULL }
 };

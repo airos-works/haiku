@@ -87,7 +87,8 @@ cond_wait(pthread_cond_t* cond, pthread_mutex_t* mutex, uint32 flags,
 	if ((cond->flags & COND_FLAG_SHARED) != 0)
 		flags |= B_USER_MUTEX_SHARED;
 	status_t status = _kern_mutex_switch_lock((int32*)&mutex->lock,
-		((mutex->flags & MUTEX_FLAG_SHARED) ? B_USER_MUTEX_SHARED : 0),
+		B_USER_MUTEX_UNBLOCK_RELEASED
+			| ((mutex->flags & MUTEX_FLAG_SHARED) ? B_USER_MUTEX_SHARED : 0),
 		(int32*)&cond->lock, "pthread condition", flags, timeout);
 
 	if (status == B_INTERRUPTED) {

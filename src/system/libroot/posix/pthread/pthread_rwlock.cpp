@@ -14,6 +14,7 @@
 #include <syscalls.h>
 #include <time_private.h>
 #include <user_mutex_defs.h>
+#include <user_mutex_spin.h>
 #include <user_thread.h>
 #include <util/DoublyLinkedList.h>
 
@@ -100,6 +101,9 @@ struct SharedRWLock {
 };
 
 
+namespace {
+	// Its member functions are not always inlined; they are not for export.
+
 struct LocalRWLock {
 	uint32_t	flags;
 	int32_t		owner;
@@ -134,8 +138,7 @@ struct LocalRWLock {
 
 	bool StructureLock()
 	{
-		const int32 oldValue = atomic_test_and_set((int32*)&mutex, B_USER_MUTEX_LOCKED, 0);
-		if (oldValue != 0) {
+		if (!__user_mutex_try_lock((int32*)&mutex, true)) {
 			status_t status;
 			do {
 				status = _kern_mutex_lock((int32*)&mutex, NULL, 0, 0);
@@ -153,7 +156,7 @@ struct LocalRWLock {
 		int32 status = atomic_and((int32*)&mutex,
 			~(int32)B_USER_MUTEX_LOCKED);
 		if ((status & B_USER_MUTEX_WAITING) != 0)
-			_kern_mutex_unblock((int32*)&mutex, 0);
+			_kern_mutex_unblock((int32*)&mutex, B_USER_MUTEX_UNBLOCK_RELEASED);
 	}
 
 	status_t ReadLock(uint32 flags, bigtime_t timeout)
@@ -301,6 +304,8 @@ private:
 	};
 	typedef AutoLocker<LocalRWLock, Locking> Locker;
 };
+
+}	// namespace
 
 
 static void inline

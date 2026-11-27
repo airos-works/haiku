@@ -13,6 +13,11 @@
 #define B_USER_MUTEX_UNBLOCK_ALL	0x80000000
 	// All threads currently waiting on the mutex will be unblocked. The mutex
 	// state will be locked.
+#define B_USER_MUTEX_UNBLOCK_RELEASED	0x20000000
+	// The caller has released the mutex: one waiter is woken to compete for
+	// it with running threads instead of being handed the mutex (which would
+	// separate every two critical sections by a wake-up). Without the flag
+	// the waiter is handed the mutex (condition variables rely on that).
 
 
 // mutex value flags

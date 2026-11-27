@@ -16,12 +16,7 @@
 
 #include <syscalls.h>
 #include <user_mutex_defs.h>
-
-
-#define MAX_UNSUCCESSFUL_SPINS	100
-
-
-extern int32 __gCPUCount;
+#include <user_mutex_spin.h>
 
 
 // #pragma mark - mutex
@@ -42,9 +37,8 @@ __mutex_init_etc(mutex *lock, const char *name, uint32 flags)
 	lock->name = (flags & MUTEX_FLAG_CLONE_NAME) != 0 ? strdup(name) : name;
 	lock->lock = 0;
 	lock->flags = flags;
-
-	if (__gCPUCount < 2)
-		lock->flags &= ~uint32(MUTEX_FLAG_ADAPTIVE);
+		// MUTEX_FLAG_ADAPTIVE is accepted, but makes no difference: all
+		// mutexes spin a while before sleeping when there are several CPUs.
 }
 
 
@@ -59,16 +53,13 @@ __mutex_destroy(mutex *lock)
 status_t
 __mutex_lock(mutex *lock)
 {
-	uint32 count = 0;
-	const uint32 kMaxCount
-		= (lock->flags & MUTEX_FLAG_ADAPTIVE) != 0 ? MAX_UNSUCCESSFUL_SPINS : 1;
+	const int32 oldValue = atomic_test_and_set(&lock->lock,
+		B_USER_MUTEX_LOCKED, 0);
+	if (oldValue == 0 || (oldValue & B_USER_MUTEX_DISABLED) != 0)
+		return B_OK;
 
-	int32 oldValue;
-	do {
-		oldValue = atomic_test_and_set(&lock->lock, B_USER_MUTEX_LOCKED, 0);
-		if (oldValue == 0 || (oldValue & B_USER_MUTEX_DISABLED) != 0)
-			return B_OK;
-	} while (count++ < kMaxCount && (oldValue & B_USER_MUTEX_WAITING) != 0);
+	if (__user_mutex_try_lock(&lock->lock, true))
+		return B_OK;
 
 	// we have to call the kernel
 	status_t error;
@@ -87,7 +78,7 @@ __mutex_unlock(mutex *lock)
 	int32 oldValue = atomic_and(&lock->lock, ~(int32)B_USER_MUTEX_LOCKED);
 	if ((oldValue & B_USER_MUTEX_WAITING) != 0
 			&& (oldValue & B_USER_MUTEX_DISABLED) == 0) {
-		_kern_mutex_unblock(&lock->lock, 0);
+		_kern_mutex_unblock(&lock->lock, B_USER_MUTEX_UNBLOCK_RELEASED);
 	}
 
 	if ((oldValue & B_USER_MUTEX_LOCKED) == 0)

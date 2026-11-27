@@ -33,6 +33,18 @@ void *__gCommPageAddress;
 void *__dso_handle;
 
 int32 __gCPUCount = 1;
+	// libroot's mutex code (mutex.o) only polls a contended mutex when there
+	// is more than one CPU, so it never does here.
+
+
+/*!	For that polling, which looks at the clock: the libroot one is not
+	linked into the runtime loader.
+*/
+extern "C" bigtime_t
+system_time()
+{
+	return _kern_system_time();
+}
 
 const directory_which kLibraryDirectories[] = {
 	B_SYSTEM_LIB_DIRECTORY,
