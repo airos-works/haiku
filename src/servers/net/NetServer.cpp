@@ -11,7 +11,10 @@
 
 #include "NetServer.h"
 
+#include <algorithm>
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <map>
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,6 +49,7 @@
 #include <WPASupplicant.h>
 
 #include "AutoconfigLooper.h"
+#include "ResolvConf.h"
 #include "Services.h"
 #include "../../shared/net/ServiceOrder.h"
 
@@ -60,6 +64,7 @@ using namespace BNetworkKit;
 
 
 typedef std::map<std::string, AutoconfigLooper*> LooperMap;
+typedef std::map<std::string, BMessage> ResolverMap;
 
 
 class NetServer : public BServer {
@@ -80,6 +85,8 @@ private:
 			status_t			_ConfigureInterface(BMessage& interface);
 			status_t			_ConfigureResolver(
 									BMessage& resolverConfiguration);
+			void				_ForgetResolver(const char* device);
+			status_t			_WriteResolverConfiguration();
 			bool				_QuitLooperForDevice(const char* device);
 			AutoconfigLooper*	_LooperForDevice(const char* device);
 			status_t			_ConfigureDevice(const char* path);
@@ -109,6 +116,9 @@ private:
 private:
 			BNetworkSettings	fSettings;
 			LooperMap			fDeviceMap;
+			ResolverMap			fResolverMap;
+				// the resolver settings of each device's lease
+			bool				fResolverConfigured;
 			BMessenger			fServices;
 };
 
@@ -144,7 +154,8 @@ set_80211(const char* name, int32 type, void* data,
 
 NetServer::NetServer(status_t& error)
 	:
-	BServer(kNetServerSignature, false, &error)
+	BServer(kNetServerSignature, false, &error),
+	fResolverConfigured(false)
 {
 }
 
@@ -395,6 +406,7 @@ NetServer::_RemoveInterface(const char* name)
 {
 	BNetworkRoster& roster = BNetworkRoster::Default();
 	status_t status = roster.RemoveInterface(name);
+	_ForgetResolver(name);
 	if (status != B_OK) {
 		fprintf(stderr, "%s: Could not delete interface %s: %s\n",
 			Name(), name, strerror(status));
@@ -590,76 +602,141 @@ NetServer::_ConfigureInterface(BMessage& message)
 }
 
 
+/*!	Takes the resolver settings of a device's lease ("device", "nameserver",
+	"domain"). A message without name servers and domain removes what the
+	device had (its link went away).
+*/
 status_t
 NetServer::_ConfigureResolver(BMessage& resolverConfiguration)
 {
-	// Store resolver settings in resolv.conf file, while maintaining any
-	// user specified settings already present.
+	const char* device = resolverConfiguration.GetString("device", "");
+	if (!resolverConfiguration.HasString("nameserver")
+		&& !resolverConfiguration.HasString("domain")) {
+		if (fResolverMap.erase(device) == 0)
+			return B_OK;
+	} else
+		fResolverMap[device] = resolverConfiguration;
+
+	fResolverConfigured = true;
+	return _WriteResolverConfiguration();
+}
+
+
+void
+NetServer::_ForgetResolver(const char* device)
+{
+	if (fResolverMap.erase(device) != 0)
+		_WriteResolverConfiguration();
+}
+
+
+struct ResolverSource {
+	int32		metric;
+	std::string	device;
+	ResolvConf::Source source;
+
+	bool operator<(const ResolverSource& other) const
+	{
+		if (metric != other.metric)
+			return metric < other.metric;
+		return device < other.device;
+	}
+};
+
+
+/*!	Writes the name servers of all interfaces that have a link and a lease
+	into resolv.conf, the most preferred interface (the lowest metric, which
+	is what the service order sets) first. Before, the file held whatever
+	the last lease to arrive had sent: the servers of an interface that was
+	unplugged since, or of a standby one, while the others were ignored.
+	The rest of the file stays as it is; it is replaced in one step, so that
+	no reader sees half of it.
+*/
+status_t
+NetServer::_WriteResolverConfiguration()
+{
+	if (!fResolverConfigured)
+		return B_OK;
 
 	BPath path;
 	if (find_directory(B_SYSTEM_SETTINGS_DIRECTORY, &path) != B_OK
 		|| path.Append("network/resolv.conf") != B_OK)
 		return B_ERROR;
 
-	FILE* file = fopen(path.Path(), "r+");
-	// open existing resolv.conf if possible
-	if (file == NULL) {
-		// no existing resolv.conf, create a new one
-		file = fopen(path.Path(), "w");
-		if (file == NULL) {
-			fprintf(stderr, "Could not open resolv.conf: %s\n",
-				strerror(errno));
-			return errno;
-		}
-	} else {
-		// An existing resolv.conf was found, parse it for user settings
-		const char* staticDNS = "# Static DNS Only";
-		size_t sizeStaticDNS = strlen(staticDNS);
-		const char* dynamicDNS = "# Dynamic DNS entries";
-		size_t sizeDynamicDNS = strlen(dynamicDNS);
-		char resolveConfBuffer[80];
-		size_t sizeResolveConfBuffer = sizeof(resolveConfBuffer);
-
-		while (fgets(resolveConfBuffer, sizeResolveConfBuffer, file)) {
-			if (strncmp(resolveConfBuffer, staticDNS, sizeStaticDNS) == 0) {
-				// If DNS is set to static only, don't modify
-				fclose(file);
-				return B_OK;
-			} else if (strncmp(resolveConfBuffer, dynamicDNS, sizeDynamicDNS)
-					== 0) {
-				// Overwrite existing dynamic entries
-				break;
-			}
+	std::vector<ResolverSource> sources;
+	for (ResolverMap::const_iterator iterator = fResolverMap.begin();
+			iterator != fResolverMap.end(); iterator++) {
+		ResolverSource source;
+		source.device = iterator->first;
+		source.metric = INT32_MAX;
+		if (!source.device.empty()) {
+			BNetworkInterface interface(source.device.c_str());
+			if (!interface.Exists() || (interface.Flags() & IFF_UP) == 0
+				|| !interface.HasLink())
+				continue;
+			source.metric = interface.Metric();
 		}
 
-		if (feof(file) != 0) {
-			// No static entries found, close and re-open as new file
-			fclose(file);
-			file = fopen(path.Path(), "w");
-			if (file == NULL) {
-				fprintf(stderr, "Could not open resolv.conf: %s\n",
-					strerror(errno));
-				return errno;
-			}
+		const BMessage& message = iterator->second;
+		const char* string;
+		for (int32 i = 0; message.FindString("nameserver", i, &string)
+				== B_OK; i++) {
+			source.source.nameservers.push_back(string);
 		}
+		if (message.FindString("domain", &string) == B_OK)
+			source.source.domain = string;
+		sources.push_back(source);
+	}
+	std::stable_sort(sources.begin(), sources.end());
+
+	std::vector<ResolvConf::Source> ordered;
+	for (size_t i = 0; i < sources.size(); i++)
+		ordered.push_back(sources[i].source);
+	std::string block = ResolvConf::MakeBlock(ordered);
+
+	std::string current;
+	bool exists = false;
+	FILE* file = fopen(path.Path(), "r");
+	if (file != NULL) {
+		exists = true;
+		char buffer[1024];
+		size_t bytes;
+		while ((bytes = fread(buffer, 1, sizeof(buffer), file)) > 0)
+			current.append(buffer, bytes);
+		fclose(file);
 	}
 
-	fprintf(file, "# Added automatically by DHCP\n");
+	std::string contents;
+	if (!ResolvConf::Merge(current, exists, block, contents)) {
+		// "# Static DNS Only"
+		return B_OK;
+	}
+	if (exists && contents == current)
+		return B_OK;
 
-	const char* nameserver;
-	for (int32 i = 0; resolverConfiguration.FindString("nameserver", i,
-			&nameserver) == B_OK; i++) {
-		fprintf(file, "nameserver %s\n", nameserver);
+	BString temporary(path.Path());
+	temporary << ".new";
+	int fd = open(temporary.String(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0) {
+		fprintf(stderr, "%s: Could not write %s: %s\n", Name(),
+			temporary.String(), strerror(errno));
+		return errno;
+	}
+	ssize_t written = write(fd, contents.c_str(), contents.size());
+	status_t status = written == (ssize_t)contents.size() ? B_OK
+		: written < 0 ? errno : B_IO_ERROR;
+	close(fd);
+	if (status == B_OK && rename(temporary.String(), path.Path()) != 0)
+		status = errno;
+	if (status != B_OK) {
+		fprintf(stderr, "%s: Could not write %s: %s\n", Name(), path.Path(),
+			strerror(status));
+		unlink(temporary.String());
+		return status;
 	}
 
-	const char* domain;
-	if (resolverConfiguration.FindString("domain", &domain) == B_OK)
-		fprintf(file, "domain %s\n", domain);
-
-	fprintf(file, "# End of automatic DHCP additions\n");
-
-	fclose(file);
-
+	syslog(LOG_INFO, "%s: resolv.conf: %d name server source(s)\n", Name(),
+		(int)sources.size());
 	return B_OK;
 }
 
@@ -676,6 +753,9 @@ NetServer::_QuitLooperForDevice(const char* device)
 		iterator->second->Quit();
 
 	fDeviceMap.erase(iterator);
+
+	// its lease is gone, and with it the name servers it brought
+	_ForgetResolver(device);
 	return true;
 }
 
@@ -906,6 +986,8 @@ NetServer::_SetServiceOrder(const BMessage& message)
 	}
 
 	_ApplyServiceOrder();
+	_WriteResolverConfiguration();
+		// the name servers follow the order of the interfaces
 	return B_OK;
 }
 

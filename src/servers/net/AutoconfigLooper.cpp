@@ -227,6 +227,13 @@ AutoconfigLooper::_NetworkMonitorNotification(BMessage* message)
 				if (fCurrentClient != NULL)
 					fCurrentClient->KeepLease();
 				_RemoveClient();
+
+				// The lease's name servers can't be reached any more: let
+				// the net_server write resolv.conf without them. The next
+				// lease brings them back.
+				BMessage resolver(kMsgConfigureResolver);
+				resolver.AddString("device", fDevice.String());
+				fTarget.SendMessage(&resolver, this);
 			}
 
 			fLastMediaStatus = media;

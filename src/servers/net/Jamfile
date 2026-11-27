@@ -21,6 +21,7 @@ Application net_server :
 	AutoconfigClient.cpp
 	AutoconfigLooper.cpp
 	DHCPClient.cpp
+	ResolvConf.cpp
 	Services.cpp
 
 	: be network bnetapi [ TargetLibstdc++ ] shared
