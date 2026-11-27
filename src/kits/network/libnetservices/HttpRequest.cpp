@@ -569,7 +569,7 @@ BHttpRequest::_MakeRequest()
 
 	_EmitDebug(B_URL_PROTOCOL_DEBUG_TEXT, "Connection to %s on port %d.",
 		fUrl.Authority().String(), fRemoteAddr.Port());
-	status_t connectError = fSocket->Connect(fRemoteAddr);
+	status_t connectError = fSocket->Connect(fRemoteAddr, fTimeout);
 
 	if (connectError != B_OK) {
 		_EmitDebug(B_URL_PROTOCOL_DEBUG_ERROR, "Socket connection error %s",

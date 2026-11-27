@@ -21,7 +21,8 @@ BNetworkRequest::BNetworkRequest(const BUrl& url, BDataIO* output,
 	const char* threadName, const char* protocolName)
 	:
 	BUrlRequest(url, output, listener, context, threadName, protocolName),
-	fSocket(NULL)
+	fSocket(NULL),
+	fTimeout(B_INFINITE_TIMEOUT)
 {
 }
 
@@ -40,9 +41,14 @@ BNetworkRequest::Stop()
 }
 
 
+/*!	How long connecting, and then each read or write, may wait. Kept for the
+	socket that the request makes once it runs (and for those of its
+	redirections): set before Run(), it used to change nothing at all.
+*/
 void
 BNetworkRequest::SetTimeout(bigtime_t timeout)
 {
+	fTimeout = timeout;
 	if (fSocket != NULL)
 		fSocket->SetTimeout(timeout);
 }

@@ -52,6 +52,7 @@ public:
 			status_t			Stop();
 
 #ifdef HAIKU_TARGET_PLATFORM_HAIKU
+	virtual void	HeadersReceived(BUrlRequest* request);
 	virtual void	DownloadProgress(BUrlRequest*,
 						off_t bytesReceived, off_t bytesTotal);
 	virtual void 	RequestCompleted(BUrlRequest* request,
@@ -72,7 +73,14 @@ private:
 			off_t				fTotalBytes;
 
 #ifdef HAIKU_TARGET_PLATFORM_HAIKU
+			void				_Pause(bigtime_t duration);
+
 			BUrlRequest*			fUrlRequest;
+			off_t				fRangeStart;
+			uint16				fStatusCode;
+			bool				fRetry;
+			bigtime_t			fRetryAfter;
+			volatile bool		fStopped;
 #endif
 };
 

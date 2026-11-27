@@ -41,6 +41,8 @@ protected:
 protected:
 			BAbstractSocket*	fSocket;
 			BNetworkAddress		fRemoteAddr;
+			bigtime_t			fTimeout;
+				// for connecting, and for each read and write
 
 			BNetBuffer			fInputBuffer;
 };
