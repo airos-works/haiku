@@ -1147,6 +1147,57 @@ write_blocks_in_previous_transaction(block_cache* cache,
 }
 
 
+/*!	Takes the blocks of \a transaction out of the previous transactions they
+	are still part of, without writing them back. The caller must have
+	written \a transaction to its log already: its copy of each block is
+	newer, and replaying the log restores it, so the older change no longer
+	needs to reach the disk on its own. A previous transaction that loses
+	its last block that way is done, as if it had been written.
+	This is how a journal checkpoints a buffer that a newer transaction
+	logged again; it keeps a block that is changed in every transaction
+	from being written back synchronously at each commit, while the file
+	system holds its journal (airos-works/haiku#221).
+	Discarded blocks are still written: they do not stay in the cache.
+*/
+static status_t
+supersede_blocks_in_previous_transaction(block_cache* cache,
+	cache_transaction* transaction)
+{
+	BlockWriter writer(cache);
+
+	cached_block* block = transaction->first_block;
+	for (; block != NULL; block = block->transaction_next) {
+		cache_transaction* previous = block->previous_transaction;
+		if (previous == NULL)
+			continue;
+
+		if (block->discard) {
+			writer.Add(block);
+			continue;
+		}
+
+		// The transaction locker waited for all writes to finish
+		ASSERT(!block->busy_writing);
+
+		previous->blocks.Remove(block);
+		block->previous_transaction = NULL;
+
+		if (--previous->num_blocks == 0) {
+			TRACE("cache transaction %" B_PRId32 " superseded!\n",
+				previous->id);
+			T(Action("superseded", cache, previous));
+
+			notify_transaction_listeners(cache, previous,
+				TRANSACTION_WRITTEN);
+			cache->transaction_hash.Remove(previous);
+			delete_transaction(cache, previous);
+		}
+	}
+
+	return writer.Write();
+}
+
+
 //	#pragma mark - cached_block
 
 
@@ -3195,8 +3246,10 @@ cache_end_transaction(void* _cache, int32 id,
 		return B_BAD_VALUE;
 	}
 
-	// Write back all pending transaction blocks
-	status_t status = write_blocks_in_previous_transaction(cache, transaction);
+	// The changes of earlier transactions to the blocks of this one are
+	// part of this one now
+	status_t status = supersede_blocks_in_previous_transaction(cache,
+		transaction);
 	if (status != B_OK)
 		return status;
 
