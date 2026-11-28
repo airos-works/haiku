@@ -9,12 +9,15 @@
 	resting on or brushing the touchpad must neither move the pointer nor
 	click.
 
-	Touches that begin within the keyboard lock delay of a key (the
-	padblocker_threshold of the touchpad settings, in milliseconds) count for
-	nothing until they lift: no movement, scrolling or tap. While typing, a
-	run of keys, the delay is longer. Touches that began before the typing,
-	the buttons of the touchpad itself and keys pressed with Command, Control
-	or Option (shortcuts, used with the pointer) are left alone.
+	For the keyboard lock delay after a key goes down (the
+	padblocker_threshold of the touchpad settings, in milliseconds; longer
+	while typing, a run of keys) touches that begin count for nothing: no
+	movement, scrolling or tap. Once the delay is over, such a touch moves
+	and scrolls after all, unless a key went down after it touched: that is
+	a palm resting there while typing, nothing until it lifts. Its tap never
+	clicks. Touches that began before the typing, the buttons of the touchpad
+	itself and keys pressed with Command, Control or Option (shortcuts, used
+	with the pointer) are left alone. (So libinput has it.)
 
 	The touchpad's messages tell when the touch they come of began
 	("be:touch_began") and whether a press is a tap ("be:tap").
@@ -67,13 +70,14 @@ private:
 			time_t				fSettingsTime;
 			bigtime_t			fSettingsChecked;
 
-			bigtime_t			fLastKey;
 			bigtime_t			fLastKeyDown;
 			bool				fTyping;
 			bigtime_t			fLockedUntil;
 
 			// the touch whose messages go nowhere, by when it began
 			bigtime_t			fBlockedTouch;
+			// a touch that began while typing and moves since: it taps not
+			bigtime_t			fReleasedTouch;
 			// the touchpad buttons the rest of the system saw go down
 			int32				fPassedButtons;
 			bool				fScrolling;
@@ -85,11 +89,11 @@ PadBlocker::PadBlocker()
 	fThreshold(kDefaultTouchpadSettings.padblocker_threshold * 1000LL),
 	fSettingsTime(0),
 	fSettingsChecked(0),
-	fLastKey(0),
 	fLastKeyDown(0),
 	fTyping(false),
 	fLockedUntil(0),
 	fBlockedTouch(-1),
+	fReleasedTouch(-1),
 	fPassedButtons(0),
 	fScrolling(false)
 {
@@ -153,12 +157,9 @@ PadBlocker::_CheckSettings(bigtime_t now)
 bool
 PadBlocker::_KeyNear(bigtime_t when) const
 {
-	if (fThreshold <= 0 || fLastKey == 0)
+	if (fThreshold <= 0 || fLastKeyDown == 0)
 		return false;
-	if (when >= fLastKey)
-		return when < fLockedUntil;
-	// a key soon after the touch began: a palm put down while typing
-	return fLastKey - when < fThreshold;
+	return when >= fLastKeyDown && when < fLockedUntil;
 }
 
 
@@ -172,8 +173,19 @@ PadBlocker::_IsBlocked(BMessage* message, bigtime_t now)
 		return message->what == B_MOUSE_DOWN && _KeyNear(now);
 	}
 
-	if (touchBegan == fBlockedTouch)
+	if (touchBegan == fBlockedTouch) {
+		// The typing is over, and no key went down since it touched: a
+		// finger brought to the touchpad (a palm resting on it while typing
+		// sees keys go down after it touched).
+		if (now >= fLockedUntil && fLastKeyDown < touchBegan) {
+			fBlockedTouch = -1;
+			fReleasedTouch = touchBegan;
+			return false;
+		}
 		return true;
+	}
+	if (touchBegan == fReleasedTouch)
+		return false;
 	if (_KeyNear(touchBegan)) {
 		fBlockedTouch = touchBegan;
 		return true;
@@ -187,7 +199,6 @@ PadBlocker::Filter(BMessage* message, BList* outList)
 {
 	switch (message->what) {
 		case B_KEY_DOWN:
-		case B_KEY_UP:
 		{
 			if (message->HasInt32("be:key_repeat"))
 				break;
@@ -203,15 +214,11 @@ PadBlocker::Filter(BMessage* message, BList* outList)
 			_CheckSettings(now);
 
 			// a key going down soon after another is typing
-			if (message->what == B_KEY_DOWN) {
-				fTyping = fLastKeyDown != 0
-					&& now - fLastKeyDown < kTypingGap;
-				fLastKeyDown = now;
-			}
+			fTyping = fLastKeyDown != 0 && now - fLastKeyDown < kTypingGap;
+			fLastKeyDown = now;
 			bigtime_t lock = fThreshold;
 			if (fTyping)
 				lock = lock * kTypingFactor / 2;
-			fLastKey = now;
 			fLockedUntil = max_c(fLockedUntil, now + lock);
 			break;
 		}
@@ -235,8 +242,10 @@ PadBlocker::Filter(BMessage* message, BList* outList)
 			if (message->what == B_MOUSE_DOWN) {
 				// the touchpad's own buttons are pressed on purpose
 				bool tap = message->GetBool("be:tap", true);
-				if (blocked && tap)
+				if (tap && (blocked || message->GetInt64("be:touch_began", -2)
+						== fReleasedTouch)) {
 					return B_SKIP_MESSAGE;
+				}
 				if (tap && fThreshold > 0 && now < fLockedUntil)
 					return B_SKIP_MESSAGE;
 				fPassedButtons = buttons;
