@@ -152,6 +152,8 @@ TouchpadPref::LoadSettings()
 	settingsMsg.FindInt8("scroll_acceleration", (int8*)&fSettings.scroll_acceleration);
 	settingsMsg.FindInt8("tapgesture_sensibility", (int8*)&fSettings.tapgesture_sensibility);
 	settingsMsg.FindInt16("padblocker_threshold", (int16*)&fSettings.padblocker_threshold);
+	fSettings.padblocker_threshold
+		= touchpad_padblocker_threshold(fSettings.padblocker_threshold);
 	settingsMsg.FindInt32("trackpad_speed", &fSettings.trackpad_speed);
 	settingsMsg.FindInt32("trackpad_acceleration", &fSettings.trackpad_acceleration);
 	settingsMsg.FindPoint("window_position", &fWindowPosition);

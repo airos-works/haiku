@@ -19,7 +19,8 @@ typedef struct {
 
 	uint8	tapgesture_sensibility;	// 0 : no tapgesture
 									// 20: very light tap is enough (default)
-	uint16  padblocker_threshold;	//0 to 100
+	uint16  padblocker_threshold;	// ms after a key in which touches that
+									// begin are taken for a palm; 0: never
 
 	int32  trackpad_speed;
 	int32  trackpad_acceleration;
@@ -51,7 +52,7 @@ const static touchpad_settings kDefaultTouchpadSettings = {
 	10,
 	10,
 	20,
-	30,
+	200,
 	65536,
 	65536,
 	false,
@@ -62,5 +63,15 @@ const static touchpad_settings kDefaultTouchpadSettings = {
 };
 
 #define TOUCHPAD_SETTINGS_FILE "Touchpad_settings"
+
+
+// The keyboard lock delay used to be 30 ms by default, too short for any
+// palm, and the preferences saved it with all the other settings: a saved
+// 30 is that default, the new one now.
+static inline uint16
+touchpad_padblocker_threshold(uint16 saved)
+{
+	return saved == 30 ? kDefaultTouchpadSettings.padblocker_threshold : saved;
+}
 
 #endif	/* TOUCHPAD_SETTINGS_H */

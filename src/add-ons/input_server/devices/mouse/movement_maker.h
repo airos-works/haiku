@@ -117,6 +117,8 @@ private:
 			int32				fTapClicks;
 			int32				fTapFingers;
 			bool				fTapdragStarted;
+			bool				fPalm;
+				// a palm touched: no taps until everything lifted
 
 			bool				fValidEdgeMotion;
 			bigtime_t			fLastEdgeMotion;

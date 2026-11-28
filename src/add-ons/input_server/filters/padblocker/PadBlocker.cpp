@@ -1,148 +1,99 @@
 /*
- Touchpad sensitivity filter
- Most windows/mac/etc laptops have a sensitivity filter/mechanism
- which protects the user from accidently rubbing the
- touchpad while typing and thus deleting text or moving
- the cursor to a new insertion point. I've been grousing
- about this to myself for months, and finally decided to
- write something for BeOS which other people might benefit
- from.
+ * Copyright 2000, Shamyl Zakariya.
+ * Copyright 2026, Haiku, Inc. All rights reserved.
+ * Distributed under the terms of the MIT License.
+ */
 
- Just an input_server add_on. I wrote it in < hour. Works on
- my inspiron 3500, but I imagine it would work fine on any BeOS
- machine. Not that desktops would benefit. Compiled under 4.5.2
 
- Do what you want with it. Enjoy.
+/*!	Keeps the touchpad still while typing ("disable while typing"): a palm
+	resting on or brushing the touchpad must neither move the pointer nor
+	click.
 
- --Shamyl Zakariya
- --March 22 2000
- --zakariya@earthlink.net
+	Touches that begin within the keyboard lock delay of a key (the
+	padblocker_threshold of the touchpad settings, in milliseconds) count for
+	nothing until they lift: no movement, scrolling or tap. While typing, a
+	run of keys, the delay is longer. Touches that began before the typing,
+	the buttons of the touchpad itself and keys pressed with Command, Control
+	or Option (shortcuts, used with the pointer) are left alone.
 
- Note:
- reads Touchpad_settings file in home/config/settings .
- padblocker_threshold value represents the delay between the last
- B_KEY_UP message and when the filter will allow
- a B_MOUSE_DOWN message. Eg, if less than _threshold has
- transpired between a B_KEY_DOWN and a B_MOUSE_DOWN, the mouse
- down event will be skipped, cast into oblivion.
-
- Kudos to the people at Be for making this kind of thing
- so damnably easy to do. Bravo!
-
- And a hearty thanks to Magnus Landahl for his superb
- debug console, without which I wouldn't have ever known if
- this damn thing worked at all.
-
+	The touchpad's messages tell when the touch they come of began
+	("be:touch_began") and whether a press is a tap ("be:tap").
 */
 
 
-#include <stdlib.h>
-#include <string.h>
-#include <ctype.h>
+#include <new>
+#include <sys/stat.h>
+
 #include <input/touchpad_settings.h>
-#include <Debug.h>
+#include <File.h>
+#include <FindDirectory.h>
+#include <Input.h>
+#include <InterfaceDefs.h>
 #include <List.h>
 #include <Message.h>
 #include <OS.h>
-#include <StorageKit.h>
+#include <Path.h>
 
 #include <add-ons/input_server/InputServerDevice.h>
 #include <add-ons/input_server/InputServerFilter.h>
 
-#if DEBUG
-#	define LOG(text...) PRINT((text))
-#else
-#	define LOG(text...)
-#endif
-
-//#define Z_DEBUG 1
-
-
-#if Z_DEBUG
-#include <BeDC.h>
-#endif
 
 extern "C" _EXPORT BInputServerFilter* instantiate_input_filter();
 
-class PadBlocker : public BInputServerFilter
-{
-	public:
-		PadBlocker();
-		virtual ~PadBlocker();
-		virtual	filter_result Filter(BMessage *message, BList *outList);
 
-	private:
-		bigtime_t 			_lastKeyUp; //timestamp of last B_KEY_DOWN
-		bigtime_t 			_threshold;
-		status_t			GetSettingsPath(BPath& path);
+// Keys this close together are typing, which locks the touchpad longer.
+static const bigtime_t kTypingGap = 500000;
+static const int32 kTypingFactor = 5;
+	// in halves: 2.5 times the delay while typing
+
+// how often the settings file is checked for changes, at most
+static const bigtime_t kSettingsCheckInterval = 1000000;
+
+
+class PadBlocker : public BInputServerFilter {
+public:
+								PadBlocker();
+	virtual						~PadBlocker();
+
+	virtual	filter_result		Filter(BMessage* message, BList* outList);
+
+private:
+			void				_LoadSettings();
+			void				_CheckSettings(bigtime_t now);
+			bool				_KeyNear(bigtime_t when) const;
+			bool				_IsBlocked(BMessage* message, bigtime_t now);
+
+			bigtime_t			fThreshold;
+			time_t				fSettingsTime;
+			bigtime_t			fSettingsChecked;
+
+			bigtime_t			fLastKey;
+			bigtime_t			fLastKeyDown;
+			bool				fTyping;
+			bigtime_t			fLockedUntil;
+
+			// the touch whose messages go nowhere, by when it began
+			bigtime_t			fBlockedTouch;
+			// the touchpad buttons the rest of the system saw go down
+			int32				fPassedButtons;
+			bool				fScrolling;
 };
 
 
-status_t
-PadBlocker::GetSettingsPath(BPath &path)
-{
-	status_t status = find_directory(B_USER_SETTINGS_DIRECTORY, &path);
-	if (status < B_OK)
-		return status;
-
-	return path.Append(TOUCHPAD_SETTINGS_FILE);
-}
-
-
 PadBlocker::PadBlocker()
+	:
+	fThreshold(kDefaultTouchpadSettings.padblocker_threshold * 1000LL),
+	fSettingsTime(0),
+	fSettingsChecked(0),
+	fLastKey(0),
+	fLastKeyDown(0),
+	fTyping(false),
+	fLockedUntil(0),
+	fBlockedTouch(-1),
+	fPassedButtons(0),
+	fScrolling(false)
 {
-	_lastKeyUp = 0;
-	_threshold = 300; //~one third of a second?
-
-	touchpad_settings settings;
-
-	#if Z_DEBUG
-	BeDC dc("PadBlocker");
-	#endif
-	BPath path;
-	status_t status = GetSettingsPath(path);
-	if (status == B_OK) {
-		BFile settingsFile(path.Path(), B_READ_ONLY);
-		status = settingsFile.InitCheck();
-		if (status == B_OK) {
-			BMessage settingsMsg;
-			status = settingsMsg.Unflatten(&settingsFile);
-			if (status != B_OK) {
-				off_t size;
-				settingsFile.Seek(0, SEEK_SET);
-				if (settingsFile.GetSize(&size) == B_OK && size == 28) {
-					if (settingsFile.Read(&settings, 20) != 20) {
-						LOG("failed to load old settings\n");
-						status = B_ERROR;
-					} else
-						status = B_OK;
-				} else {
-					LOG("failed to load settings\n");
-					status = B_ERROR;
-				}
-			} else
-				settingsMsg.FindInt16("padblocker_threshold",
-					(int16*)&settings.padblocker_threshold);
-		}
-	}
-
-	//load settings file
-
-	if (status == B_OK)
-	{
-		#if Z_DEBUG
-		dc.SendMessage("Settings file Exists");
-		#endif
-		_threshold = settings.padblocker_threshold;
-	}
-
-
-
-	_threshold *= 1000; //I'd rather keep the number in the file in thousandths
-
-	#ifdef Z_DEBUG
-	dc.SendInt(_threshold, "Touchpad threshold.");
-	#endif
+	_LoadSettings();
 }
 
 
@@ -151,61 +102,199 @@ PadBlocker::~PadBlocker()
 }
 
 
-filter_result PadBlocker::Filter(BMessage *message, BList *outList)
+void
+PadBlocker::_LoadSettings()
 {
-	filter_result res = B_DISPATCH_MESSAGE;
+	BPath path;
+	if (find_directory(B_USER_SETTINGS_DIRECTORY, &path) != B_OK
+		|| path.Append(TOUCHPAD_SETTINGS_FILE) != B_OK) {
+		return;
+	}
 
-	switch (message->what)
-	{
-		case B_KEY_UP: case B_KEY_DOWN:
+	struct stat st;
+	if (stat(path.Path(), &st) != 0)
+		return;
+	fSettingsTime = st.st_mtime;
+
+	BFile file(path.Path(), B_READ_ONLY);
+	BMessage settings;
+	if (settings.Unflatten(&file) != B_OK)
+		return;
+
+	int16 threshold;
+	if (settings.FindInt16("padblocker_threshold", &threshold) == B_OK)
+		fThreshold = touchpad_padblocker_threshold(threshold) * 1000LL;
+}
+
+
+/*!	The preferences save the settings file when they change; the input
+	server tells filters nothing.
+*/
+void
+PadBlocker::_CheckSettings(bigtime_t now)
+{
+	if (now - fSettingsChecked < kSettingsCheckInterval)
+		return;
+	fSettingsChecked = now;
+
+	BPath path;
+	struct stat st;
+	if (find_directory(B_USER_SETTINGS_DIRECTORY, &path) != B_OK
+		|| path.Append(TOUCHPAD_SETTINGS_FILE) != B_OK
+		|| stat(path.Path(), &st) != 0 || st.st_mtime == fSettingsTime) {
+		return;
+	}
+
+	_LoadSettings();
+}
+
+
+//!	Whether a touch that began then began while typing.
+bool
+PadBlocker::_KeyNear(bigtime_t when) const
+{
+	if (fThreshold <= 0 || fLastKey == 0)
+		return false;
+	if (when >= fLastKey)
+		return when < fLockedUntil;
+	// a key soon after the touch began: a palm put down while typing
+	return fLastKey - when < fThreshold;
+}
+
+
+bool
+PadBlocker::_IsBlocked(BMessage* message, bigtime_t now)
+{
+	bigtime_t touchBegan;
+	if (message->FindInt64("be:touch_began", &touchBegan) != B_OK) {
+		// a touchpad that does not tell: only its presses go, as soon after
+		// a key as ever
+		return message->what == B_MOUSE_DOWN && _KeyNear(now);
+	}
+
+	if (touchBegan == fBlockedTouch)
+		return true;
+	if (_KeyNear(touchBegan)) {
+		fBlockedTouch = touchBegan;
+		return true;
+	}
+	return false;
+}
+
+
+filter_result
+PadBlocker::Filter(BMessage* message, BList* outList)
+{
+	switch (message->what) {
+		case B_KEY_DOWN:
+		case B_KEY_UP:
 		{
-			if (!message->HasInt32("be:key_repeat"))
-				_lastKeyUp = system_time();	//update timestamp
+			if (message->HasInt32("be:key_repeat"))
+				break;
+			// shortcuts are used with the pointer
+			int32 modifiers = 0;
+			message->FindInt32("modifiers", &modifiers);
+			if ((modifiers & (B_COMMAND_KEY | B_CONTROL_KEY | B_OPTION_KEY))
+					!= 0) {
+				break;
+			}
+
+			bigtime_t now = system_time();
+			_CheckSettings(now);
+
+			// a key going down soon after another is typing
+			if (message->what == B_KEY_DOWN) {
+				fTyping = fLastKeyDown != 0
+					&& now - fLastKeyDown < kTypingGap;
+				fLastKeyDown = now;
+			}
+			bigtime_t lock = fThreshold;
+			if (fTyping)
+				lock = lock * kTypingFactor / 2;
+			fLastKey = now;
+			fLockedUntil = max_c(fLockedUntil, now + lock);
 			break;
 		}
 
+		case B_MOUSE_MOVED:
 		case B_MOUSE_DOWN:
+		case B_MOUSE_UP:
+		case B_MOUSE_WHEEL_CHANGED:
 		{
-			int32 device;
-			// do nothing if disabled
-			if (_threshold == 0)
+			int32 subtype;
+			if (message->FindInt32("be:device_subtype", &subtype) != B_OK
+				|| subtype != B_TOUCHPAD_POINTING_DEVICE) {
 				break;
-
-			// only block touchpad devices
-			if (message->FindInt32("be:device_subtype", &device) != B_OK
-				|| device != B_TOUCHPAD_POINTING_DEVICE)
-				break;
+			}
 
 			bigtime_t now = system_time();
-			// if less than the threshold has passed, tell input server
-			// to ignore this message
-			if ((now - _lastKeyUp) < _threshold) res = B_SKIP_MESSAGE;
+			bool blocked = _IsBlocked(message, now);
+			int32 buttons = 0;
+			message->FindInt32("buttons", &buttons);
+
+			if (message->what == B_MOUSE_DOWN) {
+				// the touchpad's own buttons are pressed on purpose
+				bool tap = message->GetBool("be:tap", true);
+				if (blocked && tap)
+					return B_SKIP_MESSAGE;
+				if (tap && fThreshold > 0 && now < fLockedUntil)
+					return B_SKIP_MESSAGE;
+				fPassedButtons = buttons;
+				break;
+			}
+
+			if (message->what == B_MOUSE_UP) {
+				// only what went down comes up
+				if ((fPassedButtons & ~buttons) == 0)
+					return B_SKIP_MESSAGE;
+				fPassedButtons &= buttons;
+				break;
+			}
+
+			if (message->what == B_MOUSE_WHEEL_CHANGED) {
+				int32 phase = message->GetInt32("be:wheel_phase",
+					B_WHEEL_PHASE_NONE);
+				if (blocked) {
+					// a scroll gesture under way still ends
+					if (fScrolling && phase == B_WHEEL_PHASE_ENDED) {
+						fScrolling = false;
+						message->ReplaceFloat("be:wheel_delta_x", 0);
+						message->ReplaceFloat("be:wheel_delta_y", 0);
+						message->ReplaceFloat("be:wheel_precise_delta_x", 0);
+						message->ReplaceFloat("be:wheel_precise_delta_y", 0);
+						break;
+					}
+					return B_SKIP_MESSAGE;
+				}
+				if (phase == B_WHEEL_PHASE_BEGAN)
+					fScrolling = true;
+				else if (phase == B_WHEEL_PHASE_ENDED)
+					fScrolling = false;
+				break;
+			}
+
+			// B_MOUSE_MOVED
+			if (blocked)
+				return B_SKIP_MESSAGE;
+			// no dragging with a button whose press went nowhere
+			if ((buttons & ~fPassedButtons) != 0)
+				message->ReplaceInt32("buttons", buttons & fPassedButtons);
 			break;
 		}
 
 		default:
-		{
-			//we don't want to mess with anybody else
 			break;
-		}
 	}
 
-	#if Z_DEBUG
-	if (res == B_SKIP_MESSAGE)
-	{
-		BeDC dc("PadBlocker");
-		dc.SendMessage("Skipping mouse down event");
-	}
-	#endif
-
-	return (res);
+	return B_DISPATCH_MESSAGE;
 }
 
 
-//*************************************************************************
-//Exported instantiator
+//	#pragma mark -
 
-BInputServerFilter* instantiate_input_filter()
+
+BInputServerFilter*
+instantiate_input_filter()
 {
-	return new (std::nothrow) PadBlocker();
+	return new(std::nothrow) PadBlocker();
 }

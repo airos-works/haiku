@@ -18,6 +18,7 @@
 #include <new>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include <Autolock.h>
@@ -336,7 +337,7 @@ MouseDevice::_ControlThread()
 	}
 
 	// touchpad settings
-	touchpad_specs touchpadSpecs;
+	touchpad_specs touchpadSpecs = {};
 	if (ioctl(fDevice, MS_IS_TOUCHPAD, &touchpadSpecs, sizeof(touchpadSpecs)) == B_OK) {
 		TRACE("is touchpad %s\n", fPath.String());
 		fIsTouchpad = true;
@@ -380,7 +381,14 @@ MouseDevice::_ControlThread()
 
 	// touchpads only
 	touchpad_movement lastTouchpadMovement;
+	memset(&lastTouchpadMovement, 0, sizeof(lastTouchpadMovement));
 	bigtime_t touchpadEventTimeout = B_INFINITE_TIMEOUT;
+	// When the fingers last came onto the touchpad, and whether a button of
+	// the touchpad itself is down rather than one a tap makes: the input
+	// server's filters tell what began while typing (a palm, mostly) by it.
+	bigtime_t touchBegan = 0;
+	bool touching = false;
+	bool touchpadButtonDown = false;
 
 	while (fActive) {
 		mouse_movement movements;
@@ -419,6 +427,15 @@ MouseDevice::_ControlThread()
 			}
 
 			if (read.event == MS_READ_TOUCHPAD) {
+				const touchpad_movement& event = read.u.touchpad;
+				bool touches = event.zPressure >= touchpadSpecs.minPressure
+					&& event.zPressure > 0
+					&& (event.xPosition != 0 || event.yPosition != 0);
+				if (touches && !touching)
+					touchBegan = system_time();
+				touching = touches;
+				touchpadButtonDown = event.buttons != 0;
+
 				status = fTouchpadMovementMaker.EventToMovement(&read.u.touchpad,
 					&movements, touchpadEventTimeout, &scroll);
 				if (status == B_OK)
@@ -472,8 +489,11 @@ MouseDevice::_ControlThread()
 				movements.timestamp,
 				buttons != 0 ? _RemapButtons(lastButtons) : remappedButtons,
 				deltaX, deltaY);
-			if (message != NULL)
+			if (message != NULL) {
+				if (fIsTouchpad)
+					message->AddInt64("be:touch_began", touchBegan);
 				fTarget.EnqueueMessage(message);
+			}
 		}
 
 		if (buttons != 0) {
@@ -482,6 +502,11 @@ MouseDevice::_ControlThread()
 				pressedButton ? B_MOUSE_DOWN : B_MOUSE_UP,
 				movements.timestamp, remappedButtons, 0, 0);
 			if (message != NULL) {
+				if (fIsTouchpad) {
+					message->AddInt64("be:touch_began", touchBegan);
+					if (pressedButton)
+						message->AddBool("be:tap", !touchpadButtonDown);
+				}
 				if (pressedButton) {
 					message->AddInt32("clicks", movements.clicks);
 					LOG_EVENT("B_MOUSE_DOWN\n");
@@ -511,6 +536,8 @@ MouseDevice::_ControlThread()
 					fIsTouchpad
 						? B_TOUCHPAD_POINTING_DEVICE
 						: B_MOUSE_POINTING_DEVICE) == B_OK
+				&& (!fIsTouchpad
+					|| message->AddInt64("be:touch_began", touchBegan) == B_OK)
 				&& (scroll.phase == B_WHEEL_PHASE_NONE
 					|| (message->AddFloat("be:wheel_precise_delta_x",
 							scroll.x) == B_OK

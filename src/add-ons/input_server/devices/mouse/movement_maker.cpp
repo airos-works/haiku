@@ -345,6 +345,10 @@ MovementMaker::_ComputeAcceleration(int8 accel_factor)
 
 #define fTapTimeOUT			200000
 
+// The widest finger: a palm. A precision touchpad reports it in the frame in
+// which a finger turned out to be one.
+static const uint8 kPalmWidth = 15;
+
 
 TouchpadMovement::TouchpadMovement()
 {
@@ -354,9 +358,23 @@ TouchpadMovement::TouchpadMovement()
 	fScrollingStarted = false;
 	fScrollPhaseActive = false;
 	fTapStarted = false;
+	fTapTime = 0;
+	fTapDeltaX = 0;
+	fTapDeltaY = 0;
+	fTapClicks = 0;
+	fTapFingers = 0;
+	fTapdragStarted = false;
+		// (left as it was, it could hold the button down from the start)
 	fValidEdgeMotion = false;
+	fLastEdgeMotion = 0;
+	fRestEdgeMotion = 0;
 	fDoubleClick = false;
 	fFingers = 0;
+	fPalm = false;
+	fClickLastTime = 0;
+	fClickCount = 0;
+	fButtonsState = 0;
+	click_speed = 500000;
 }
 
 TouchpadMovement::~TouchpadMovement() {
@@ -434,6 +452,19 @@ TouchpadMovement::EventToMovement(const touchpad_movement* _event, mouse_movemen
 		}
 		fFingers = fingers;
 	}
+
+	// What a palm did was no tap, nor is anything until all lifts: a palm
+	// often touches first and only then turns out to be one.
+	if (event->fingerWidth >= kPalmWidth) {
+		if (fTapStarted || fDoubleClick)
+			TRACE("TouchpadMovement: a palm, no tap\n");
+		fPalm = true;
+		fTapStarted = false;
+		fTapClicks = 0;
+		fDoubleClick = false;
+	} else if (event->zPressure < fSpecs.minPressure
+		|| (event->xPosition == 0 && event->yPosition == 0))
+		fPalm = false;
 
 	if ((movement->timestamp - fTapTime) > fTapTimeOUT) {
 		if (fTapStarted)
@@ -864,7 +895,7 @@ TouchpadMovement::_CheckTapStarted(const touchpad_movement *event)
 	// to high
 	float pressure = 20 * (event->zPressure - fSpecs.minPressure)
 		/ (fSpecs.realMaxPressure - fSpecs.minPressure);
-	if (!fTapStarted
+	if (!fTapStarted && !fPalm
 		&& fSettings.tapgesture_sensibility > 0.
 		&& fSettings.tapgesture_sensibility > (20 - pressure)) {
 		TRACE("TouchpadMovement: tap started\n");

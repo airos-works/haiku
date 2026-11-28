@@ -600,7 +600,8 @@ TouchpadPrefView::SetValues(touchpad_settings* settings)
 	fScrollStepYSlider->SetValue(20 - settings->scroll_ystepsize / 2);
 	fScrollAccelSlider->SetValue(settings->scroll_acceleration);
 	fTapSlider->SetValue(settings->tapgesture_sensibility);
-	fPadBlockerSlider->SetValue(settings->padblocker_threshold);
+	fPadBlockerSlider->SetValue(settings->padblocker_threshold == 0
+		? 1000 : settings->padblocker_threshold);
 	int32 value = int32((log(settings->trackpad_speed / 8192.0) / log(2)) * 1000 / 6);
 	fSpeedSlider->SetValue(value);
 	value = int32(sqrt(settings->trackpad_acceleration / 16384.0) * 1000 / 4);

@@ -173,7 +173,10 @@ typedef struct {
 		// 3		?
 		// 4 - 7	normal width
 		// 8 - 14	very wide finger or palm
-		// 15		maximum reportable width; extreme wide contact
+		// 15		maximum reportable width; extreme wide contact. Precision
+		//			touchpads report it in the frame in which a finger
+		//			turned out to be a palm: the input server makes no tap
+		//			of what it did.
 		//
 		// While it looks like the idea is to decouple this to end up with
 		// values related to the width only and not mixed with other features:
