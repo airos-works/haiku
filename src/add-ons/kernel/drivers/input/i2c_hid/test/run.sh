@@ -98,6 +98,10 @@ build_resume "" "$work/resume" -DTEST_NEW
 
 if [ -n "$1" ]; then
 	echo "=== the resume test on the driver of $1:"
-	build_resume "$1" "$work/resume-old"
+	# (a driver that knows resets has the hook the test's handler stubs)
+	flag=
+	(cd "$top" && git show "$1:$hid/hid_shared/ProtocolHandler.h") \
+		| grep -q DeviceWasReset && flag=-DTEST_NEW
+	build_resume "$1" "$work/resume-old" $flag
 	"$work/resume-old" || true
 fi

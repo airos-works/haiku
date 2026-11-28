@@ -30,6 +30,16 @@ static const uint32 kInputModeTouchpad = 3;
 // precision touchpads tell contact or not, so a contact gets this one.
 static const uint8 kContactPressure = 50;
 static const uint8 kContactWidth = 4;
+// The width that tells the input server a finger turned out to be a palm:
+// what it did was no tap.
+static const uint8 kPalmWidth = 15;
+
+// Palms resting on a side edge while typing: a contact that begins in the
+// outer 8% of the width at either side is taken for one unless it leaves
+// that edge within kEdgeTimeout, as a finger starting a movement there does
+// (as libinput does it).
+static const uint32 kEdgePercent = 8;
+static const bigtime_t kEdgeTimeout = 200000;
 
 
 TouchpadProtocolHandler::TouchpadProtocolHandler(HIDReport& report,
@@ -49,7 +59,9 @@ TouchpadProtocolHandler::TouchpadProtocolHandler(HIDReport& report,
 	fMaxY(0),
 	fFrameContacts(0),
 	fFrameExpected(0),
-	fFrameButtons(0)
+	fFrameButtons(0),
+	fTrackedCount(0),
+	fEdgeWidth(0)
 {
 	mutex_init(&fConfigureLock, "hid touchpad configuration");
 	memset(fContacts, 0, sizeof(fContacts));
@@ -77,6 +89,9 @@ TouchpadProtocolHandler::TouchpadProtocolHandler(HIDReport& report,
 			} else if (page == B_HID_USAGE_PAGE_DIGITIZER
 				&& id == B_HID_UID_DIG_TOUCH_VALID) {
 				contact.confidence = item;
+			} else if (page == B_HID_USAGE_PAGE_DIGITIZER
+				&& id == B_HID_UID_DIG_CONTACT_IDENTIFIER) {
+				contact.id = item;
 			} else if (page == B_HID_USAGE_PAGE_GENERIC_DESKTOP
 				&& id == B_HID_UID_GD_X) {
 				contact.x = item;
@@ -120,6 +135,7 @@ TouchpadProtocolHandler::TouchpadProtocolHandler(HIDReport& report,
 	fSpecs.areaEndY = fMaxY;
 	fSpecs.width = fMaxX - fMinX;
 	fSpecs.edgeMotionWidth = (fMaxX - fMinX) / 50;
+	fEdgeWidth = (fMaxX - fMinX) * kEdgePercent / 100;
 	fSpecs.minPressure = 0;
 	fSpecs.realMaxPressure = kContactPressure;
 	fSpecs.maxPressure = 255;
@@ -202,6 +218,7 @@ TouchpadProtocolHandler::Open(uint32 flags, uint32* cookie)
 	}
 
 	fFrameExpected = 0;
+	fTrackedCount = 0;
 	return B_OK;
 }
 
@@ -351,31 +368,47 @@ TouchpadProtocolHandler::_ReadReport(touchpad_movement* movement,
 		return B_BUSY;
 	}
 
-	Point points[kMaxContacts];
+	// A report has the contact count in it (0 in the further reports of a
+	// frame that takes several), and only that many of its contact slots
+	// are in use: the others may hold whatever they held before.
+	uint32 reported = 0;
+	if (fContactCount != NULL && fContactCount->Extract() == B_OK
+		&& fContactCount->Valid()) {
+		reported = fContactCount->Data();
+	}
+	bool continuation = fFrameExpected > 0 && reported == 0;
+	uint32 slots = fContactSlots;
+	if (continuation)
+		slots = min_c(fFrameExpected, fContactSlots);
+	else if (reported > 0)
+		slots = min_c(reported, fContactSlots);
+
+	FrameContact contacts[kMaxContacts];
 	uint32 touching = 0;
-	for (uint32 i = 0; i < fContactSlots; i++) {
+	for (uint32 i = 0; i < slots; i++) {
 		Contact& contact = fContacts[i];
 		if (contact.tip->Extract() != B_OK || !contact.tip->Valid()
 			|| contact.tip->Data() == 0) {
 			continue;
 		}
-		// a palm, or whatever the touchpad does not trust to be a finger
-		if (contact.confidence != NULL && contact.confidence->Extract() == B_OK
-			&& contact.confidence->Valid() && contact.confidence->Data() == 0) {
-			continue;
-		}
 		if (contact.x->Extract() != B_OK || contact.y->Extract() != B_OK)
 			continue;
 
-		points[touching].x = contact.x->Data();
-		points[touching].y = contact.y->Data();
+		FrameContact& frameContact = contacts[touching];
+		// without contact identifiers, the order in the frame
+		frameContact.id = (continuation ? fFrameContacts : 0) + i;
+		if (contact.id != NULL && contact.id->Extract() == B_OK
+			&& contact.id->Valid()) {
+			frameContact.id = contact.id->Data();
+		}
+		// what the touchpad does not trust to be a finger: a palm
+		frameContact.confident = contact.confidence == NULL
+			|| contact.confidence->Extract() != B_OK
+			|| !contact.confidence->Valid()
+			|| contact.confidence->Data() != 0;
+		frameContact.x = contact.x->Data();
+		frameContact.y = contact.y->Data();
 		touching++;
-	}
-
-	uint32 reported = 0;
-	if (fContactCount != NULL && fContactCount->Extract() == B_OK
-		&& fContactCount->Valid()) {
-		reported = fContactCount->Data();
 	}
 
 	uint32 buttons = 0;
@@ -390,9 +423,9 @@ TouchpadProtocolHandler::_ReadReport(touchpad_movement* movement,
 	// A touchpad with fewer contact slots than fingers on it sends one
 	// frame in several reports: the first one has the contact count, the
 	// others none.
-	if (fFrameExpected > 0 && reported == 0) {
+	if (continuation) {
 		for (uint32 i = 0; i < touching && fFrameContacts < kMaxContacts; i++)
-			fFrame[fFrameContacts++] = points[i];
+			fFrame[fFrameContacts++] = contacts[i];
 		fFrameButtons |= buttons;
 		if (fFrameExpected > fContactSlots) {
 			fFrameExpected -= fContactSlots;
@@ -402,7 +435,7 @@ TouchpadProtocolHandler::_ReadReport(touchpad_movement* movement,
 	} else {
 		fFrameContacts = 0;
 		for (uint32 i = 0; i < touching; i++)
-			fFrame[fFrameContacts++] = points[i];
+			fFrame[fFrameContacts++] = contacts[i];
 		fFrameButtons = buttons;
 		if (reported > fContactSlots) {
 			fFrameExpected = reported - fContactSlots;
@@ -413,17 +446,94 @@ TouchpadProtocolHandler::_ReadReport(touchpad_movement* movement,
 
 	memset(movement, 0, sizeof(*movement));
 	movement->buttons = fFrameButtons;
-	if (fFrameContacts == 0)
-		return B_OK;
+	_TrackFrame(movement);
+	return B_OK;
+}
 
+
+bool
+TouchpadProtocolHandler::_InSideEdge(uint32 x) const
+{
+	return x < fMinX + fEdgeWidth || x > fMaxX - fEdgeWidth;
+}
+
+
+/*!	Follows the contacts of a whole frame from the ones before and makes the
+	movement of the fingers among them: palms count for nothing until they
+	lift, whether the touchpad says so or they rest on a side edge.
+*/
+void
+TouchpadProtocolHandler::_TrackFrame(touchpad_movement* movement)
+{
+	bigtime_t now = system_time();
+	bool turnedPalm = false;
+
+	for (uint32 i = 0; i < fTrackedCount; i++)
+		fTracked[i].seen = false;
+
+	uint32 fingers = 0;
 	uint64 sumX = 0;
 	uint64 sumY = 0;
 	for (uint32 i = 0; i < fFrameContacts; i++) {
-		sumX += fFrame[i].x;
-		sumY += fFrame[i].y;
+		const FrameContact& contact = fFrame[i];
+
+		TrackedContact* tracked = NULL;
+		for (uint32 j = 0; j < fTrackedCount; j++) {
+			if (fTracked[j].id == contact.id && !fTracked[j].seen) {
+				tracked = &fTracked[j];
+				break;
+			}
+		}
+
+		if (tracked == NULL) {
+			if (fTrackedCount >= kMaxContacts)
+				continue;
+			tracked = &fTracked[fTrackedCount++];
+			tracked->id = contact.id;
+			tracked->began = now;
+			if (!contact.confident)
+				tracked->kind = kPalm;
+			else if (_InSideEdge(contact.x))
+				tracked->kind = kEdge;
+			else
+				tracked->kind = kFinger;
+		} else if (!contact.confident) {
+			// once a palm, a palm until it lifts: touchpads tell late, and
+			// not in every report
+			if (tracked->kind == kFinger)
+				turnedPalm = true;
+			tracked->kind = kPalm;
+		} else if (tracked->kind == kEdge) {
+			if (now - tracked->began >= kEdgeTimeout)
+				tracked->kind = kPalm;
+			else if (!_InSideEdge(contact.x))
+				tracked->kind = kFinger;
+		}
+		tracked->seen = true;
+
+		if (tracked->kind != kFinger)
+			continue;
+
+		sumX += contact.x;
+		sumY += contact.y;
+		fingers++;
 	}
-	uint32 x = sumX / fFrameContacts;
-	uint32 y = sumY / fFrameContacts;
+
+	// the ones not in this frame have lifted
+	for (uint32 i = 0; i < fTrackedCount;) {
+		if (!fTracked[i].seen)
+			fTracked[i] = fTracked[--fTrackedCount];
+		else
+			i++;
+	}
+
+	if (turnedPalm)
+		movement->fingerWidth = kPalmWidth;
+	if (fingers == 0)
+		return;
+
+	uint32 x = sumX / fingers;
+	uint32 y = sumY / fingers;
 	x = max_c(fMinX, min_c(fMaxX, x));
 	y = max_c(fMinY, min_c(fMaxY, y));
 
@@ -432,8 +542,8 @@ TouchpadProtocolHandler::_ReadReport(touchpad_movement* movement,
 	movement->xPosition = max_c(x, 1);
 	movement->yPosition = max_c(fMaxY - (y - fMinY), 1);
 	movement->zPressure = kContactPressure;
-	movement->fingerWidth = kContactWidth;
-	uint32 fingers = min_c(fFrameContacts, 5);
+	if (!turnedPalm)
+		movement->fingerWidth = kContactWidth;
+	fingers = min_c(fingers, 5);
 	movement->fingers = (1 << fingers) - 1;
-	return B_OK;
 }

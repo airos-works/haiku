@@ -567,7 +567,7 @@ HIDDevice::_InputReport(const uint8* data, size_t length)
 	size_t slotSize = sizeof(size_t) + fMaxReportSize;
 	uint8* slot = queue->slots
 		+ ((queue->head + queue->count) % kQueueSlots) * slotSize;
-	*(size_t*)slot = length;
+	memcpy(slot, &length, sizeof(length));
 	memcpy(slot + sizeof(size_t), data, length);
 	queue->count++;
 
@@ -603,7 +603,9 @@ HIDDevice::_Deliver(ReportQueue* queue)
 	// fLock is held: the queue cannot change underneath.
 	size_t slotSize = sizeof(size_t) + fMaxReportSize;
 	uint8* slot = queue->slots + queue->head * slotSize;
-	size_t length = *(size_t*)slot;
+	size_t length;
+	memcpy(&length, slot, sizeof(length));
+		// (the slots are not aligned)
 	memcpy(queue->delivered, slot + sizeof(size_t), length);
 	memset(queue->delivered + length, 0, fMaxReportSize + 4 - length);
 

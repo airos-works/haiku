@@ -10,6 +10,10 @@
 	behaves as the specification says: after a reset, and after losing its
 	power, it is a mouse again until it is told to report contacts.
 
+	And of what the touchpad handler makes of the contacts of a real one (the
+	Framework Laptop 13's PixArt PIXA3854): palms, fingers on its edges,
+	contact slots not in use.
+
 	The reader thread is run by the test itself, for a few rounds.
 */
 
@@ -22,7 +26,10 @@
 #include "Driver.h"
 #include "GpioInterrupt.h"
 #include "HIDCollection.h"
+// (the test hands the device its input reports, as its reader does)
+#define private public
 #include "HIDDevice.h"
+#undef private
 #include "HIDParser.h"
 #include "HIDReport.h"
 #include "I2CHIDProtocol.h"
@@ -256,6 +263,71 @@ static const uint8 kReportDescriptor[] = {
 	0x75, 0x10, 0x95, 0x02, 0x25, 0x0a, 0x81, 0x06, 0xc0, 0xc0
 };
 
+// The PixArt PIXA3854 (093a:0274) of the Framework Laptop 13, as it reports
+// itself: a mouse (report 2), the touch pad with five contacts (report 1:
+// confidence, tip, identifier, x 0-1337, y 0-876 each; then the contact
+// count, three buttons and the scan time) and its configuration.
+static const uint8 kPixArtDescriptor[] = {
+	0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x85, 0x02, 0x05, 0x01, 0x09, 0x01,
+	0xa1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x02, 0x15, 0x00, 0x25, 0x01,
+	0x75, 0x01, 0x95, 0x02, 0x81, 0x02, 0x05, 0x0d, 0x09, 0x32, 0x75, 0x01,
+	0x95, 0x01, 0x81, 0x02, 0x75, 0x05, 0x95, 0x01, 0x81, 0x03, 0x05, 0x01,
+	0x75, 0x10, 0x95, 0x01, 0x35, 0x00, 0x45, 0x00, 0x16, 0x00, 0x80, 0x26,
+	0xff, 0x7f, 0x09, 0x30, 0x81, 0x26, 0x16, 0x00, 0x80, 0x26, 0xff, 0x7f,
+	0x09, 0x31, 0x81, 0x26, 0xc0, 0xc0, 0x05, 0x0d, 0x09, 0x05, 0xa1, 0x01,
+	0x85, 0x01, 0x05, 0x0d, 0x09, 0x22, 0xa1, 0x02, 0x09, 0x47, 0x09, 0x42,
+	0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x02, 0x81, 0x02, 0x95, 0x06,
+	0x81, 0x03, 0x09, 0x51, 0x25, 0x0f, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02,
+	0x05, 0x01, 0x09, 0x30, 0x75, 0x10, 0x55, 0x0e, 0x65, 0x11, 0x35, 0x00,
+	0x46, 0x5a, 0x04, 0x27, 0x39, 0x05, 0x00, 0x00, 0x81, 0x02, 0x09, 0x31,
+	0x46, 0xda, 0x02, 0x27, 0x6c, 0x03, 0x00, 0x00, 0x81, 0x02, 0xc0, 0x05,
+	0x0d, 0x09, 0x22, 0xa1, 0x02, 0x09, 0x47, 0x09, 0x42, 0x15, 0x00, 0x25,
+	0x01, 0x75, 0x01, 0x95, 0x02, 0x81, 0x02, 0x95, 0x06, 0x81, 0x03, 0x09,
+	0x51, 0x25, 0x0f, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02, 0x05, 0x01, 0x09,
+	0x30, 0x75, 0x10, 0x55, 0x0e, 0x65, 0x11, 0x35, 0x00, 0x46, 0x5a, 0x04,
+	0x27, 0x39, 0x05, 0x00, 0x00, 0x81, 0x02, 0x09, 0x31, 0x46, 0xda, 0x02,
+	0x27, 0x6c, 0x03, 0x00, 0x00, 0x81, 0x02, 0xc0, 0x05, 0x0d, 0x09, 0x22,
+	0xa1, 0x02, 0x09, 0x47, 0x09, 0x42, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01,
+	0x95, 0x02, 0x81, 0x02, 0x95, 0x06, 0x81, 0x03, 0x09, 0x51, 0x25, 0x0f,
+	0x75, 0x08, 0x95, 0x01, 0x81, 0x02, 0x05, 0x01, 0x09, 0x30, 0x75, 0x10,
+	0x55, 0x0e, 0x65, 0x11, 0x35, 0x00, 0x46, 0x5a, 0x04, 0x27, 0x39, 0x05,
+	0x00, 0x00, 0x81, 0x02, 0x09, 0x31, 0x46, 0xda, 0x02, 0x27, 0x6c, 0x03,
+	0x00, 0x00, 0x81, 0x02, 0xc0, 0x05, 0x0d, 0x09, 0x22, 0xa1, 0x02, 0x09,
+	0x47, 0x09, 0x42, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x02, 0x81,
+	0x02, 0x95, 0x06, 0x81, 0x03, 0x09, 0x51, 0x25, 0x0f, 0x75, 0x08, 0x95,
+	0x01, 0x81, 0x02, 0x05, 0x01, 0x09, 0x30, 0x75, 0x10, 0x55, 0x0e, 0x65,
+	0x11, 0x35, 0x00, 0x46, 0x5a, 0x04, 0x27, 0x39, 0x05, 0x00, 0x00, 0x81,
+	0x02, 0x09, 0x31, 0x46, 0xda, 0x02, 0x27, 0x6c, 0x03, 0x00, 0x00, 0x81,
+	0x02, 0xc0, 0x05, 0x0d, 0x09, 0x22, 0xa1, 0x02, 0x09, 0x47, 0x09, 0x42,
+	0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x02, 0x81, 0x02, 0x95, 0x06,
+	0x81, 0x03, 0x09, 0x51, 0x25, 0x0f, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02,
+	0x05, 0x01, 0x09, 0x30, 0x75, 0x10, 0x55, 0x0e, 0x65, 0x11, 0x35, 0x00,
+	0x46, 0x5a, 0x04, 0x27, 0x39, 0x05, 0x00, 0x00, 0x81, 0x02, 0x09, 0x31,
+	0x46, 0xda, 0x02, 0x27, 0x6c, 0x03, 0x00, 0x00, 0x81, 0x02, 0xc0, 0x05,
+	0x0d, 0x09, 0x54, 0x15, 0x00, 0x25, 0x05, 0x75, 0x08, 0x95, 0x01, 0x81,
+	0x02, 0x05, 0x09, 0x09, 0x01, 0x09, 0x02, 0x09, 0x03, 0x15, 0x00, 0x25,
+	0x01, 0x75, 0x01, 0x95, 0x03, 0x81, 0x02, 0x95, 0x05, 0x81, 0x03, 0x05,
+	0x0d, 0x09, 0x56, 0x55, 0x0c, 0x66, 0x01, 0x10, 0x35, 0x00, 0x47, 0xff,
+	0xff, 0x00, 0x00, 0x15, 0x00, 0x27, 0xff, 0xff, 0x00, 0x00, 0x75, 0x10,
+	0x95, 0x01, 0x81, 0x02, 0x05, 0x0d, 0x09, 0x55, 0x15, 0x00, 0x25, 0x05,
+	0x75, 0x08, 0x95, 0x01, 0x85, 0x03, 0xb1, 0x02, 0x05, 0x0d, 0x09, 0x59,
+	0x15, 0x00, 0x25, 0x0f, 0x75, 0x08, 0x95, 0x01, 0x85, 0x04, 0xb1, 0x02,
+	0x06, 0x00, 0xff, 0x85, 0x05, 0x75, 0x08, 0x15, 0x00, 0x09, 0xc6, 0x25,
+	0x08, 0x95, 0x01, 0xb1, 0x02, 0x09, 0xc7, 0x26, 0xff, 0x00, 0x95, 0x20,
+	0xb1, 0x02, 0xc0, 0x05, 0x0d, 0x09, 0x0e, 0xa1, 0x01, 0x05, 0x0d, 0x09,
+	0x22, 0xa1, 0x02, 0x09, 0x52, 0x15, 0x00, 0x25, 0x0a, 0x75, 0x08, 0x95,
+	0x01, 0x85, 0x06, 0xb1, 0x02, 0xc0, 0x05, 0x0d, 0x09, 0x22, 0xa1, 0x00,
+	0x09, 0x57, 0x09, 0x58, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x02,
+	0x85, 0x07, 0xb1, 0x02, 0x95, 0x06, 0xb1, 0x03, 0xc0, 0x05, 0x0d, 0x09,
+	0x60, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x01, 0x85, 0x08, 0xb1,
+	0x02, 0x95, 0x07, 0xb1, 0x03, 0xc0, 0x06, 0x00, 0xff, 0x09, 0x01, 0xa1,
+	0x01, 0x85, 0x42, 0x09, 0x06, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08,
+	0x95, 0x03, 0xb1, 0x02, 0x06, 0x00, 0xff, 0x09, 0x05, 0x15, 0x00, 0x26,
+	0xff, 0x00, 0x75, 0x08, 0x96, 0x00, 0x01, 0x85, 0x41, 0xb1, 0x02, 0x85,
+	0x43, 0x09, 0x06, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x03,
+	0xb1, 0x02, 0xc0
+};
+
 static const uint16 kDescriptorRegister = 0x0001;
 static const uint16 kReportDescriptorRegister = 0x0002;
 static const uint16 kInputRegister = 0x0003;
@@ -269,6 +341,9 @@ static const uint8 kSwitchesReportID = 5;
 
 
 struct FakeTouchpad {
+	const uint8*	descriptor;
+	size_t			descriptorLength;
+		// NULL: Microsoft's sample
 	uint8	inputMode;
 	uint8	switches;
 		// bit 0 surface, bit 1 buttons; both on after a reset
@@ -310,10 +385,11 @@ struct FakeTouchpad {
 				i2c_hid_descriptor descriptor = {};
 				descriptor.wHIDDescLength = sizeof(descriptor);
 				descriptor.bcdVersion = 0x0100;
-				descriptor.wReportDescLength = sizeof(kReportDescriptor);
+				descriptor.wReportDescLength = this->descriptor != NULL
+					? descriptorLength : sizeof(kReportDescriptor);
 				descriptor.wReportDescRegister = kReportDescriptorRegister;
 				descriptor.wInputRegister = kInputRegister;
-				descriptor.wMaxInputLength = 16;
+				descriptor.wMaxInputLength = 40;
 				descriptor.wCommandRegister = kCommandRegister;
 				descriptor.wDataRegister = kDataRegister;
 				descriptor.wVendorID = 0x093a;
@@ -323,8 +399,13 @@ struct FakeTouchpad {
 				return B_OK;
 			}
 			if (reg == kReportDescriptorRegister) {
-				memcpy(data, kReportDescriptor, min_c(dataLength,
-					sizeof(kReportDescriptor)));
+				if (this->descriptor != NULL) {
+					memcpy(data, this->descriptor, min_c(dataLength,
+						descriptorLength));
+				} else {
+					memcpy(data, kReportDescriptor, min_c(dataLength,
+						sizeof(kReportDescriptor)));
+				}
 				return B_OK;
 			}
 			return B_ERROR;
@@ -556,6 +637,212 @@ test_closed()
 }
 
 
+// #pragma mark - palms
+
+
+struct TestContact {
+	uint8	id;
+	bool	confident;
+	uint16	x;
+	uint16	y;
+	bool	lifted;
+};
+
+static const uint32 kPixArtSlots = 5;
+
+
+/*!	One report of the PixArt touchpad with \a count contacts in it; the
+	slots after those hold \a stale, as a touchpad may leave them.
+*/
+static void
+send_contacts(HIDDevice* device, const TestContact* contacts, uint32 count,
+	const TestContact* stale = NULL)
+{
+	uint8 data[1 + kPixArtSlots * 6 + 4] = {};
+	data[0] = 1;
+	for (uint32 i = 0; i < kPixArtSlots; i++) {
+		const TestContact* contact = i < count ? &contacts[i] : stale;
+		if (contact == NULL)
+			continue;
+		uint8* slot = data + 1 + i * 6;
+		slot[0] = (contact->confident ? 1 : 0) | (contact->lifted ? 0 : 2);
+		slot[1] = contact->id;
+		slot[2] = contact->x & 0xff;
+		slot[3] = contact->x >> 8;
+		slot[4] = contact->y & 0xff;
+		slot[5] = contact->y >> 8;
+	}
+	data[1 + kPixArtSlots * 6] = count;
+	device->_InputReport(data, sizeof(data));
+}
+
+
+static touchpad_movement
+read_movement(ProtocolHandler* handler, uint32* cookie)
+{
+	touchpad_read read = {};
+	read.timeout = 1000;
+	touchpad_movement movement = {};
+	if (handler->Control(cookie, MS_READ_TOUCHPAD, &read, sizeof(read))
+			!= B_OK) {
+		check(false, "a movement is read");
+		return movement;
+	}
+	return read.u.touchpad;
+}
+
+
+static uint32
+finger_count(const touchpad_movement& movement)
+{
+	return __builtin_popcount(movement.fingers);
+}
+
+
+/*!	A frame: the contacts go in, the movement the input server gets comes
+	out, 10 ms after the last one.
+*/
+static touchpad_movement
+frame(HIDDevice* device, ProtocolHandler* handler, uint32* cookie,
+	const TestContact* contacts, uint32 count,
+	const TestContact* stale = NULL)
+{
+	sTime += 10000;
+	send_contacts(device, contacts, count, stale);
+	return read_movement(handler, cookie);
+}
+
+
+static void
+test_palms()
+{
+	printf("--- palms on the PixArt touchpad\n");
+
+	FakeTouchpad touchpad = {};
+	touchpad.descriptor = kPixArtDescriptor;
+	touchpad.descriptorLength = sizeof(kPixArtDescriptor);
+	touchpad.PowerOn();
+	sLog[0] = '\0';
+	sThreadFunction = NULL;
+
+	HIDDevice* device = new HIDDevice(kDescriptorRegister, &sI2C, &touchpad,
+		NULL);
+	ProtocolHandler* handler = device->InitCheck() == B_OK
+		? device->ProtocolHandlerAt(0) : NULL;
+	check(handler != NULL, "a touchpad handler (%s)\n%s",
+		test_strerror(device->InitCheck()), sLog);
+	if (handler == NULL) {
+		delete device;
+		return;
+	}
+	touchpad_specs specs = {};
+	handler->Control(NULL, MS_IS_TOUCHPAD, &specs, sizeof(specs));
+	check(specs.areaEndX == 1337 && specs.areaEndY == 876,
+		"a surface of 1337 x 876 (%u x %u)", specs.areaEndX, specs.areaEndY);
+
+	uint32 cookie = 0;
+	handler->Open(0, &cookie);
+
+	// a finger in the middle
+	TestContact finger = { 3, true, 600, 400, false };
+	touchpad_movement movement = frame(device, handler, &cookie, &finger, 1);
+	check(finger_count(movement) == 1 && movement.xPosition == 600
+			&& movement.yPosition == 876 - 400 && movement.fingerWidth == 4,
+		"a finger: one at (%u, %u), width %u", movement.xPosition,
+		movement.yPosition, movement.fingerWidth);
+	finger.lifted = true;
+	movement = frame(device, handler, &cookie, &finger, 1);
+	check(finger_count(movement) == 0 && movement.xPosition == 0,
+		"it lifts: no finger");
+	movement = frame(device, handler, &cookie, NULL, 0);
+
+	// a contact the touchpad trusts at first and then takes for a palm
+	TestContact palm = { 4, true, 700, 300, false };
+	movement = frame(device, handler, &cookie, &palm, 1);
+	check(finger_count(movement) == 1, "a palm that touches: a finger first");
+	palm.confident = false;
+	movement = frame(device, handler, &cookie, &palm, 1);
+	check(finger_count(movement) == 0 && movement.fingerWidth == 15,
+		"then a palm: no finger, and the width says palm (%u)",
+		movement.fingerWidth);
+	palm.confident = true;
+	palm.x += 30;
+	movement = frame(device, handler, &cookie, &palm, 1);
+	check(finger_count(movement) == 0 && movement.fingerWidth != 15,
+		"trusted again: still a palm, said once (%u fingers, width %u)",
+		finger_count(movement), movement.fingerWidth);
+	palm.lifted = true;
+	frame(device, handler, &cookie, &palm, 1);
+	movement = frame(device, handler, &cookie, NULL, 0);
+	palm.lifted = false;
+	palm.confident = true;
+	palm.id = 5;
+	movement = frame(device, handler, &cookie, &palm, 1);
+	check(finger_count(movement) == 1,
+		"lifted, a new contact there is a finger again");
+	palm.lifted = true;
+	frame(device, handler, &cookie, &palm, 1);
+
+	// a resting palm does not move the finger's point
+	TestContact two[2] = {
+		{ 1, false, 200, 800, false },
+		{ 2, true, 650, 300, false }
+	};
+	movement = frame(device, handler, &cookie, two, 2);
+	check(finger_count(movement) == 1 && movement.xPosition == 650,
+		"a palm resting and a finger: the finger alone (%u fingers, x %u)",
+		finger_count(movement), movement.xPosition);
+
+	// slots after the contact count are not contacts, whatever is in them
+	TestContact ghost = { 9, true, 100, 100, false };
+	movement = frame(device, handler, &cookie, &two[1], 1, &ghost);
+	check(finger_count(movement) == 1 && movement.xPosition == 650,
+		"an old contact in an unused slot is none (%u fingers, x %u)",
+		finger_count(movement), movement.xPosition);
+	two[1].lifted = true;
+	frame(device, handler, &cookie, &two[1], 1);
+	movement = frame(device, handler, &cookie, NULL, 0);
+
+	// a palm on a side edge, while typing
+	TestContact edge = { 6, true, 40, 500, false };
+	movement = frame(device, handler, &cookie, &edge, 1);
+	check(finger_count(movement) == 0, "a contact on the left edge: none");
+	sTime += 250000;
+	edge.x = 400;
+	movement = frame(device, handler, &cookie, &edge, 1);
+	check(finger_count(movement) == 0,
+		"it stayed there too long: a palm wherever it goes then");
+	edge.lifted = true;
+	frame(device, handler, &cookie, &edge, 1);
+
+	// a finger starting a movement at the right edge
+	edge = { 7, true, 1320, 500, false };
+	movement = frame(device, handler, &cookie, &edge, 1);
+	check(finger_count(movement) == 0, "a contact on the right edge: none");
+	edge.x = 1150;
+	movement = frame(device, handler, &cookie, &edge, 1);
+	check(finger_count(movement) == 1 && movement.xPosition == 1150,
+		"it soon leaves the edge: a finger (%u fingers)",
+		finger_count(movement));
+	edge.lifted = true;
+	frame(device, handler, &cookie, &edge, 1);
+
+	// after a close and an open, nothing is left of before
+	TestContact resting = { 8, false, 600, 400, false };
+	frame(device, handler, &cookie, &resting, 1);
+	handler->Close(&cookie);
+	cookie = 0;
+	handler->Open(0, &cookie);
+	resting.confident = true;
+	movement = frame(device, handler, &cookie, &resting, 1);
+	check(finger_count(movement) == 1,
+		"reopened, contacts are new to it");
+
+	handler->Close(&cookie);
+	delete device;
+}
+
+
 int
 main(int argc, char** argv)
 {
@@ -565,6 +852,7 @@ main(int argc, char** argv)
 	test_sleep(true);
 	test_sleep(false);
 	test_closed();
+	test_palms();
 
 	printf("%d failed\n", sFailures);
 	return sFailures == 0 ? 0 : 1;

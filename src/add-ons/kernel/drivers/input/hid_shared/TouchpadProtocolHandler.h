@@ -46,19 +46,42 @@ private:
 			struct Contact {
 				HIDReportItem*	tip;
 				HIDReportItem*	confidence;
+				HIDReportItem*	id;
 				HIDReportItem*	x;
 				HIDReportItem*	y;
 			};
 
-			struct Point {
+			// a contact touching in a frame
+			struct FrameContact {
+				uint32			id;
 				uint32			x;
 				uint32			y;
+				bool			confident;
+			};
+
+			// what a contact on the surface is taken for, from the time it
+			// touches until it lifts
+			enum {
+				kFinger,
+				kPalm,
+				kEdge
+					// began at a side edge: a palm unless it leaves the
+					// edge soon
+			};
+
+			struct TrackedContact {
+				uint32			id;
+				uint8			kind;
+				bool			seen;
+				bigtime_t		began;
 			};
 
 			status_t			_Configure();
 			status_t			_SetFeature(uint16 usageID, uint32 value);
 			status_t			_ReadReport(touchpad_movement* movement,
 									bigtime_t timeout, uint32* cookie);
+			void				_TrackFrame(touchpad_movement* movement);
+			bool				_InSideEdge(uint32 x) const;
 
 			HIDReport&			fReport;
 			HIDCollection&		fCollection;
@@ -80,10 +103,15 @@ private:
 
 			// a frame whose contacts come in more than one report
 			// ("hybrid" reporting)
-			Point				fFrame[kMaxContacts];
+			FrameContact		fFrame[kMaxContacts];
 			uint32				fFrameContacts;
 			uint32				fFrameExpected;
 			uint32				fFrameButtons;
+
+			// the contacts on the surface, from frame to frame
+			TrackedContact		fTracked[kMaxContacts];
+			uint32				fTrackedCount;
+			uint32				fEdgeWidth;
 };
 
 
