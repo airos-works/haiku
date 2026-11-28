@@ -32,6 +32,15 @@ MessageEvent::MessageEvent(bigtime_t time, const BMessenger& messenger)
 }
 
 
+MessageEvent::MessageEvent(bigtime_t time, const BMessenger& messenger,
+		const BMessage& message)
+	: Event(time),
+	  AbstractLOAdapter(messenger),
+	  fMessage(message)
+{
+}
+
+
 MessageEvent::~MessageEvent()
 {
 }

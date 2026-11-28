@@ -18,6 +18,7 @@
 #include <BufferGroup.h>
 #include <Buffer.h>
 #include <MediaDefs.h>
+#include <Messenger.h>
 #include <ParameterWeb.h>
 #include <TimeSource.h>
 
@@ -889,8 +890,12 @@ AudioProducer::_FillNextBuffer(bigtime_t eventTime)
 		}
 		bigtime_t realTime = TimeSource()->RealTimeFor(
 			fStartTime + startTime, 0);
+		// Address the listener through a messenger: the event fires later,
+		// on the EventQueue thread, and the listener (MainWin's PeakView)
+		// may be deleted by then. A raw BHandler* would be dereferenced
+		// after it is freed (haiku#240); a messenger just fails to send.
 		MessageEvent* event = new (std::nothrow) MessageEvent(realTime,
-			fPeakListener, message);
+			BMessenger(fPeakListener), message);
 		if (event != NULL)
 			EventQueue::Default().AddEvent(event);
 	}

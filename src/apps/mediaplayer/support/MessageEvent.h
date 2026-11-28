@@ -28,6 +28,9 @@ class MessageEvent : public Event, public AbstractLOAdapter {
 									const BMessage& message);
 								MessageEvent(bigtime_t time,
 									const BMessenger& messenger);
+								MessageEvent(bigtime_t time,
+									const BMessenger& messenger,
+									const BMessage& message);
 	virtual						~MessageEvent();
 
 	virtual	void				Execute();
